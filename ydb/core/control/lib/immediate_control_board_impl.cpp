@@ -64,18 +64,6 @@ void TControlBoard::GetValue(TString name, TAtomic &outValue, bool &outIsControl
 TString TControlBoard::RenderAsHtml() const {
     TStringStream str;
     HTML(str) {
-        TABLE_SORTABLE_CLASS("table") {
-            TABLEHEAD() {
-                TABLER() {
-                    TABLEH() { str << "Parameter"; }
-                    TABLEH() { str << "Acceptable range"; }
-                    TABLEH() { str << "Current"; }
-                    TABLEH() { str << "Default"; }
-                    TABLEH() { str << "Send new value"; }
-                    TABLEH() { str << "Changed"; }
-                }
-            }
-        }
     }
     return str.Str();
 }
