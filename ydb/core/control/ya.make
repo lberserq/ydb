@@ -13,8 +13,6 @@ SRCS(
     defs.h
     immediate_control_board_actor.cpp
     immediate_control_board_actor.h
-    immediate_control_board_control.h
-    immediate_control_board_impl.h
 )
 
 END()

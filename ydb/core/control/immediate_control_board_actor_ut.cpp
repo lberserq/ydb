@@ -1,6 +1,7 @@
 #include "defs.h"
 #include "immediate_control_board_actor.h"
-#include "immediate_control_board_wrapper.h"
+
+#include <ydb/core/control/lib/immediate_control_board_wrapper.h>
 
 #include <ydb/library/actors/interconnect/interconnect.h>
 #include <ydb/core/mon/mon.h>
