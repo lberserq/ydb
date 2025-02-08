@@ -51,6 +51,7 @@ namespace NActors {
             TAutoPtr<NActors::IDestructable> Opaque;
             TKeyConfigGenerator KeyConfigGenerator;
             std::vector<TIntrusivePtr<NKikimr::TControlBoard>> Icb;
+            std::vector<TIntrusivePtr<NKikimr::TStaticControlBoard>> StaticControlBoard;
         };
 
         struct TActorSystemSetupConfig {

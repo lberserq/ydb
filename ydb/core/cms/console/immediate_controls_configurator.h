@@ -12,6 +12,7 @@ namespace NKikimr::NConsole {
  * immediate control board via CMS.
  */
 IActor *CreateImmediateControlsConfigurator(TIntrusivePtr<TControlBoard> board,
+                                            TIntrusivePtr<TStaticControlBoard> staticControlBoard,
                                             const NKikimrConfig::TImmediateControlsConfig &cfg,
                                             bool allowExistingControls = false);
 
