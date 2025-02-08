@@ -100,6 +100,7 @@ namespace NKikimr {
     struct TDomainsInfo;
     class TResourceProfiles;
     class TControlBoard;
+    class TStaticControlBoard;
     class TFeatureFlags;
 }
 
