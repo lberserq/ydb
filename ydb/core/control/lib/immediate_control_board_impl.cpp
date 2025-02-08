@@ -75,13 +75,6 @@ TString TControlBoard::RenderAsHtml() const {
                     TABLEH() { str << "Changed"; }
                 }
             }
-            TABLEBODY() {
-                for (const auto& bucket : Board.Buckets) {
-                    TReadGuard guard(bucket.GetLock());
-                    for (const auto &item : bucket.GetMap()) {
-                    }
-                }
-            }
         }
     }
     return str.Str();
