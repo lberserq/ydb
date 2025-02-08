@@ -109,9 +109,6 @@ TString TControlBoard::RenderAsHtml() const {
                 }
             }
         }
-        str << "<form class='form_horizontal' method='post'>";
-        str << "<button type='submit' name='restoreDefaults' style='color:green;'><b>Restore Default</b></button>";
-        str << "</form>";
     }
     return str.Str();
 }
