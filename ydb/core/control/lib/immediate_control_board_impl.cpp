@@ -79,32 +79,6 @@ TString TControlBoard::RenderAsHtml() const {
                 for (const auto& bucket : Board.Buckets) {
                     TReadGuard guard(bucket.GetLock());
                     for (const auto &item : bucket.GetMap()) {
-                        TABLER() {
-                            TABLED() { str << item.first; }
-                            TABLED() { str << item.second->RangeAsString(); }
-                            TABLED() {
-                                if (item.second->IsDefault()) {
-                                    str << "<p>" << item.second->Get() << "</p>";
-                                } else {
-                                    str << "<p style='color:red;'><b>" << item.second->Get() << " </b></p>";
-                                }
-                            }
-                            TABLED() {
-                                if (item.second->IsDefault()) {
-                                    str << "<p>" << item.second->GetDefault() << "</p>";
-                                } else {
-                                    str << "<p style='color:red;'><b>" << item.second->GetDefault() << " </b></p>";
-                                }
-                            }
-                            TABLED() {
-                                str << "<form class='form_horizontal' method='post'>";
-                                str << "<input name='" << item.first << "' type='text' value='"
-                                    << item.second->Get() << "'/>";
-                                str << "<button type='submit' style='color:red;'><b>Change</b></button>";
-                                str << "</form>";
-                            }
-                            TABLED() { str << !item.second->IsDefault(); }
-                        }
                     }
                 }
             }
