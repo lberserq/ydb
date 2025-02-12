@@ -126,5 +126,6 @@ RECURSE(
 
 RECURSE_FOR_TESTS(
     ut
+    ut_auth
     ut_board_subscriber
 )
