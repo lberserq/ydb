@@ -69,6 +69,7 @@ struct TAppData::TImpl {
     NKikimrConfig::TMemoryControllerConfig MemoryControllerConfig;
     NKikimrReplication::TReplicationDefaults ReplicationConfig;
     NKikimrProto::TDataIntegrityTrailsConfig DataIntegrityTrailsConfig;
+    NKikimrConfig::TDataErasureConfig DataErasureConfig;
 };
 
 TAppData::TAppData(
@@ -126,6 +127,7 @@ TAppData::TAppData(
     , MemoryControllerConfig(Impl->MemoryControllerConfig)
     , ReplicationConfig(Impl->ReplicationConfig)
     , DataIntegrityTrailsConfig(Impl->DataIntegrityTrailsConfig)
+    , DataErasureConfig(Impl->DataErasureConfig)
     , KikimrShouldContinue(kikimrShouldContinue)
     , TracingConfigurator(MakeIntrusive<NJaegerTracing::TSamplingThrottlingConfigurator>(TimeProvider, RandomProvider))
 {}
