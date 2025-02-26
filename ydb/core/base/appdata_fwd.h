@@ -155,6 +155,10 @@ namespace NSchemeShard {
 
 class TFormatFactory;
 
+namespace NYamlConfig {
+    class IConfigSwissKnife;
+}
+
 struct TAppData {
     static const ui32 MagicTag = 0x2991AAF8;
     const ui32 Magic;
@@ -174,6 +178,7 @@ struct TAppData {
     const TFormatFactory* FormatFactory = nullptr;
     const NSQS::IEventsWriterFactory* SqsEventsWriterFactory = nullptr;
     const NSchemeShard::IOperationFactory *SchemeOperationFactory = nullptr;
+    const NYamlConfig::IConfigSwissKnife *ConfigSwissKnife = nullptr;
 
     NSQS::IAuthFactory* SqsAuthFactory = nullptr;
 
