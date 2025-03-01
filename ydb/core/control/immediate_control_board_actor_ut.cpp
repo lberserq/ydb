@@ -9,6 +9,8 @@
 #include <ydb/core/base/counters.h>
 #include <ydb/core/node_whiteboard/node_whiteboard.h>
 #include <ydb/core/base/tablet.h>
+#include <ydb/core/control/lib/immediate_control_board_wrapper.h>
+
 #include <ydb/library/actors/core/executor_pool_basic.h>
 #include <ydb/library/actors/core/executor_pool_io.h>
 #include <ydb/library/actors/core/hfunc.h>
