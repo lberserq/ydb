@@ -16,6 +16,7 @@
 #include <ydb/services/fq/private_grpc.h>
 #include <ydb/services/cms/grpc_service.h>
 #include <ydb/services/datastreams/grpc_service.h>
+#include <ydb/services/view/grpc_service.h>
 #include <ydb/services/ymq/grpc_service.h>
 #include <ydb/services/kesus/grpc_service.h>
 #include <ydb/core/grpc_services/grpc_mon.h>
@@ -729,6 +730,7 @@ namespace Tests {
         GRpcServer->AddService(new NGRpcService::TGRpcYdbLogStoreService(system, counters, grpcRequestProxies[0], true));
         GRpcServer->AddService(new NGRpcService::TGRpcAuthService(system, counters, grpcRequestProxies[0], true));
         GRpcServer->AddService(new NGRpcService::TGRpcReplicationService(system, counters, grpcRequestProxies[0], true));
+        GRpcServer->AddService(new NGRpcService::TGRpcViewService(system, counters, grpcRequestProxies[0], true));
         GRpcServer->Start();
     }
 
@@ -1854,6 +1856,8 @@ namespace Tests {
     NBus::EMessageStatus TClient::SendAndWaitCompletion(TAutoPtr<NMsgBusProxy::TBusSchemeOperation> request,
                                                         TAutoPtr<NBus::TBusMessage>& reply,
                                                         TDuration timeout) {
+        PrepareRequest(request);
+
         NBus::EMessageStatus status = SendWhenReady(request, reply, timeout.MilliSeconds());
 
         if (status != NBus::MESSAGE_OK) {
@@ -1867,7 +1871,7 @@ namespace Tests {
         const NKikimrClient::TResponse* response = &flatResponse->Record;
 
         if (response->HasErrorReason()) {
-            Cerr << "reason: " << response->GetErrorReason() << Endl;
+            Cerr << "Error " << response->GetStatus() << ": " << response->GetErrorReason() << Endl;
         }
 
         if (response->GetStatus() != NMsgBusProxy::MSTATUS_INPROGRESS) {
