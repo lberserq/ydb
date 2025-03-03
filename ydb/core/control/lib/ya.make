@@ -1,8 +1,8 @@
 LIBRARY()
 
 PEERDIR(
-    ydb/library/actors/core
     util
+    library/cpp/containers/absl_flat_hash
     library/cpp/deprecated/atomic
     library/cpp/iterator
     library/cpp/threading/hot_swap
