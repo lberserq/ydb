@@ -61,59 +61,13 @@ void TControlBoard::GetValue(TString name, TAtomic &outValue, bool &outIsControl
     }
 }
 
-TString TControlBoard::RenderAsHtml() const {
-    TStringStream str;
-    HTML(str) {
-        TABLE_SORTABLE_CLASS("table") {
-            TABLEHEAD() {
-                TABLER() {
-                    TABLEH() { str << "Parameter"; }
-                    TABLEH() { str << "Acceptable range"; }
-                    TABLEH() { str << "Current"; }
-                    TABLEH() { str << "Default"; }
-                    TABLEH() { str << "Send new value"; }
-                    TABLEH() { str << "Changed"; }
-                }
-            }
-            TABLEBODY() {
-                for (const auto& bucket : Board.Buckets) {
-                    TReadGuard guard(bucket.GetLock());
-                    for (const auto &item : bucket.GetMap()) {
-                        TABLER() {
-                            TABLED() { str << item.first; }
-                            TABLED() { str << item.second->RangeAsString(); }
-                            TABLED() {
-                                if (item.second->IsDefault()) {
-                                    str << "<p>" << item.second->Get() << "</p>";
-                                } else {
-                                    str << "<p style='color:red;'><b>" << item.second->Get() << " </b></p>";
-                                }
-                            }
-                            TABLED() {
-                                if (item.second->IsDefault()) {
-                                    str << "<p>" << item.second->GetDefault() << "</p>";
-                                } else {
-                                    str << "<p style='color:red;'><b>" << item.second->GetDefault() << " </b></p>";
-                                }
-                            }
-                            TABLED() {
-                                str << "<form class='form_horizontal' method='post'>";
-                                str << "<input name='" << item.first << "' type='text' value='"
-                                    << item.second->Get() << "'/>";
-                                str << "<button type='submit' style='color:red;'><b>Change</b></button>";
-                                str << "</form>";
-                            }
-                            TABLED() { str << !item.second->IsDefault(); }
-                        }
-                    }
-                }
-            }
+void TControlBoard::RenderAsHtml(TControlBoardTableHtmlRenderer& renderer) const {
+    for (const auto& bucket : Board.Buckets) {
+        TReadGuard guard(bucket.GetLock());
+        for (const auto &item : bucket.GetMap()) {
+            renderer.AddTableItem(item.first, item.second);
         }
-        str << "<form class='form_horizontal' method='post'>";
-        str << "<button type='submit' name='restoreDefaults' style='color:green;'><b>Restore Default</b></button>";
-        str << "</form>";
     }
-    return str.Str();
 }
 
 }
