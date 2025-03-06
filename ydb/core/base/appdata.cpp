@@ -97,7 +97,7 @@ TAppData::TAppData(
     , Mon(nullptr)
     , Icb(new TControlBoard())
     , StaticControlBoard(new TStaticControlBoard())
-    , InFlightLimiterRegistry(new NGRpcService::TInFlightLimiterRegistry(Icb))
+    , InFlightLimiterRegistry(new NGRpcService::TInFlightLimiterRegistry(StaticControlBoard))
     , SharedCachePages(new NSharedCache::TSharedCachePages())
     , StreamingConfig(Impl->StreamingConfig)
     , PQConfig(Impl->PQConfig)
