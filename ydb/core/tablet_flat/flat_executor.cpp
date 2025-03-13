@@ -98,7 +98,7 @@ using namespace NResourceBroker;
 
 class TExecutor::TActiveTransactionZone {
 public:
-    explicit TActiveTransactionZone(TExecutor* self) noexcept
+    explicit TActiveTransactionZone(TExecutor* self)
         : Self(self)
     {
         Y_DEBUG_ABORT_UNLESS(!Self->ActiveTransaction);
@@ -106,11 +106,11 @@ public:
         Active = true;
     }
 
-    ~TActiveTransactionZone() noexcept {
+    ~TActiveTransactionZone() {
         Done();
     }
 
-    void Done() noexcept {
+    void Done() {
         if (Active) {
             Self->ActiveTransaction = false;
             Active = false;
@@ -208,7 +208,7 @@ void TExecutor::Broken() {
     return PassAway();
 }
 
-void TExecutor::RecreatePageCollectionsCache() noexcept
+void TExecutor::RecreatePageCollectionsCache()
 {
     PrivatePageCache = MakeHolder<TPrivatePageCache>();
     StickyPagesMemory = 0;
@@ -224,11 +224,13 @@ void TExecutor::RecreatePageCollectionsCache() noexcept
     }
 
     if (TransactionWaitPads) {
-        for (auto &xpair : TransactionWaitPads) {
-            xpair.second->WaitingSpan.EndOk();
-            TSeat* seat = xpair.second->Seat;
+        auto it = TransactionWaitPads.begin();
+        while (it != TransactionWaitPads.end()) {
+            it->second->WaitingSpan.EndOk();
+            TSeat* seat = it->second->Seat;
             Y_ABORT_UNLESS(seat->State == ESeatState::Waiting);
             seat->State = ESeatState::None;
+            TransactionWaitPads.erase(it++);
 
             if (seat->Cancelled) {
                 FinishCancellation(seat, false);
@@ -236,11 +238,10 @@ void TExecutor::RecreatePageCollectionsCache() noexcept
                 EnqueueActivation(seat, false);
             }
         }
-        TransactionWaitPads.clear();
     }
 }
 
-void TExecutor::ReflectSchemeSettings() noexcept
+void TExecutor::ReflectSchemeSettings()
 {
     for (const auto &it : Scheme().Tables) {
         auto &policy = *it.second.CompactionPolicy;
@@ -653,7 +654,7 @@ void TExecutor::ActivateWaitingTransactions(TPrivatePageCache::TPage::TWaitQueue
     }
 }
 
-void TExecutor::AddCachesOfBundle(const NTable::TPartView &partView) noexcept
+void TExecutor::AddCachesOfBundle(const NTable::TPartView &partView)
 {
     auto *partStore = partView.As<NTable::TPartStore>();
 
@@ -671,7 +672,7 @@ void TExecutor::AddCachesOfBundle(const NTable::TPartView &partView) noexcept
         AddSingleCache(blobs);
 }
 
-void TExecutor::AddSingleCache(const TIntrusivePtr<TPrivatePageCache::TInfo> &info) noexcept
+void TExecutor::AddSingleCache(const TIntrusivePtr<TPrivatePageCache::TInfo> &info)
 {
     PrivatePageCache->RegisterPageCollection(info);
     Send(MakeSharedPageCacheId(), new NSharedCache::TEvAttach(info->PageCollection, SelfId()));
@@ -681,7 +682,7 @@ void TExecutor::AddSingleCache(const TIntrusivePtr<TPrivatePageCache::TInfo> &in
     Counters->Simple()[TExecutorCounters::CACHE_TOTAL_STICKY] = StickyPagesMemory;
 }
 
-void TExecutor::DropCachesOfBundle(const NTable::TPart &part) noexcept
+void TExecutor::DropCachesOfBundle(const NTable::TPart &part)
 {
     auto *partStore = CheckedCast<const NTable::TPartStore*>(&part);
 
@@ -699,7 +700,7 @@ void TExecutor::DropCachesOfBundle(const NTable::TPart &part) noexcept
         DropSingleCache(blobs->Id);
 }
 
-void TExecutor::DropSingleCache(const TLogoBlobID &label) noexcept
+void TExecutor::DropSingleCache(const TLogoBlobID &label)
 {
     auto pageCollection = PrivatePageCache->GetPageCollection(label);
 
@@ -3178,7 +3179,7 @@ void TExecutor::Handle(TEvResourceBroker::TEvResourceAllocated::TPtr &ev) {
     }
 }
 
-void TExecutor::StartSeat(ui64 task, TResource *cookie_) noexcept
+void TExecutor::StartSeat(ui64 task, TResource *cookie_)
 {
     auto *cookie = CheckedCast<TMemory::TCookie*>(cookie_);
     TSeat* seat = cookie->Seat;
@@ -3247,13 +3248,13 @@ THolder<TScanSnapshot> TExecutor::PrepareScanSnapshot(ui32 table, const NTable::
     return THolder<TScanSnapshot>(new TScanSnapshot{table, std::move(barrier), subset, snapshot});
 }
 
-void TExecutor::StartScan(ui64 serial, ui32 table) noexcept
+void TExecutor::StartScan(ui64 serial, ui32 table)
 {
     Y_UNUSED(table);
     Scans->Start(serial);
 }
 
-void TExecutor::StartScan(ui64 task, TResource *cookie) noexcept
+void TExecutor::StartScan(ui64 task, TResource *cookie)
 {
     if (auto acquired = Scans->Acquired(task, cookie)) {
         StartScan(acquired.Serial, acquired.Table);
@@ -4386,7 +4387,7 @@ void TExecutor::RenderHtmlPage(NMon::TEvRemoteHttpInfo::TPtr &ev) const {
     Send(ev->Sender, new NMon::TEvRemoteHttpInfoRes(str.Str()));
 }
 
-const NTable::TScheme& TExecutor::Scheme() const noexcept {
+const NTable::TScheme& TExecutor::Scheme() const {
     Y_DEBUG_ABORT_UNLESS(Database);
     return Database->GetScheme();
 }
@@ -4469,7 +4470,7 @@ TTransactionWaitPad::TTransactionWaitPad(TSeat* seat)
 TTransactionWaitPad::~TTransactionWaitPad()
 {}
 
-NWilson::TTraceId TTransactionWaitPad::GetWaitingTraceId() const noexcept {
+NWilson::TTraceId TTransactionWaitPad::GetWaitingTraceId() const {
     return WaitingSpan.GetTraceId();
 }
 
