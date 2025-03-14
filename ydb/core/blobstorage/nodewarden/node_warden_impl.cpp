@@ -10,6 +10,7 @@
 #include <ydb/core/blobstorage/dsproxy/dsproxy_nodemonactor.h>
 #include <ydb/core/blobstorage/pdisk/drivedata_serializer.h>
 #include <ydb/core/blobstorage/vdisk/repl/blobstorage_replbroker.h>
+#include <ydb/core/blobstorage/vdisk/syncer/blobstorage_syncer_broker.h>
 #include <ydb/library/pdisk_io/file_params.h>
 #include <ydb/core/control/lib/static_control_board_impl.h>
 #include <ydb/core/mind/bscontroller/yaml_config_helpers.h>
@@ -424,6 +425,8 @@ void TNodeWarden::Bootstrap() {
 
     const ui64 maxBytes = replBrokerConfig.GetMaxInFlightReadBytes();
     actorSystem->RegisterLocalService(MakeBlobStorageReplBrokerID(), Register(CreateReplBrokerActor(maxBytes)));
+
+    actorSystem->RegisterLocalService(MakeBlobStorageSyncBrokerID(), Register(CreateSyncBrokerActor()));
 
     // determine if we are running in 'mock' mode
     EnableProxyMock = Cfg->BlobStorageConfig.GetServiceSet().GetEnableProxyMock();
