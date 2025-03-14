@@ -27,6 +27,7 @@ namespace NKikimr {
         DataShardControlsIncrementalRestoreReadAheadHi          /* "DataShardControls.IncrementalRestoreReadAheadHi" */,
         DataShardControlsCdcInitialScanReadAheadLo              /* "DataShardControls.CdcInitialScanReadAheadLo" */,
         DataShardControlsCdcInitialScanReadAheadHi              /* "DataShardControls.CdcInitialScanReadAheadHi" */,
+        DataShardControlsReadIteratorKeysExtBlobsPrecharge      /* "DataShardControls.ReadIteratorKeysExtBlobsPrecharge" */
         TxLimitControlsPerRequestDataSizeLimit                  /* "TxLimitControls.PerRequestDataSizeLimit" */,
         TxLimitControlsPerShardReadSizeLimit                    /* "TxLimitControls.PerShardReadSizeLimit" */,
         TxLimitControlsPerShardIncomingReadSetSizeLimit         /* "TxLimitControls.PerShardIncomingReadSetSizeLimit" */,
