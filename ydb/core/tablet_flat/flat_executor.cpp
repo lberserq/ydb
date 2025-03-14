@@ -140,6 +140,20 @@ TExecutor::~TExecutor() {
 
 }
 
+bool TExecutor::OnUnhandledException(const std::exception& e) {
+    if (AppData()->FeatureFlags.GetEnableTabletRestartOnUnhandledExceptions()) {
+        if (auto log = Logger->Log(ELnLev::Crit)) {
+            log << "Tablet " << TabletId() << " unhandled exception " << TypeName(e) << ": " << e.what()
+                << '\n' << TBackTrace::FromCurrentException().PrintToString();
+        }
+        Broken();
+        return true;
+    }
+
+    // Exception will propagate and cause the process to crash
+    return false;
+}
+
 ui64 TExecutor::Stamp() const noexcept
 {
     return CommitManager ? CommitManager->Stamp() : TTxStamp{ Generation0, Step0 }.Raw;
@@ -169,6 +183,7 @@ void TExecutor::Registered(TActorSystem *sys, const TActorId&)
     GetServiceCounters(AppData()->Counters, "tablets")->GetCounter("alerts_req_nodata", true);
     GetServiceCounters(AppData()->Counters, "tablets")->GetCounter("alerts_scan_nodata", true);
     GetServiceCounters(AppData()->Counters, "tablets")->GetCounter("alerts_boot_nodata", true);
+    GetServiceCounters(AppData()->Counters, "tablets")->GetCounter("alerts_broken", true);
 }
 
 void TExecutor::PassAway() {
@@ -196,6 +211,8 @@ void TExecutor::PassAway() {
 }
 
 void TExecutor::Broken() {
+    GetServiceCounters(AppData()->Counters, "tablets")->GetCounter("alerts_broken", true)->Inc();
+
     if (BootLogic)
         BootLogic->Cancel();
 
@@ -889,7 +906,7 @@ void TExecutor::Restored(TEvTablet::TEvRestored::TPtr &ev, const TActorContext &
     return TranscriptBootOpResult(res, ctx);
 }
 
-void TExecutor::DetachTablet(const TActorContext &) {
+void TExecutor::DetachTablet() {
     TabletCountersForgetTablet(Owner->TabletID(), Owner->TabletType(),
         Owner->Info()->TenantPathId, Stats->IsFollower(), SelfId());
     return PassAway();
