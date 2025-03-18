@@ -103,6 +103,7 @@ namespace NKikimr {
         VDiskControlsDiskTimeAvailableScaleHDD                  /* "VDiskControls.DiskTimeAvailableScaleHDD" */,
         VDiskControlsDiskTimeAvailableScaleSSD                  /* "VDiskControls.DiskTimeAvailableScaleSSD" */,
         VDiskControlsDiskTimeAvailableScaleNVME                 /* "VDiskControls.DiskTimeAvailableScaleNVME" */,
+        VDiskControlsMaxInProgressSyncCount                     /* "VDiskControls.MaxInProgressSyncCount" */,
         DSProxyControlsSlowDiskThreshold                        /* "DSProxyControls.SlowDiskThreshold" */,
         DSProxyControlsSlowDiskThresholdHDD                     /* "DSProxyControls.SlowDiskThresholdHDD" */,
         DSProxyControlsSlowDiskThresholdSSD                     /* "DSProxyControls.SlowDiskThresholdSSD" */,
