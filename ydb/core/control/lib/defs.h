@@ -65,8 +65,6 @@ namespace NKikimr {
         ColumnShardControlsCompactionDelaySec                                       /* "ColumnShardControls.CompactionDelaySec" */,
         ColumnShardControlsGranuleIndexedPortionsSizeLimit                          /* "ColumnShardControls.GranuleIndexedPortionsSizeLimit" */,
         ColumnShardControlsGranuleIndexedPortionsCountLimit                         /* "ColumnShardControls.GranuleIndexedPortionsCountLimit" */,
-        ColumnShardControlsBlobCountToTriggerGC                                     /* "ColumnShardControls.BlobCountToTriggerGC" */,
-        ColumnShardControlsMaxPortionsInGranule                                     /* "ColumnShardControls.MaxPortionsInGranule" */,
         BlobCacheMaxCacheDataSize                                                   /* "BlobCache.MaxCacheDataSize" */,
         BlobCacheMaxInFlightDataSize                                                /* "BlobCache.MaxInFlightDataSize" */,
         CoordinatorControlsEnableLeaderLeases                                       /* "CoordinatorControls.EnableLeaderLeases" */,

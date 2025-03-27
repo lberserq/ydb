@@ -2538,17 +2538,6 @@ Y_UNIT_TEST_SUITE(TColumnShardTestReadWrite) {
         };
         runtime.SetEventFilter(captureEvents);
 
-        // Disable GC batching so that deleted blobs get collected without a delay
-        {
-            TAtomic unusedPrev;
-            runtime.GetAppData().StaticControlBoard->SetValue(EStaticControlType::ColumnShardControlsBlobCountToTriggerGC, 1, unusedPrev);
-        }
-
-        {
-            TAtomic unusedPrev;
-            runtime.GetAppData().StaticControlBoard->SetValue(EStaticControlType::ColumnShardControlsMaxPortionsInGranule, 10, unusedPrev);
-        }
-
         // Write different keys: grow on compaction
 
         static const ui32 triggerPortionSize = 75 * 1000;
