@@ -27,7 +27,7 @@ namespace NKikimr {
         DataShardControlsIncrementalRestoreReadAheadHi                              /* "DataShardControls.IncrementalRestoreReadAheadHi" */,
         DataShardControlsCdcInitialScanReadAheadLo                                  /* "DataShardControls.CdcInitialScanReadAheadLo" */,
         DataShardControlsCdcInitialScanReadAheadHi                                  /* "DataShardControls.CdcInitialScanReadAheadHi" */,
-        DataShardControlsReadIteratorKeysExtBlobsPrecharge                          /* "DataShardControls.ReadIteratorKeysExtBlobsPrecharge" */
+        DataShardControlsReadIteratorKeysExtBlobsPrecharge                          /* "DataShardControls.ReadIteratorKeysExtBlobsPrecharge" */,
         TxLimitControlsPerRequestDataSizeLimit                                      /* "TxLimitControls.PerRequestDataSizeLimit" */,
         TxLimitControlsPerShardReadSizeLimit                                        /* "TxLimitControls.PerShardReadSizeLimit" */,
         TxLimitControlsPerShardIncomingReadSetSizeLimit                             /* "TxLimitControls.PerShardIncomingReadSetSizeLimit" */,
@@ -163,6 +163,9 @@ namespace NKikimr {
         GrpcControlsRequestConfigsClickhouseInternalDescribeTableMaxInFlight        /* "GrpcControls.RequestConfigs.ClickhouseInternal_DescribeTable_MaxInFlight" */,
         GrpcControlsRequestConfigsClickhouseInternalCreateSnapshotMaxInFlight       /* "GrpcControls.RequestConfigs.ClickhouseInternal_CreateSnapshot_MaxInFlight" */,
         GrpcControlsRequestConfigsClickhouseInternalRefreshSnapshotMaxInFlight      /* "GrpcControls.RequestConfigs.ClickhouseInternal_RefreshSnapshot_MaxInFlight" */,
-        GrpcControlsRequestConfigsClickhouseInternalDiscardSnapshotMaxInFlight      /* "GrpcControls.RequestConfigs.ClickhouseInternal_DiscardSnapshot_MaxInFlight" */
-    };
+        GrpcControlsRequestConfigsClickhouseInternalDiscardSnapshotMaxInFlight      /* "GrpcControls.RequestConfigs.ClickhouseInternal_DiscardSnapshot_MaxInFlight" */,
+        GrpcControlsRequestConfigsTableServiceStreamExecuteScanQueryMaxInflight     /* "GrpcControls.RequestConfigs.TableService.StreamExecuteScanQuery_MaxInflight" */,
+        GrpcControlsRequestConfigsTableServiceStreamReadTableMaxInflight            /* "GrpcControls.RequestConfigs.TableService.StreamReadTable_MaxInflight" */,
+        GrpcControlsRequestConfigsTableServiceReadRowsMaxInflight                   /* "GrpcControls.RequestConfigs.TableService.ReadRows_MaxInflight" */
+        };
 } // NKikimr
