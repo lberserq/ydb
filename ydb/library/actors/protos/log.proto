@@ -5,10 +5,9 @@ option java_package = "ru.yandex.kikimr.proto";
 option java_outer_classname = "NActorsBaseProtoLog";
 
 message TActorSendMessage {
-    optional uint32 ActivityIndex = 1;
-    optional NActorsProto.TActorId Sender = 2;
-    optional NActorsProto.TActorId RecipientRewrite = 3;
-    optional fixed64 ObjectId = 4;
+    optional NActorsProto.TActorId Sender = 1;
+    optional NActorsProto.TActorId RecipientRewrite = 2;
+    optional fixed64 ObjectId = 3;
 }
 
 message TActorReceiveMessage {
