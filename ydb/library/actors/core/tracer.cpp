@@ -1,10 +1,7 @@
 #include "tracer.h"
 
-
 #include "actor.h"
 #include "actorid.h"
-
-#include <ydb/library/actors/trace_data/trace_data.h>
 
 #include <library/cpp/containers/concurrent_hash/concurrent_hash.h>
 #include <library/cpp/containers/ring_buffer/ring_buffer.h>
@@ -12,16 +9,15 @@
 
 #include <util/system/thread.h>
 
-// TODO REMOVE DEBUG
+#ifdef DEBUG_TRACER_MANUAL
 #include <util/stream/file.h>
-// END
+#endif
 
 namespace NActors::NTracing {
 
     class TInternalTracer {
     private:
         using TMessage = TEvent;
-        using TEventNameDict = THashMap<ui32, TString>;
     public:
         explicit TInternalTracer(TSettings&& settings)
             : Settings(std::move(settings))
@@ -36,17 +32,6 @@ namespace NActors::NTracing {
                 return TThreadData{.Buffer = std::move(buffer)};
             });
             threadData.Buffer->PushBack(std::move(message));
-        }
-
-        void Dump() {
-            // DEBUG ONLY
-            TFileOutput fout("actors_dump.bin");
-            auto [dataBuffer, eventNames] = DumpImpl();
-            auto activityDict = GetActivityDict();
-            auto headerBuffer = SerializeHeader(std::move(activityDict), std::move(eventNames));
-            fout.Write(headerBuffer.data(), headerBuffer.Size());
-            fout.Write(dataBuffer.data(), dataBuffer.Size());
-            fout.Flush();
         }
 
         TVector<TStringBuf> GetActivityDict() const {
@@ -68,10 +53,33 @@ namespace NActors::NTracing {
                 bucket.GetUnsafe(threadId).EventNameDict.emplace(typeIndex, typeName);
             }
         }
+
+        TTraceChunk GetTraceChunk() {
+            auto [events, eventNamesDict] = GetTraceChunkImpl();
+            return {
+                .ActivityDict = GetActivityDict(),
+                .EventNamesDict = std::move(eventNamesDict),
+                .Events = std::move(events)
+            };
+        }
+
+#ifdef DEBUG_TRACER_MANUAL
+        void Dump() {
+            TFileOutput fout("actors_dump.bin");
+            auto traceChunk = GetTraceChunk();
+
+            auto headerBuffer = SerializeHeader(std::move(traceChunk.ActivityDict), std::move(traceChunk.EventNamesDict));
+            fout.Write(headerBuffer.data(), headerBuffer.Size());
+            auto dataBuffer = SerializeEvents(std::move(traceChunk.Events));
+            fout.Write(dataBuffer.data(), dataBuffer.Size());
+            fout.Flush();
+        }
+#endif
+
     private:
-        std::pair<TBuffer, TEventNameDict> DumpImpl() {
-            TBuffer res;
-            TEventNameDict eventNames;
+        std::pair<TTraceChunk::TEvents, TEventNamesDict> GetTraceChunkImpl() {
+            TTraceChunk::TEvents events;
+            TEventNamesDict eventNames;
             while (!Queue.IsEmpty()) {
                 auto bufferItem = Queue.Pop();
                 if (!bufferItem) {
@@ -86,48 +94,21 @@ namespace NActors::NTracing {
                     );
                 }
                 auto& buffer = *bufferItem->Buffer;
-#define WRITE_TO_BUFF(buff, MEMBER_NAME) \
-                buff.Append(reinterpret_cast<const char*>(&item.MEMBER_NAME), sizeof(item.MEMBER_NAME));
-
-                auto writer = [&res](auto&& item) {
-                    WRITE_TO_BUFF(res, Timestamp);
-                    WRITE_TO_BUFF(res, Type);
-                    switch (item.Type) {
-                        case TMessage::EType::SendInterconnect:
-                            WRITE_TO_BUFF(res, Event.SendInterconnectEvent);
-                            break;
-                        case TMessage::EType::RecieveInterconnect:
-                            WRITE_TO_BUFF(res, Event.RecieveInterconnectEvent);
-                            break;
-                        case TMessage::EType::SendLocal:
-                            WRITE_TO_BUFF(res, Event.SendLocalEvent);
-                            break;
-                        case TMessage::EType::RecieveLocal:
-                            WRITE_TO_BUFF(res, Event.RecieveLocalEvent);
-                            break;
-                        case TMessage::EType::New:
-                            WRITE_TO_BUFF(res, Event.NewEvent);
-                            break;
-                        case TMessage::EType::Die:
-                            WRITE_TO_BUFF(res, Event.DieEvent);
-                            break;
-                    }
-                };
-#undef WRITE_TO_BUFF
-
+                events.reserve(events.size() + buffer.AvailSize());
                 for (size_t idx = buffer.FirstIndex(); idx < buffer.TotalSize(); ++idx) {
-                    writer(buffer[idx]);
+                    events.push_back(buffer[idx]);
                 }
             }
-            return std::make_pair(res, eventNames);
+            return std::make_pair(events, eventNames);
         }
+
     private:
         TSettings Settings;
         using TRingBuffer = TSimpleRingBuffer<TMessage>;
         using TRingBufferPtr = TAtomicSharedPtr<TRingBuffer>;
         struct TThreadData {
             TRingBufferPtr Buffer;
-            TEventNameDict EventNameDict;
+            TEventNamesDict EventNameDict;
         };
 
         static constexpr size_t DEFAULT_BUCKET_COUNT = 64;
@@ -151,9 +132,12 @@ namespace NActors::NTracing {
     class TActorTracer: public IActorTracer {
     public:
         explicit TActorTracer(TSettings settings)
-            : TracerImpl(std::move(settings))
+            : AutoStart(settings.AutoStart)
+            , TracerImpl(std::move(settings))
         {
-            Start();
+            if (AutoStart) {
+                Start();
+            }
         }
 
         void HandleNew(IActor& actor) override {
@@ -276,12 +260,18 @@ namespace NActors::NTracing {
             Started.store(false, std::memory_order::release);
         }
 
-        ~TActorTracer() override {
-            Stop();
-            TracerImpl.Dump();
+        TTraceChunk GetTraceData() override {
+            return TracerImpl.GetTraceChunk();
         }
 
+        ~TActorTracer() override {
+            Stop();
+#ifdef DEBUG_TRACER_MANUAL
+            TracerImpl.Dump();
+#endif
+        }
     private:
+        bool AutoStart = false;
         TInternalTracer TracerImpl;
         std::atomic<bool> Started;
     };
