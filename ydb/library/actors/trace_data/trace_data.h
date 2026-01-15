@@ -70,6 +70,6 @@ namespace NActors {
             EType Type;
         };
 
-        TBuffer SerializeHeaderDict(const THashMap<ui32, TString>& dict);
+        TBuffer SerializeHeader(TVector<TStringBuf>&& activityDict, THashMap<ui32, TString>&& eventNamesDict);
     }
 }
