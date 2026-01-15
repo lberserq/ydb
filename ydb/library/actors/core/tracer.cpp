@@ -21,6 +21,7 @@ namespace NActors::NTracing {
     class TInternalTracer {
     private:
         using TMessage = TEvent;
+        using TEventNameDict = THashMap<ui32, TString>;
     public:
         explicit TInternalTracer(TSettings&& settings)
             : Settings(std::move(settings))
@@ -28,25 +29,49 @@ namespace NActors::NTracing {
 
         void AddMessage(TMessage&& message) {
             message.Timestamp = TInstant::Now().Seconds();
-            auto& buffer = ThreadId2Buffer.InsertIfAbsentWithInit(TThread::CurrentThreadId(), [&queue=this->Queue, &settings=this->Settings]{
+            auto& threadData = ThreadId2Data.InsertIfAbsentWithInit(TThread::CurrentThreadId(), [&queue=this->Queue, &settings=this->Settings]{
                 auto buffer = MakeAtomicShared<TRingBuffer>(settings.MaxBufferSizePerThread);
                 auto queueItem = MakeHolder<TRingBufferWithTid>(TRingBufferWithTid{.Buffer = buffer, .ThreadId = TThread::CurrentThreadId()});
                 queue.Push(std::move(queueItem));
-                return buffer;
+                return TThreadData{.Buffer = std::move(buffer)};
             });
-            buffer->PushBack(std::move(message));
+            threadData.Buffer->PushBack(std::move(message));
         }
 
         void Dump() {
             // DEBUG ONLY
             TFileOutput fout("actors_dump.bin");
-            auto buffer = DumpImpl();
-            fout.Write(buffer.data(), buffer.Size());
+            auto [dataBuffer, eventNames] = DumpImpl();
+            auto activityDict = GetActivityDict();
+            auto headerBuffer = SerializeHeader(std::move(activityDict), std::move(eventNames));
+            fout.Write(headerBuffer.data(), headerBuffer.Size());
+            fout.Write(dataBuffer.data(), dataBuffer.Size());
             fout.Flush();
         }
+
+        TVector<TStringBuf> GetActivityDict() const {
+            auto& activityIndex = TLocalProcessKeyState<TActorActivityTag>::GetInstance();
+            TVector<TStringBuf> res(Reserve(activityIndex.GetCount()));
+            for (ui32 index = 0; index < activityIndex.GetCount(); ++index) {
+                if (auto name = activityIndex.GetNameByIndex(index); !name.empty()) {
+                    res.push_back(std::move(name));
+                }
+            }
+            return res;
+        }
+
+        void RegisterEventTypeName(ui32 typeIndex, const TString& typeName) {
+            auto threadId = TThread::CurrentThreadId();
+            auto& bucket = ThreadId2Data.GetBucketForKey(threadId);
+            {
+                TThreadIdMapping::TBucketGuard guard(bucket.GetMutex());
+                bucket.GetUnsafe(threadId).EventNameDict.emplace(typeIndex, typeName);
+            }
+        }
     private:
-        TBuffer DumpImpl() {
+        std::pair<TBuffer, TEventNameDict> DumpImpl() {
             TBuffer res;
+            TEventNameDict eventNames;
             while (!Queue.IsEmpty()) {
                 auto bufferItem = Queue.Pop();
                 if (!bufferItem) {
@@ -54,8 +79,11 @@ namespace NActors::NTracing {
                 }
 
                 {
-                    auto bufferFromMap = ThreadId2Buffer.Remove(bufferItem->ThreadId);
-                    Y_UNUSED(bufferFromMap);
+                    auto threadData = ThreadId2Data.Remove(bufferItem->ThreadId);
+                    eventNames.insert(
+                        std::make_move_iterator(threadData.EventNameDict.begin()),
+                        std::make_move_iterator(threadData.EventNameDict.end())
+                    );
                 }
                 auto& buffer = *bufferItem->Buffer;
 #define WRITE_TO_BUFF(buff, MEMBER_NAME) \
@@ -91,14 +119,20 @@ namespace NActors::NTracing {
                     writer(buffer[idx]);
                 }
             }
-            return res;
+            return std::make_pair(res, eventNames);
         }
     private:
         TSettings Settings;
         using TRingBuffer = TSimpleRingBuffer<TMessage>;
         using TRingBufferPtr = TAtomicSharedPtr<TRingBuffer>;
+        struct TThreadData {
+            TRingBufferPtr Buffer;
+            TEventNameDict EventNameDict;
+        };
+
         static constexpr size_t DEFAULT_BUCKET_COUNT = 64;
-        TConcurrentHashMap<TThread::TId, TRingBufferPtr, DEFAULT_BUCKET_COUNT, TSpinLock> ThreadId2Buffer;
+        using TThreadIdMapping = TConcurrentHashMap<TThread::TId, TThreadData, DEFAULT_BUCKET_COUNT, TSpinLock>;
+        TThreadIdMapping ThreadId2Data;
         struct TRingBufferWithTid {
             TRingBufferPtr Buffer;
             TThread::TId ThreadId;
@@ -209,6 +243,7 @@ namespace NActors::NTracing {
                 .Type = TEvent::EType::SendLocal
             };
             TracerImpl.AddMessage(std::move(message));
+            TracerImpl.RegisterEventTypeName(event.GetTypeRewrite(), event.GetTypeName());
         }
 
         void HandleReceive(IActor& recipient, IEventHandle& event) override {
@@ -230,6 +265,7 @@ namespace NActors::NTracing {
             message.Event.RecieveLocalEvent.ActivityIndex = recipient.GetActivityType().GetIndex();
 
             TracerImpl.AddMessage(std::move(message));
+            TracerImpl.RegisterEventTypeName(event.GetTypeRewrite(), event.GetTypeName());
         }
 
         void Start() override {
