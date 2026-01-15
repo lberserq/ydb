@@ -43,10 +43,46 @@ namespace NActors::NTracing {
         }
     }
 
-    TBuffer SerializeHeader(TVector<TStringBuf>&& activityDict, THashMap<ui32, TString>&& eventNamesDict) {
+    TBuffer SerializeHeader(TActivityDict&& activityDict, TEventNamesDict&& eventNamesDict) {
         TBuffer res;
         Serialize(activityDict, res);
         Serialize(eventNamesDict, res);
+        return res;
+    }
+
+    TBuffer SerializeEvents(TTraceChunk::TEvents&& events) {
+        TBuffer res;
+#define WRITE_TO_BUFF(buff, MEMBER_NAME) \
+        buff.Append(reinterpret_cast<const char*>(&item.MEMBER_NAME), sizeof(item.MEMBER_NAME));
+
+        auto writer = [&res](auto&& item) {
+            WRITE_TO_BUFF(res, Timestamp);
+            WRITE_TO_BUFF(res, Type);
+            switch (item.Type) {
+                case TEvent::EType::SendInterconnect:
+                    WRITE_TO_BUFF(res, Event.SendInterconnectEvent);
+                    break;
+                case TEvent::EType::RecieveInterconnect:
+                    WRITE_TO_BUFF(res, Event.RecieveInterconnectEvent);
+                    break;
+                case TEvent::EType::SendLocal:
+                    WRITE_TO_BUFF(res, Event.SendLocalEvent);
+                    break;
+                case TEvent::EType::RecieveLocal:
+                    WRITE_TO_BUFF(res, Event.RecieveLocalEvent);
+                    break;
+                case TEvent::EType::New:
+                    WRITE_TO_BUFF(res, Event.NewEvent);
+                    break;
+                case TEvent::EType::Die:
+                    WRITE_TO_BUFF(res, Event.DieEvent);
+                    break;
+            }
+        };
+#undef WRITE_TO_BUFF
+        for (auto&& event: events) {
+            writer(std::move(event));
+        }
         return res;
     }
 }

@@ -1,7 +1,10 @@
 #pragma once
 
 #include <util/generic/fwd.h>
+
 #include <util/generic/buffer.h>
+#include <util/generic/vector.h>
+#include <util/generic/hash.h>
 
 namespace NActors {
     namespace NTracing {
@@ -70,6 +73,17 @@ namespace NActors {
             EType Type;
         };
 
-        TBuffer SerializeHeader(TVector<TStringBuf>&& activityDict, THashMap<ui32, TString>&& eventNamesDict);
+        using TActivityDict = TVector<TStringBuf>;
+        using TEventNamesDict = THashMap<ui32, TString>;
+
+        struct TTraceChunk {
+            using TEvents = TVector<TEvent>;
+            TActivityDict ActivityDict;
+            TEventNamesDict EventNamesDict;
+            TEvents Events;
+        };
+
+        TBuffer SerializeHeader(TActivityDict&& activityDict, TEventNamesDict&& eventNamesDict);
+        TBuffer SerializeEvents(TTraceChunk::TEvents&& events);
     }
 }
