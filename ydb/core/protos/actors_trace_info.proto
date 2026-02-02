@@ -1,0 +1,10 @@
+package NKikimrActorsTraceInfoProto;
+
+
+message TEvActorsTraceInfoRequest {
+
+}
+
+message TEvActorsTraceInfoResponse {
+    optional bytes Response = 1;
+}
