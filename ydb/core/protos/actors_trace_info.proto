@@ -1,10 +1,15 @@
 package NKikimrActorsTraceInfoProto;
 
-
-message TEvActorsTraceInfoRequest {
-
+message TEvActorsTraceStartRequest {
 }
 
-message TEvActorsTraceInfoResponse {
-    optional bytes Response = 1;
+message TEvActorsTraceStartResponse {
+}
+
+message TEvActorsTraceGetInfoRequest {
+}
+
+message TEvActorsTraceGetInfoResponse {
+    optional bytes Header = 1;
+    optional bytes Events = 2;
 }
