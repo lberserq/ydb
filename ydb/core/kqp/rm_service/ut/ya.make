@@ -6,6 +6,7 @@ SIZE(MEDIUM)
 
 SRCS(
     kqp_rm_ut.cpp
+    kqp_rm_bench_ut.cpp
 )
 
 PEERDIR(
