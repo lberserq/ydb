@@ -190,6 +190,84 @@ Y_UNIT_TEST(YellowZoneZeroDivision) {
     UNIT_ASSERT_EQUAL(false, alloc.IsMemoryYellowZoneEnabled());
 }
 
+Y_UNIT_TEST(LimitExceededThrowsWithoutCallback) {
+    TAlignedPagePool::ResetGlobalsUT();
+    TAlignedPagePoolImpl alloc(__LOCATION__);
+
+    auto size = 1024 * TAlignedPagePool::POOL_PAGE_SIZE;
+    alloc.SetLimit(size);
+
+    auto block = alloc.GetBlock(size);
+    UNIT_ASSERT_EXCEPTION(alloc.GetBlock(size), TMemoryLimitExceededException);
+
+    alloc.ReturnBlock(block, size);
+}
+
+Y_UNIT_TEST(IncreaseLimitCallbackGrants) {
+    TAlignedPagePool::ResetGlobalsUT();
+    TAlignedPagePoolImpl alloc(__LOCATION__);
+
+    auto size = 1024 * TAlignedPagePool::POOL_PAGE_SIZE;
+    alloc.SetLimit(size);
+    alloc.SetIncreaseMemoryLimitCallback([&](ui64 /*limit*/, ui64 required) {
+        alloc.SetLimit(required);
+    });
+
+    auto block1 = alloc.GetBlock(size);
+    auto block2 = alloc.GetBlock(size);
+    UNIT_ASSERT_GE(alloc.GetLimit(), 2 * size);
+
+    alloc.ReturnBlock(block2, size);
+    alloc.ReturnBlock(block1, size);
+}
+
+Y_UNIT_TEST(IncreaseLimitCallbackDenies) {
+    TAlignedPagePool::ResetGlobalsUT();
+    TAlignedPagePoolImpl alloc(__LOCATION__);
+
+    auto size = 1024 * TAlignedPagePool::POOL_PAGE_SIZE;
+    alloc.SetLimit(size);
+    bool asked = false;
+    // The callback contract: denial is signaled by not raising the limit,
+    // then the pool itself throws the typed exception.
+    alloc.SetIncreaseMemoryLimitCallback([&](ui64, ui64) {
+        asked = true;
+    });
+
+    auto block = alloc.GetBlock(size);
+    UNIT_ASSERT_EXCEPTION(alloc.GetBlock(size), TMemoryLimitExceededException);
+    UNIT_ASSERT(asked);
+
+    alloc.ReturnBlock(block, size);
+}
+
+Y_UNIT_TEST(YellowZoneSuppressedWhileCallbackActive) {
+    TAlignedPagePool::ResetGlobalsUT();
+    TAlignedPagePoolImpl alloc(__LOCATION__);
+
+    // Pinned behavior: while an increase-limit callback is set and the
+    // maximum-limit flag is not reached, the yellow zone is not updated —
+    // spilling pressure comes from the quota manager instead.
+    auto size = 1024 * TAlignedPagePool::POOL_PAGE_SIZE;
+    alloc.SetLimit(size * 20);
+    alloc.SetIncreaseMemoryLimitCallback([](ui64, ui64) {});
+
+    auto block1 = alloc.GetBlock(size * 13);
+    UNIT_ASSERT_VALUES_EQUAL(false, alloc.IsMemoryYellowZoneEnabled());
+
+    // 85% > threshold, but the update is suppressed by the active callback
+    auto block2 = alloc.GetBlock(size * 4);
+    UNIT_ASSERT_VALUES_EQUAL(false, alloc.IsMemoryYellowZoneEnabled());
+
+    alloc.SetMaximumLimitValueReached(true);
+    auto block3 = alloc.GetBlock(size * 2);
+    UNIT_ASSERT_VALUES_EQUAL(true, alloc.IsMemoryYellowZoneEnabled());
+
+    alloc.ReturnBlock(block3, size * 2);
+    alloc.ReturnBlock(block2, size * 4);
+    alloc.ReturnBlock(block1, size * 13);
+}
+
 } // Y_UNIT_TEST_SUITE(TAlignedPagePoolTest)
 
 } // namespace NKikimr::NMiniKQL

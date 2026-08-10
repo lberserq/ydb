@@ -197,6 +197,11 @@ public:
         return MakeIntrusive<NRm::TTxState>(rm, txId, TInstant::Now(), "", (double)100, "", false);
     }
 
+    TIntrusivePtr<NRm::TTxState> MakePoolTx(ui64 txId, std::shared_ptr<NRm::IKqpResourceManager> rm,
+            const TString& poolId, double memoryPoolPercent, const TString& database = "db1") {
+        return MakeIntrusive<NRm::TTxState>(rm, txId, TInstant::Now(), poolId, memoryPoolPercent, database, false);
+    }
+
     void AssertResourceManagerStats(
             std::shared_ptr<NRm::IKqpResourceManager> rm, ui64 scanQueryMemory, ui32 executionUnits) {
         Y_UNUSED(executionUnits);
@@ -282,6 +287,14 @@ public:
         UNIT_TEST(SnapshotSharingByExchanger);
         UNIT_TEST(NodesMembershipByExchanger);
         UNIT_TEST(DisonnectNodes);
+        UNIT_TEST(NamedPoolLimitEnforced);
+        UNIT_TEST(TwoNamedPoolsIsolated);
+        UNIT_TEST(SamePoolNameDifferentDatabases);
+        UNIT_TEST(ZeroPercentBypassesNamedPool);
+        UNIT_TEST(StaleLimitRestoredByOldTx);
+        UNIT_TEST(ExternalMemoryNotChargedToNamedPool);
+        UNIT_TEST(NamedPoolRollbackOnResourceBrokerFailure);
+        UNIT_TEST(NamedPoolSpillingThreshold);
     UNIT_TEST_SUITE_END();
 
     void SingleTask();
@@ -299,6 +312,14 @@ public:
     void NodesMembership();
     void NodesMembershipByExchanger();
     void DisonnectNodes();
+    void NamedPoolLimitEnforced();
+    void TwoNamedPoolsIsolated();
+    void SamePoolNameDifferentDatabases();
+    void ZeroPercentBypassesNamedPool();
+    void StaleLimitRestoredByOldTx();
+    void ExternalMemoryNotChargedToNamedPool();
+    void NamedPoolRollbackOnResourceBrokerFailure();
+    void NamedPoolSpillingThreshold();
 
 private:
     THolder<TTestBasicRuntime> Runtime;
@@ -703,6 +724,187 @@ void KqpRm::DisonnectNodes() {
     Runtime->DispatchEvents(TDispatchOptions(), TDuration::Seconds(1));
 
     CheckSnapshot(0, {{1000, 100}}, rm_first);
+}
+
+// Named-pool tests below pin the current behavior of MemoryNamedPools,
+// including known gaps (see workload_manager_memory_limits_plan.md, Step 1).
+
+void KqpRm::NamedPoolLimitEnforced() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    constexpr ui64 nodeLimit = 1000;             // QueryMemoryLimit in test config
+    constexpr double poolPercent = 50;
+    constexpr ui64 poolLimit = nodeLimit / 2;    // poolPercent% of nodeLimit
+    constexpr ui64 chunk = 100;
+    constexpr ui32 chunksToFillPool = poolLimit / chunk;
+
+    auto tx = MakePoolTx(1, rm, "pool_a", poolPercent);
+    NRm::TKqpResourcesRequest request{.Memory = chunk};
+
+    for (ui32 i = 0; i < chunksToFillPool; ++i) {
+        UNIT_ASSERT(rm->AllocateResources(*tx, i + 1, request));
+    }
+    // pool is exhausted while the node still has nodeLimit - poolLimit free
+    UNIT_ASSERT(!rm->AllocateResources(*tx, chunksToFillPool + 1, request));
+    AssertResourceManagerStats(rm, nodeLimit - poolLimit, 100);
+
+    rm->FreeResources(*tx, 1, request);
+    UNIT_ASSERT(rm->AllocateResources(*tx, chunksToFillPool + 1, request));
+}
+
+void KqpRm::TwoNamedPoolsIsolated() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    constexpr double poolPercent = 30;           // 300 of the node's 1000 each
+    constexpr ui64 chunk = 100;
+    constexpr ui32 chunksToFillPool = 3;         // poolPercent% of 1000 / chunk
+
+    auto txA = MakePoolTx(1, rm, "pool_a", poolPercent);
+    auto txB = MakePoolTx(2, rm, "pool_b", poolPercent);
+    NRm::TKqpResourcesRequest request{.Memory = chunk};
+
+    for (ui32 i = 0; i < chunksToFillPool; ++i) {
+        UNIT_ASSERT(rm->AllocateResources(*txA, i + 1, request));
+    }
+    UNIT_ASSERT(!rm->AllocateResources(*txA, chunksToFillPool + 1, request));
+
+    // pool_a exhaustion must not affect pool_b
+    for (ui32 i = 0; i < chunksToFillPool; ++i) {
+        UNIT_ASSERT(rm->AllocateResources(*txB, i + 1, request));
+    }
+    UNIT_ASSERT(!rm->AllocateResources(*txB, chunksToFillPool + 1, request));
+}
+
+void KqpRm::SamePoolNameDifferentDatabases() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    // pools are keyed by (database, pool), so same name is two pools
+    constexpr double poolPercent = 30;
+    constexpr ui64 poolLimit = 300;               // poolPercent% of the node's 1000
+    constexpr ui64 overflowChunk = 100;
+
+    auto tx1 = MakePoolTx(1, rm, "pool", poolPercent, "db1");
+    auto tx2 = MakePoolTx(2, rm, "pool", poolPercent, "db2");
+    NRm::TKqpResourcesRequest fillPool{.Memory = poolLimit};
+
+    UNIT_ASSERT(rm->AllocateResources(*tx1, 1, fillPool));
+    UNIT_ASSERT(!rm->AllocateResources(*tx1, 2, NRm::TKqpResourcesRequest{.Memory = overflowChunk}));
+    UNIT_ASSERT(rm->AllocateResources(*tx2, 1, fillPool));
+}
+
+void KqpRm::ZeroPercentBypassesNamedPool() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    // Pinned gap: MemoryPoolPercent == 0 disables named-pool accounting
+    // entirely instead of denying allocations (plan Step 4 / D2).
+    constexpr ui64 aboveAnyPoolShare = 800;       // no pool percent would allow this much of the node's 1000
+    auto tx = MakePoolTx(1, rm, "pool_a", 0);
+    UNIT_ASSERT(rm->AllocateResources(*tx, 1, NRm::TKqpResourcesRequest{.Memory = aboveAnyPoolShare}));
+}
+
+void KqpRm::StaleLimitRestoredByOldTx() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    // Pinned gap: each tx rewrites the shared pool limit with the percent it
+    // captured at start, so an old tx keeps resurrecting the old limit after
+    // an ALTER RESOURCE POOL (plan Step 4 moves config ownership out of tx).
+    constexpr double oldPercent = 50;            // old limit = 500 of the node's 1000
+    constexpr double newPercent = 10;            // post-ALTER limit = 100
+    constexpr ui64 newLimit = 100;
+    constexpr ui64 abovePostAlterLimit = 300;     // fits 500, does not fit 100
+
+    auto oldTx = MakePoolTx(1, rm, "pool_a", oldPercent);
+    auto newTx = MakePoolTx(2, rm, "pool_a", newPercent);
+    NRm::TKqpResourcesRequest fillNewLimit{.Memory = newLimit};
+
+    UNIT_ASSERT(rm->AllocateResources(*oldTx, 1, fillNewLimit));
+    // newTx sees its post-ALTER limit, already fully used by oldTx
+    UNIT_ASSERT(!rm->AllocateResources(*newTx, 1, fillNewLimit));
+    // oldTx restores its stale limit and grows the pool past the new one
+    UNIT_ASSERT(rm->AllocateResources(*oldTx, 2, NRm::TKqpResourcesRequest{.Memory = abovePostAlterLimit}));
+}
+
+void KqpRm::ExternalMemoryNotChargedToNamedPool() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    // Pinned gap: ExternalMemory bypasses named-pool accounting (plan D6).
+    constexpr double poolPercent = 10;
+    constexpr ui64 poolLimit = 100;               // poolPercent% of the node's 1000
+    constexpr ui64 externalAbovePoolLimit = 900;  // would never fit the pool if charged
+
+    auto tx = MakePoolTx(1, rm, "pool_a", poolPercent);
+    UNIT_ASSERT(rm->AllocateResources(*tx, 1, NRm::TKqpResourcesRequest{.ExternalMemory = externalAbovePoolLimit}));
+
+    // the full pool limit is still available after the external reservation
+    NRm::TKqpResourcesRequest fillPool{.Memory = poolLimit};
+    UNIT_ASSERT(rm->AllocateResources(*tx, 2, fillPool));
+    UNIT_ASSERT(!rm->AllocateResources(*tx, 3, fillPool));
+}
+
+void KqpRm::NamedPoolRollbackOnResourceBrokerFailure() {
+    // broker queue memory limit; a lone task may exceed it, tasks running
+    // concurrently may not (see queue_kqp_resource_manager in the RB config)
+    constexpr ui64 rbQueueLimit = 50'000;
+    constexpr ui64 baseAlloc = 1'000;            // keeps the queue non-idle
+    constexpr ui64 aboveRbLimit = rbQueueLimit + 10'000;
+    constexpr ui64 secondAlloc = 40'000;         // fits the queue next to baseAlloc
+    // node/pool cap admits base+second, but not the failed allocation's
+    // residue on top — a rollback leak would fail the second allocation
+    constexpr ui64 nodeLimit = 80'000;
+
+    auto config = MakeKqpResourceManagerConfig();
+    config.SetQueryMemoryLimit(nodeLimit);
+    StartRms({config, MakeKqpResourceManagerConfig()});
+    NKikimr::TActorSystemStub stub;
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    auto tx = MakePoolTx(1, rm, "pool_a", 100);
+    UNIT_ASSERT(rm->AllocateResources(*tx, 1, NRm::TKqpResourcesRequest{.Memory = baseAlloc}));
+
+    // passes node and pool checks, rejected by the resource broker
+    UNIT_ASSERT(!rm->AllocateResources(*tx, 2, NRm::TKqpResourcesRequest{.Memory = aboveRbLimit}));
+
+    // the failed allocation must leave no residue in pool or node accounting
+    UNIT_ASSERT(rm->AllocateResources(*tx, 3, NRm::TKqpResourcesRequest{.Memory = secondAlloc}));
+    AssertResourceManagerStats(rm, nodeLimit - baseAlloc - secondAlloc, 100);
+}
+
+void KqpRm::NamedPoolSpillingThreshold() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    constexpr double poolPercent = 50;
+    constexpr ui64 poolLimit = 500;               // poolPercent% of the node's 1000
+    // default SpillingPercent is 80: spilling is signaled once available < watermark
+    constexpr ui64 spillingWatermark = poolLimit * (100 - 80) / 100;
+    constexpr ui64 crossingChunk = spillingWatermark / 2;
+
+    auto tx = MakePoolTx(1, rm, "pool_a", poolPercent);
+
+    // available == watermark: not spilling yet
+    UNIT_ASSERT(rm->AllocateResources(*tx, 1, NRm::TKqpResourcesRequest{.Memory = poolLimit - spillingWatermark}));
+    UNIT_ASSERT(!tx->IsReasonableToStartSpilling());
+
+    // available < watermark: spilling signaled
+    UNIT_ASSERT(rm->AllocateResources(*tx, 2, NRm::TKqpResourcesRequest{.Memory = crossingChunk}));
+    UNIT_ASSERT(tx->IsReasonableToStartSpilling());
+
+    // freeing back to the watermark clears the signal
+    rm->FreeResources(*tx, 2, NRm::TKqpResourcesRequest{.Memory = crossingChunk});
+    UNIT_ASSERT(!tx->IsReasonableToStartSpilling());
 }
 
 } // namespace NKqp
