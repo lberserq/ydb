@@ -81,6 +81,46 @@ Ten systems surveyed in `workload_manager_memory_prior_art.md` (ClickHouse, Cock
 
 Moved to `workload_manager_memory_prior_art.md` §14 (SafeLoad admission control, buffer-management survey, NVM-as-primary-storage — comparison and adopted ideas). Ticket \#18 in section 5 tracks the SafeLoad-style follow-up.
 
+### 1.7 Internal zone-model design (hor911, sbr://13145352241) — alignment
+
+The internal presentation "О самом дорогом — памяти" defines the target
+maturity ladder and a per-level control model this plan must align with:
+
+- **Maturity ladder:** no limits → hard limits (deny) → **yellow zone**
+  (spill; "we are here" — the `SpillingPercent` cookie path, pinned by
+  Step 1 tests) → **red zone** (asynchronous memory release/eviction) →
+  minimum limits + planned execution.
+- **PUSH/PULL model per level:** a container PUSHes limits (and its
+  green/yellow/red thresholds) down to components; a component PULLs limit
+  changes from its container. Mapping: Memory Controller — N/A; Resource
+  Broker — PUSH; KQP RM — PULL; **WM Resource Pool — PUSH(?); Query —
+  PUSH(?)**; Task — PULL. This plan resolves the two question marks: pool and
+  query accounts receive PUSHed limits from subscription-owned config
+  (Step 4) and the arbiter (Step 5), while tasks keep PULLing via
+  `IMemoryQuotaManager`.
+- **Zone semantics adopted into the arbiter (Step 5):** every account level
+  carries green/yellow/red thresholds. Yellow is checked synchronously at
+  limit-increase (PULL) time and denies "optional" growth — this is today's
+  `IsReasonableToStartSpilling` generalized per account. Red triggers
+  asynchronous reclaim — the component returns memory "when it can, as much
+  as it can" — which is exactly the D12/R6 reclaim contract; red-zone
+  semantics are now the concrete specification of that contract.
+- **Upstream dependencies owned by the hor911 track** (this plan consumes
+  them, does not implement them): the RB→RM traffic light (zone flags pushed
+  from Resource Broker), and the Memory Controller fix to distribute >100%
+  (overcommit) in any configuration. Tracked as coordination follow-ups.
+
+**Sequencing (agreed):** per-node pool limitation lands first — Steps 1–6
+are strictly node-local by design. Cluster-wide pool/query limitation comes
+after, via zverevgeny's proposal: the workload manager consumes
+**gossip-distributed** per-pool usage (the existing
+`TKqpResourceInfoExchanger` already gossips node resource snapshots —
+`ResourceSnapshotState` in `kqp_rm_service.cpp`). Eventually-consistent
+aggregates are inaccurate for short queries (staleness window ≈ exchanger
+period) but adequate for the long-running queries that dominate memory —
+short queries remain governed by node-local limits only. See Step 13 and
+D13.
+
 ## 2\. Decisions Required Before Coding (Step 0)
 
 | \#  | Decision                                                                                                                                 | Blocks    | Proposed default                                                                                                                               |
@@ -97,6 +137,7 @@ Moved to `workload_manager_memory_prior_art.md` §14 (SafeLoad admission control
 | D10 | Pool memory *guarantee* alongside the limit (basis for victim ranking `used/guarantee`; sum of guarantees ≤ node budget ≤ sum of limits) | Step 5/11 | New optional setting, default = limit (no overcommit) — prior-art R1                                                                           |
 | D11 | Bounded async wait-for-quota before terminal denial (memory waiters woken by `FreeQuota`)                                                | Step 6    | Feature flag, default off; timeout \~ D5 budget — prior-art R3                                                                                 |
 | D12 | Arbiter API reserves the reclaim contract (`ReclaimableBytes` in snapshots, async "reclaim N" event) even if unimplemented initially     | Step 5    | Yes — avoids breaking interface change later — prior-art R6                                                                                    |
+| D13 | Cluster-wide pool/query limits: eventually-consistent enforcement over gossip (`TKqpResourceInfoExchanger`) — staleness bound = exchange period; short queries governed by node-local limits only | Step 13 | Yes (zverevgeny's proposal); no synchronous cluster coordination on the allocation path |
 
 Deliverable: decisions recorded in the Tracker ticket; design doc updated.
 
@@ -166,6 +207,8 @@ Verification: `ya make ydb/core/kqp/rm_service -rA`, `ya make yql/essentials/min
   - Unit tests: hierarchy enforcement, rollback, thread stress, dynamic limits, close-with-outstanding-bytes, saturation.
   - Prior-art additions (R1/R2/R6/R12): accounts carry `{guarantee, limit}` per D10, not just a limit; snapshot includes per-query `ReclaimableBytes` (0 until Step 7 consumers report it) and a `NonReclaimable` flag; a `RankVictims()` helper orders queries by (pool priority, used/guarantee, size) for the node-pressure path; deny/kill events recorded in an audit ring buffer exposed on the RM mon page.
 
+  - Zone thresholds per account (green/yellow/red, §1.7): yellow generalizes the spilling cookie and is checked at acquire time; red raises the async reclaim event reserved by D12. Thresholds are PUSHed with the limit by the config owner.
+
 ### Step 6 — Per-query limits
 
   - Lift validation at `resource_pool_settings.cpp:74-76` behind feature flag (D9); propagate through `kqp_planner.cpp` → `kqp_node_service.cpp` alongside the pool percent.
@@ -217,6 +260,26 @@ Yes to "prioritize memory like CPU" — but as *entitlement over new growth* (de
 ### Step 12 — Exact allocator-level tracking (separate track)
 
 Unchanged from the draft: prototype-only, behind build/runtime flag, own performance gates. Decision input comes from Step 10 residual measurements.
+
+### Step 13 — Cluster-wide pool/query limits over gossip (after per-node is stable)
+
+Per §1.7 sequencing: only after Steps 1–6 (per-node) are enforced in
+production. Mechanism (zverevgeny's design):
+
+- Extend the existing `TKqpResourceInfoExchanger` snapshots with per-pool
+  usage (bounded cardinality: pools only, never per-query).
+- Workload service / arbiter consume the gossip aggregate to enforce
+  cluster-level pool budgets and per-query cluster caps: admission and
+  entitlement decisions only — never synchronous cluster coordination on the
+  allocation hot path.
+- Documented accuracy contract (D13): enforcement error is bounded by the
+  gossip staleness window × aggregate allocation rate; short queries can
+  complete inside one window and are intentionally governed only by
+  node-local limits. Long-running queries converge to the cluster cap.
+- Tests: two-node runtime (the existing exchanger tests' pattern), long
+  query capped by cluster budget while node-local budget has headroom;
+  short-query burst under-enforced but bounded; exchanger outage degrades to
+  node-local enforcement (fail-open, counters flag staleness).
 
 ## 4\. Prototypes and Benchmarks (before/alongside implementation)
 
@@ -295,6 +358,8 @@ Prior-art follow-ups (from `workload_manager_memory_prior_art.md`, can trail the
 16. Initial-grant percentile feedback from per-query-shape peak memory statistics (R5), after Step 2 counters and Step 7 coverage exist.
 17. Arbiter reclaim phases (R6, Velox-style): consumers report `ReclaimableBytes`, arbiter strips free quota then commands spills before any abort — the interface hooks are reserved by D12 in Step 5.
 18. Research track (SafeLoad-style, section 1.6): rule-based memory admission gate in the workload service at the `DatabaseLoadCpuThreshold` insertion point — start with an interpretable threshold rule over plan features + per-pool denial/OOM history; requires Step 2 counters and Step 6 per-query stats exposed as queryable system views; validate against SafeBench.
+19. Cluster-wide pool/query limits over gossip (Step 13, D13): extend `TKqpResourceInfoExchanger` snapshots with per-pool usage; enforce cluster budgets in workload service admission/entitlement only.
+20. Coordination with the hor911 zone-model track (§1.7): consume the RB→RM traffic-light zone flags when available; depend on the Memory Controller >100% distribution fix for overcommit configurations.
 
 Docs follow-up: update pool-settings / `RESOURCE_WEIGHT` documentation when Steps 6 and 11 change user-visible semantics.
 
