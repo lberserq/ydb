@@ -58,6 +58,26 @@ Alloc+free pair unless stated; ns per operation.
 
 MKQL page pool (unchanged by the MVP): \~120 ns/op churn latency; the limit-increase callback adds \~5%; after freeing half the blocks the pool retains all pages (retained/used ≈ 2×) until shrink/`ReleaseFreePages` — the existing 30 MiB shrink hysteresis, not the arbiter, is the fragmentation control.
 
+### 2.2 Real workloads: TPC-C / TPC-H on dedicated nodes (2026-08-13)
+
+Binaries: trunk `88ad64bac2e` (`ydbd_base`, sbr:13145518395) vs the same trunk
+with lock-free D6 accounting engaged for every query and a 128 GB default
+budget (`ydbd_memlimits`, sbr:13145836999, diff sbr:13145838107) — checks run
+on every allocation but never deny: pure bookkeeping overhead.
+
+- **TPC-C** (6000 warehouses, 1 h): tpmC 40 177 → 39 889 (−0.72%, single run,
+  within run-to-run noise); p50 *improved* one histogram bucket on 4/5
+  transaction types while p99 rose one bucket; 0 failed transactions in both.
+- **TPC-H**: queries-only geomean −1.42% (memlimits faster), median ratio
+  ≈ 1.000; per-query scatter ±20% both directions (cache/compaction
+  variance). memlimits: 0 fails, 0 result diffs (base run had 4 fails).
+- Results: base tpcc sbr:13165919805, base tpch sbr:13165925249, memlimits
+  tpcc sbr:13165933990, memlimits tpch sbr:13165935710.
+
+Conclusion: engaged-by-default accounting is not measurable at real-workload
+scale; the microbench deltas (§2) do not surface end-to-end. The OLTP
+fast-path items remain net-improvement work, not a precondition.
+
 ## 3\. Findings
 
 ### 3.1 The accounting cost of the defaults is noise on the growth path
