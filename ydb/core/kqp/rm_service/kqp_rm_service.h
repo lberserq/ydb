@@ -42,6 +42,8 @@ struct TKqpResourcesRequest {
 class TMemoryResourceCookie : public TAtomicRefCount<TMemoryResourceCookie> {
 public:
     std::atomic<bool> SpillingPercentReached{false};
+    // D6 lock-free prototype: per-pool external memory, one relaxed RMW per op
+    std::atomic<ui64> ExternalUsed{0};
 };
 
 class IKqpResourceManager;
