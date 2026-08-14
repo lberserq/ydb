@@ -121,6 +121,17 @@ period) but adequate for the long-running queries that dominate memory —
 short queries remain governed by node-local limits only. See Step 13 and
 D13.
 
+### 1.8 Node-wide memory governance (separate design doc)
+
+The scope above covers the QueryExecution category only. The follow-on
+rework — Workload Manager as the memory *policy* source for ALL Memory
+Controller categories (shared cache, MemTable, compaction, backup/restore),
+with a demand-driven rebalancing protocol between KQP and shards mediated
+by the MC cycle — is specified in `workload_manager_memory_governance.md`
+(D14–D16, Steps 14–16). It reuses this plan's account model (D10
+guarantee/limit, D12 reclaim contract, §1.7 zones) one level up and
+subsumes the hor911 TODOs ("RB traffic light", "MC >100%").
+
 ## 2\. Decisions Required Before Coding (Step 0)
 
 | \#  | Decision                                                                                                                                 | Blocks    | Proposed default                                                                                                                               |
