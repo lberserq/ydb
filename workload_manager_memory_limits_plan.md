@@ -129,12 +129,12 @@ D13.
 | D2  | Zero pool limit semantics: reject at admission (workload service), not at first allocation                                               | Step 4    | Admission-time `PRECONDITION_FAILED` (OQ3)                                                                                                     |
 | D3  | Query limit base: percent of *effective pool limit*, not raw node                                                                        | Step 6    | Pool-relative (OQ2)                                                                                                                            |
 | D4  | Denial statuses: `OVERLOADED` for quota denial (matches today), `PRECONDITION_FAILED` for hard per-query limit                           | Step 4/6  | As stated (OQ4)                                                                                                                                |
-| D5  | Spill-before-kill budget for over-limit queries                                                                                          | Step 6    | Bounded retries, \~10s default (OQ5)                                                                                                           |
+| D5  | Spill-before-kill budget for over-limit queries — **total per episode** across spill→shrink→wait, stage timeouts derived from it; D11's wait gets the remainder | Step 6    | Bounded retries, \~10s total default (OQ5)                                                                                                     |
 | D6  | ExternalMemory charged to the pool                                                                                                       | Step 4    | Yes, via the lock-free single-atomic design in Step 4 (per-tx account handle + relaxed pool atomic; db/node derived at publish cadence) (OQ18) |
-| D7  | Weight semantics: reuse `RESOURCE_WEIGHT` for memory vs. new setting                                                                     | Step 11   | Defer; document current "CPU only" (OQ9/10)                                                                                                    |
+| D7  | Weight semantics: reuse `RESOURCE_WEIGHT` for memory vs. new setting                                                                     | Step 11   | Defer; document current "CPU only" (OQ9/10). Until resolved, guarantee = limit everywhere and `used/guarantee` ranking degenerates to largest-consumer — D10's floor has no effect in default configs |
 | D8  | Default pool: memory limits allowed?                                                                                                     | Step 4    | Yes, same as any pool (OQ7)                                                                                                                    |
 | D9  | Rolling-upgrade behavior for accepting `QUERY_MEMORY_LIMIT_PERCENT_PER_NODE`                                                             | Step 6    | Feature flag + old nodes ignore (OQ44)                                                                                                         |
-| D10 | Pool memory *guarantee* alongside the limit (basis for victim ranking `used/guarantee`; sum of guarantees ≤ node budget ≤ sum of limits) | Step 5/11 | New optional setting, default = limit (no overcommit) — prior-art R1                                                                           |
+| D10 | Pool memory *guarantee* alongside the limit (basis for victim ranking `used/guarantee`; sum of guarantees ≤ node budget ≤ sum of limits) | Step 5/11 | New optional setting, default = limit (no overcommit) — prior-art R1. **Assignment**: `MEMORY_GUARANTEE_PERCENT_PER_NODE` schema/proto/DDL added in Step 5; floor-protection trigger enforced in Step 11; D7 enables auto-computation |
 | D11 | Bounded async wait-for-quota before terminal denial (memory waiters woken by `FreeQuota`)                                                | Step 6    | Feature flag, default off; timeout \~ D5 budget — prior-art R3                                                                                 |
 | D12 | Arbiter API reserves the reclaim contract (`ReclaimableBytes` in snapshots, async "reclaim N" event) even if unimplemented initially     | Step 5    | Yes — avoids breaking interface change later — prior-art R6                                                                                    |
 | D13 | Cluster-wide pool/query limits: eventually-consistent enforcement over gossip (`TKqpResourceInfoExchanger`) — staleness bound = exchange period; short queries governed by node-local limits only | Step 13 | Yes (zverevgeny's proposal); no synchronous cluster coordination on the allocation path |
@@ -180,7 +180,7 @@ Verification: `ya make ydb/core/kqp/rm_service -rA`, `ya make yql/essentials/min
 
   - Export per-(database, pool) sensors from `MemoryNamedPools`: Limit, Allocated, Peak, DeniedRequests, DeniedBytes, SpillingFlag; add a "WouldBeDeniedBytes" counter for enforcement changes planned later.
   - Pool table on the RM mon page (`kqp_rm_service.cpp:875-922`).
-  - Counter groups must survive the erase-on-zero of `MemoryNamedPools` (`kqp_rm_service.cpp:400-404`).
+  - Counter groups must survive the erase-on-zero of `MemoryNamedPools` (`kqp_rm_service.cpp:400-404`). Implement the cheap variant (sensors stick to the map entry): Step 4 supersedes this by removing erase-on-zero entirely.
 
 ### Step 3 — Dead-code cleanup in the deny path
 
@@ -193,6 +193,8 @@ Verification: `ya make ydb/core/kqp/rm_service -rA`, `ya make yql/essentials/min
   - **Zero-percent semantics** per D2, behind feature flag (behavior change: today zero disables enforcement).
   - **ExternalMemory charged to the pool** per D6, behind the same flag: node service passes pool identity with initial reservations (`kqp_query_control_plane.cpp:323-329`); remove the `Memory==0` early-return bypass ordering at `kqp_rm_service.cpp:258-264`.
   - **D6 hot path is lock-free, one atomic RMW per op** (bench-driven design, see report §3.2/§3.4): pool account handle resolved once at tx registration and cached in `TTxState`; alloc/free = `pool->ExternalUsed.fetch_add/sub` (relaxed). Query level uses the existing `TxExternalDataQueryMemory` atomic; database/node aggregates are derived at publish cadence (`FireResourcesPublishing`), not per op — the node-wide atomic leaves the hot path. If D6 later needs denial (not just attribution): optimistic `fetch_add` + limit compare + rollback (ClickHouse pattern, R7), with documented bounded overshoot ≤ concurrent in-flight requests. Keeps OLTP queries (whose only RM interaction is this path) out of the RM lock convoy entirely. **Measured (prototype, 2026-08-09)**: external path 58 ns vs 54 ns baseline (locked MVP was 215 ns); OLTP cycle 259 ns vs 206 ns baseline (MVP 368 ns) — the +53 ns is the once-per-query handle resolution. Prototype: `bench_patches/d6_lockfree.patch` on branch `bench/memory-baseline` (paste: <https://paste.yandex-team.ru/3fea8b2d-c10e-451b-b0ad-c9d2585ce131/text>).
+  - **Three separate feature flags**, not one: (a) zero-percent rejection (D2, user-visible semantics change), (b) ExternalMemory pool charging (D6, new denial source for over-limit pools), (c) config ownership (internal, lowest risk). Different blast radii must be independently revertable.
+  - Pool entries are refcounted handles designed to be adopted by Step 5's `TMemoryAccountTree` without re-initialization — no second lifetime migration.
   - Flip the pinned tests from Step 1a.
 
 ### Step 5 — Extract the memory arbiter library
@@ -208,6 +210,8 @@ Verification: `ya make ydb/core/kqp/rm_service -rA`, `ya make yql/essentials/min
   - Prior-art additions (R1/R2/R6/R12): accounts carry `{guarantee, limit}` per D10, not just a limit; snapshot includes per-query `ReclaimableBytes` (0 until Step 7 consumers report it) and a `NonReclaimable` flag; a `RankVictims()` helper orders queries by (pool priority, used/guarantee, size) for the node-pressure path; deny/kill events recorded in an audit ring buffer exposed on the RM mon page.
 
   - Zone thresholds per account (green/yellow/red, §1.7): yellow generalizes the spilling cookie and is checked at acquire time; red raises the async reclaim event reserved by D12. Thresholds are PUSHed with the limit by the config owner.
+  - Add `MEMORY_GUARANTEE_PERCENT_PER_NODE` to `TPoolSettings`, proto and DDL (D10 assignment) — data model only at this step; enforcement is Step 11's trigger.
+  - Scaling gate (DoD, from report §3.4): re-run `rm_alloc_free_named_pool_contended{4,16,32}` on the arbiter binary; Δp50 ≤ +5% vs trunk at each concurrency level.
 
 ### Step 6 — Per-query limits
 
@@ -216,7 +220,18 @@ Verification: `ya make ydb/core/kqp/rm_service -rA`, `ya make yql/essentials/min
   - Denial follows the escalation chain (R3, TiDB/Trino pattern): (1) set the spilling hint and retry; (2) `TryShrinkMemory` (release free pages, lower limit) and retry; (3) behind D11 — register as a memory waiter in the arbiter, bounded async wait, woken by `FreeQuota` from completing queries; (4) fail with the D4 status and a message naming pool/limit **and the top-N pool consumers at denial time** (R9). Terminal failure stays a typed `TMemoryLimitExceededException`, never `yexception`.
   - Spill thresholds are ratios of the *effective* (most restrictive) limit in the chain — query grant vs pool limit vs node budget — recomputed when grants change (R8, ClickHouse PR \#71406 pattern), not absolute bytes.
   - Query-level stats into query statistics protobuf (peak, denied, spilled, limit, pool) — not dynamic counters (cardinality).
-  - Tests: per-query limit under/over pool; many queries in one pool; multi-node query enforcing locally on each node.
+  - When D11 is off, the chain is explicitly (1)→(2)→(4) — the wait stage is skipped, not silently degraded; the D5 budget still bounds the whole episode.
+  - Storm control (§13.3): per-query escalation state on `TTxState`/query account remembers that spill/shrink already failed in this episode — subsequent denials jump straight to their stage instead of re-walking the chain per 1 MiB request.
+  - **DoD carries a "partial coverage" flag**: until Steps 7–9 land, limits cover MKQL/Arrow/channel allocations only; write-path memory is untracked and per-pool limits MUST NOT be advertised as node OOM protection.
+  - Tests: per-query limit under/over pool; many queries in one pool; multi-node query enforcing locally on each node — including that a local fragment denial propagates cancellation to sibling fragments on other nodes via the existing KQP abort path.
+
+### Step 6a — Memory-based admission gate (KR2, pulled forward from Step 11)
+
+Without this, no new query is ever stopped for memory reasons before Step 11 — `IsAdmissionRequired()` ignores memory settings entirely. Flag-gated, observe-only counters first.
+
+  - Workload service admission: for pools with a memory limit, check `pool.allocated + min_grant ≤ pool.limit` at admission; over → queue in the pool's existing FIFO (never fail immediately, never kill running queries).
+  - `min_grant` fallback until ticket #16 (percentile feedback): conservative static estimate, default 10% of pool limit, config-overridable. Admission check is a fast-path atomic read, no actor round-trip.
+  - Tests: pool at limit → new query queues; running query completes → queued query admitted; queue bounded by `QUEUE_SIZE`; observe-only mode counts would-be-queued without queueing.
 
 ### Step 7 — Complete cooperative coverage (one flag-gated PR each)
 
@@ -255,6 +270,9 @@ Yes to "prioritize memory like CPU" — but as *entitlement over new growth* (de
   - Admission gating on memory (R4, Impala/Trino semantics): workload service admission checks `pool.reserved + initial_grant ≤ pool.limit`, where `reserved` counts admitted-but-unused grants (reservation ≠ consumption); over the soft limit → new queries queue in the pool's existing FIFO; running queries are never killed by admission.
   - Initial grant starts static (D3-derived); follow-up ticket adds percentile feedback from per-query-shape peak statistics (R5, SQL Server adaptive grants).
   - Periodic recalculation in the arbiter (cadence like `UpdateFairShare`), not in the CPU snapshot code.
+  - **Floor-protection trigger (makes D10's guarantee real)**: when node usage \> Σ guarantees, new allocations from pools with `used \> guarantee` are denied/queued while pools with `used \< guarantee` continue to be granted. Without this rule the guarantee is a data model with no effect.
+  - `initial_grant` before ticket #16: inherits Step 6a's static `min_grant`; document that grant=0 makes the check post-fact-only (observe phase).
+  - Tests (DoD): reserved tracking inc/dec on admit/complete; queue-then-unblock on completion; floor protection — constrained pool below guarantee keeps allocating while borrower above guarantee is denied; admission check \< 2 µs per statement (bench gate).
   - If tree-sharing is preferred instead: first implement `TEvRemovePool`/`TEvRemoveDatabase` in the scheduler service (finding 1.3.4).
 
 ### Step 12 — Exact allocator-level tracking (separate track)
