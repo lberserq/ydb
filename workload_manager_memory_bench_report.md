@@ -74,6 +74,23 @@ on every allocation but never deny: pure bookkeeping overhead.
 - Results: base tpcc sbr:13165919805, base tpch sbr:13165925249, memlimits
   tpcc sbr:13165933990, memlimits tpch sbr:13165935710.
 
+Repeat run (2026-08-14, same memlimits binary, sbr:13182284137): tpmC
+38 138 and TPC-H geomean −0.15% vs base. **Same-binary spread: TPC-C ±4.4%,
+TPC-H geomean ±1.3%** — every base↔memlimits delta observed lies inside the
+same-binary spread, so the overhead is not detectable with proper error
+bars. Corollary: this TPC-C setup cannot resolve deltas below ~5% in a
+single run (environment drift between runs — accumulated data/compaction
+state); tier comparisons need ≥3 repeats or a state reset between runs.
+The 4 TPC-H query fails recur binary-independently (base: 4, memlimits
+run 1: 0, run 2: 4) — workload/environment flakiness.
+
+Effective limits caveat (from cluster telemetry): the Memory Controller
+pushes its own query-execution limit into the RB queue (~7.2 GiB/node on
+this slice), overriding the RM proto default — peak consumption was ~12% of
+budget, so these runs validate bookkeeping only, no enforcement. The tiered
+plan (control/yellow/deny/htap via pool DDL, script sbr:13168531079)
+covers enforcement.
+
 Conclusion: engaged-by-default accounting is not measurable at real-workload
 scale; the microbench deltas (§2) do not surface end-to-end. The OLTP
 fast-path items remain net-improvement work, not a precondition.
