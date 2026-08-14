@@ -121,16 +121,22 @@ period) but adequate for the long-running queries that dominate memory —
 short queries remain governed by node-local limits only. See Step 13 and
 D13.
 
-### 1.8 Node-wide memory governance (separate design doc)
+### 1.8 Program structure: this plan is Part A of three
 
-The scope above covers the QueryExecution category only. The follow-on
-rework — Workload Manager as the memory *policy* source for ALL Memory
-Controller categories (shared cache, MemTable, compaction, backup/restore),
-with a demand-driven rebalancing protocol between KQP and shards mediated
-by the MC cycle — is specified in `workload_manager_memory_governance.md`
-(D14–D16, Steps 14–16). It reuses this plan's account model (D10
-guarantee/limit, D12 reclaim contract, §1.7 zones) one level up and
-subsumes the hor911 TODOs ("RB traffic light", "MC >100%").
+- **Part A — KQP query limits** (THIS plan, D1–D13, Steps 1–13):
+  database→pool→query accounting, per-query limits, admission, escalation,
+  cluster gossip. Unblocked; proceeds regardless of B/C.
+- **Part B — Node memory manager** (`workload_manager_memory_governance.md`,
+  D14–D15, Steps 14–15): WM as the memory *policy* source for ALL Memory
+  Controller categories (shared cache, MemTable, compaction), with a
+  demand-driven rebalancing protocol between KQP and shards mediated by
+  the MC cycle. Reuses this plan's account model (D10 guarantee/limit,
+  D12 reclaim contract, §1.7 zones) one level up; subsumes the hor911
+  TODOs ("RB traffic light", "MC >100%"). Depends on Steps 5–6.
+- **Part C — Category expansion** (same doc §5, D16, Steps 16+): each
+  currently-untracked activity (BackupRestore first, then CDC,
+  replication, index build) becomes its own category by a repeatable
+  four-move recipe, one PR per category.
 
 ## 2\. Decisions Required Before Coding (Step 0)
 

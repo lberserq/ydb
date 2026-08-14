@@ -6,7 +6,20 @@ memory to **all memory categories of the node**, governed by the Workload
 Manager. Companion: Memory Controller reference
 (`memory_controller_config`, docs v26.1).
 
-## 1. Current model (Memory Controller, as documented)
+## 0. Program structure — three workstreams
+
+| Part | Scope | Spec | Steps | Ships independently |
+| --- | --- | --- | --- | --- |
+| **A — KQP query limits** | database→pool→query accounting, per-query limits, admission, spilling escalation, cluster gossip | `workload_manager_memory_limits_plan.md` (D1–D13) | 1–13 | Yes — the current committed plan; no dependency on B/C |
+| **B — Node memory manager** | WM as policy source over MC categories; category account tier; demand-driven rebalancing between KQP and shards | this doc, §§1–4, 6–7 (D14–D15) | 14–15 | After A's Step 5 (account tree) and Step 6 (escalation) |
+| **C — Category expansion** | splitting the untracked activities into categories and handling each: BackupRestore, CDC, replication, index build, … | this doc, §5 (D16) | 16+ (one category per step/PR) | Each category after B's Step 14 (observe) — enforcement per category after Step 15 |
+
+Part A is deliberately unblocked: everything measured and planned so far
+(Steps 1–13) proceeds regardless of B/C decisions. Part B changes no
+enforcement until its own flags flip. Part C is a repeatable per-category
+recipe, not one big change.
+
+## 1. Current model (Memory Controller, as documented) — Part B context
 
 Per-node limits, static YAML config:
 
@@ -109,16 +122,24 @@ and KQP never talk to each other directly, which keeps the failure model
 simple (a silent consumer keeps its last limit and decays toward its
 guarantee).
 
-## 5. New categories (staged)
+## 5. Part C — category expansion (per-category recipe)
 
-- **BackupRestore** first: an activity consumer with its own
-  `{guarantee, limit}`; backup/restore memory currently lives untracked in
-  the process remainder. Registration at the backup task controller;
-  in-flight buffers acquire from the category account (same
-  `TryAcquire/Release` API as Step 5).
-- Candidates after: CDC initial scan, async replication, index build —
-  each is an activity with bursty, deferrable demand, i.e. exactly the
-  shape the guarantee/limit + red-zone model handles.
+Each untracked activity becomes a category by the same four-move recipe
+(one PR per category):
+
+1. Register an MC consumer for the activity (`{guarantee, limit}`,
+   zones, D12 snapshot).
+2. Route the activity's buffers through the category account
+   (`TryAcquire/Release`, Step 5 API).
+3. Add the category to WM policy + dashboards (observe-only first).
+4. Flip enforcement per category once observe-mode data confirms the
+   budget shape.
+
+Order (by blast radius and current pain): **BackupRestore** first —
+backup/restore memory currently lives untracked in the process remainder
+and can push a node into the soft limit unattributed; then CDC initial
+scan, async replication, index build — each bursty and deferrable,
+exactly the shape the guarantee/limit + red-zone model handles.
 
 ## 6. Decisions added
 
@@ -139,9 +160,9 @@ guarantee).
   min/max; activity borrowing above guarantees; red-zone async release
   wired to SharedCache eviction, MemTable flush, and KQP forced spill
   (reuses Step 6's escalation machinery).
-- **Step 16 — BackupRestore category.** Register the consumer, route
-  backup/restore buffers through the account, add the category to WM
-  policy and dashboards.
+- **Step 16+ (Part C) — one step per category**, starting with
+  BackupRestore, following the §5 recipe. Independent, repeatable,
+  individually revertable.
 
 Dependencies: Steps 14–16 build on Step 5 (account tree), Step 6
 (escalation), D10 (guarantee), D12 (reclaim contract), D13's gossip is
