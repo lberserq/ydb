@@ -227,6 +227,35 @@ public:
         }
     }
 
+    // MVP bench helpers: pool/database accounts, entries owned by config
+    // subscription in the target design (no erase-on-zero).
+    TIntrusivePtr<TMemoryResource>& GetOrCreatePoolLocked(TTxState& tx) {
+        auto [it, success] = MemoryNamedPools.emplace(tx.MakePoolId(), nullptr);
+        if (success) {
+            it->second = MakeIntrusive<TMemoryResource>(TotalMemoryResource->GetLimit(), tx.MemoryPoolPercent, SpillingPercent.load());
+        }
+        return it->second;
+    }
+
+    TIntrusivePtr<TMemoryResource>& GetOrCreateDatabaseLocked(const TString& database) {
+        auto [it, success] = MemoryNamedDatabases.emplace(database, nullptr);
+        if (success) {
+            it->second = MakeIntrusive<TMemoryResource>(TotalMemoryResource->GetLimit(), (double)100, SpillingPercent.load());
+        }
+        return it->second;
+    }
+
+    void ReleasePoolAndDatabaseLocked(TTxState& tx, ui64 bytes) {
+        auto it = MemoryNamedPools.find(tx.MakePoolId());
+        if (it != MemoryNamedPools.end()) {
+            it->second->Release(bytes);
+        }
+        auto dit = MemoryNamedDatabases.find(tx.Database);
+        if (dit != MemoryNamedDatabases.end()) {
+            dit->second->Release(bytes);
+        }
+    }
+
     TKqpRMAllocateResult AllocateResources(TTxState& tx, ui64 taskId, const TKqpResourcesRequest& resources) override
     {
         const ui64 txId = tx.TxId;
@@ -242,7 +271,17 @@ public:
         }
 
         if (resources.ExternalMemory) {
-            ExternalDataQueryMemory.fetch_add(resources.ExternalMemory);
+            // D6 lock-free: pool handle resolved once per tx, then one relaxed RMW
+            if (!tx.PoolId.empty() && tx.MemoryPoolPercent > 0) {
+                if (Y_UNLIKELY(!tx.PoolMemoryCookie)) {
+                    with_lock (Lock) {
+                        tx.PoolMemoryCookie = GetOrCreatePoolLocked(tx)->GetSpillingCookie();
+                    }
+                }
+                tx.PoolMemoryCookie->ExternalUsed.fetch_add(resources.ExternalMemory, std::memory_order_relaxed);
+            } else {
+                ExternalDataQueryMemory.fetch_add(resources.ExternalMemory);
+            }
         }
 
         if (Y_UNLIKELY(resources.Memory == 0)) {
@@ -258,7 +297,11 @@ public:
                 }
                 if (resources.ExternalMemory) {
                     // decrease amount of external memory allocated
-                    ExternalDataQueryMemory.fetch_sub(resources.ExternalMemory);
+                    if (tx.PoolMemoryCookie && !tx.PoolId.empty() && tx.MemoryPoolPercent > 0) {
+                        tx.PoolMemoryCookie->ExternalUsed.fetch_sub(resources.ExternalMemory, std::memory_order_relaxed);
+                    } else {
+                        ExternalDataQueryMemory.fetch_sub(resources.ExternalMemory);
+                    }
                 }
             }
         };
@@ -279,18 +322,20 @@ public:
             }
 
             if (hasScanQueryMemory && !tx.PoolId.empty() && tx.MemoryPoolPercent > 0) {
-                auto [it, success] = MemoryNamedPools.emplace(tx.MakePoolId(), nullptr);
+                // MVP: pool config owned by subscription (no SetNewLimit from tx)
+                auto& poolMemory = GetOrCreatePoolLocked(tx);
 
-                if (success) {
-                    it->second = MakeIntrusive<TMemoryResource>(TotalMemoryResource->GetLimit(), tx.MemoryPoolPercent, SpillingPercent.load());
-                } else {
-                    it->second->SetNewLimit(TotalMemoryResource->GetLimit(), tx.MemoryPoolPercent, SpillingPercent.load());
-                }
-
-                auto& poolMemory = it->second;
-                if (!poolMemory->AcquireIfAvailable(resources.Memory)) {
+                // MVP (D3 default): per-query limit as a share of the pool
+                // limit; bench uses 100% so the check never denies.
+                const ui64 queryLimit = poolMemory->GetLimit();
+                if (tx.TxScanQueryMemory.load(std::memory_order_relaxed) + resources.Memory > queryLimit) {
                     hasScanQueryMemory = false;
                     TotalMemoryResource->Release(resources.Memory);
+                } else if (!poolMemory->AcquireIfAvailable(resources.Memory)) {
+                    hasScanQueryMemory = false;
+                    TotalMemoryResource->Release(resources.Memory);
+                } else {
+                    GetOrCreateDatabaseLocked(tx.Database)->AcquireIfAvailable(resources.Memory);
                 }
 
                 if (!tx.PoolMemoryCookie) {
@@ -319,13 +364,7 @@ public:
                 with_lock (Lock) {
                     TotalMemoryResource->Release(resources.Memory);
                     if (!tx.PoolId.empty()) {
-                        auto it = MemoryNamedPools.find(tx.MakePoolId());
-                        if (it != MemoryNamedPools.end()) {
-                            it->second->Release(resources.Memory);
-                            if (it->second->GetUsed() == 0) {
-                                MemoryNamedPools.erase(it);
-                            }
-                        }
+                        ReleasePoolAndDatabaseLocked(tx, resources.Memory);
                     }
                 }
             }
@@ -381,21 +420,20 @@ public:
             ExecutionUnitsResource.fetch_add(resources.ExecutionUnits);
         }
 
-        auto prev = ExternalDataQueryMemory.fetch_sub(resources.ExternalMemory);
-        Y_DEBUG_ABORT_UNLESS(prev >= resources.ExternalMemory);
+        if (resources.ExternalMemory) {
+            if (tx.PoolMemoryCookie && !tx.PoolId.empty() && tx.MemoryPoolPercent > 0) {
+                tx.PoolMemoryCookie->ExternalUsed.fetch_sub(resources.ExternalMemory, std::memory_order_relaxed);
+            } else {
+                auto prev = ExternalDataQueryMemory.fetch_sub(resources.ExternalMemory);
+                Y_DEBUG_ABORT_UNLESS(prev >= resources.ExternalMemory);
+            }
+        }
 
         if (resources.Memory > 0) {
             with_lock (Lock) {
                 TotalMemoryResource->Release(resources.Memory);
                 if (!tx.PoolId.empty()) {
-                    auto it = MemoryNamedPools.find(tx.MakePoolId());
-                    if (it != MemoryNamedPools.end()) {
-                        it->second->Release(resources.Memory);
-
-                        if (it->second->GetUsed() == 0) {
-                            MemoryNamedPools.erase(it);
-                        }
-                    }
+                    ReleasePoolAndDatabaseLocked(tx, resources.Memory);
                 }
             }
         }
@@ -598,6 +636,8 @@ public:
     TActorId ResourceInfoExchanger = TActorId();
 
     absl::flat_hash_map<std::pair<TString, TString>, TIntrusivePtr<TMemoryResource>, THash<std::pair<TString, TString>>> MemoryNamedPools;
+    // MVP bench prototype: database-level accounts (node -> database -> pool -> query)
+    absl::flat_hash_map<TString, TIntrusivePtr<TMemoryResource>> MemoryNamedDatabases;
 };
 
 struct TResourceManagers {
