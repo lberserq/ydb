@@ -206,7 +206,25 @@ private:
         }
 
         // allocatedMemory = otherConsumption + consumersConsumption
-        ui64 otherConsumption = SafeDiff(processMemoryInfo.AllocatedMemory, consumersConsumption);
+        ui64 budgetBase = processMemoryInfo.AllocatedMemory;
+        ui64 rssExcess = 0;
+        if (Config.GetRssAwareBudget() && processMemoryInfo.AnonRss.has_value()) {
+            // AnonRss above AllocatedMemory is allocator caches, fragmentation and non-tcmalloc mappings;
+            // count it as "other" beyond the slack the allocator is expected to hold anyway
+            ui64 rssBudget = SafeDiff(processMemoryInfo.AnonRss.value(), Config.GetRssBudgetSlackBytes());
+            rssExcess = SafeDiff(rssBudget, processMemoryInfo.AllocatedMemory);
+            budgetBase = Max(budgetBase, rssBudget);
+        }
+        ui64 otherConsumption = SafeDiff(budgetBase, consumersConsumption);
+
+        ui64 releaseBytes = 0;
+        if (Config.GetReleaseAllocatorCachesOnPressure() && processMemoryInfo.AnonRss.has_value()
+                && processMemoryInfo.AnonRss.value() > softLimitBytes) {
+            releaseBytes = Min(processMemoryInfo.AllocatorCachesMemory, processMemoryInfo.AnonRss.value() - softLimitBytes);
+            if (releaseBytes) {
+                tcmalloc::MallocExtension::ReleaseMemoryToSystem(releaseBytes);
+            }
+        }
 
         ui64 externalConsumption = 0;
         if (hasMemTotalHardLimit && processMemoryInfo.AnonRss.has_value()
@@ -242,6 +260,8 @@ private:
             {"activitiesLimitBytes", HumanReadableBytes(activitiesLimitBytes)},
             {"consumersConsumption", HumanReadableBytes(consumersConsumption)},
             {"otherConsumption", HumanReadableBytes(otherConsumption)},
+            {"rssExcess", HumanReadableBytes(rssExcess)},
+            {"releaseBytes", HumanReadableBytes(releaseBytes)},
             {"externalConsumption", HumanReadableBytes(externalConsumption)},
             {"targetConsumersConsumption", HumanReadableBytes(targetConsumersConsumption)},
             {"resultingConsumersConsumption", HumanReadableBytes(resultingConsumersConsumption)},
@@ -260,6 +280,8 @@ private:
         Counters->GetCounter("Stats/ActivitiesLimitBytes")->Set(activitiesLimitBytes);
         Counters->GetCounter("Stats/ConsumersConsumption")->Set(consumersConsumption);
         Counters->GetCounter("Stats/OtherConsumption")->Set(otherConsumption);
+        Counters->GetCounter("Stats/RssExcess")->Set(rssExcess);
+        Counters->GetCounter("Stats/AllocatorCachesReleaseRequested")->Set(releaseBytes);
         Counters->GetCounter("Stats/ExternalConsumption")->Set(externalConsumption);
         Counters->GetCounter("Stats/TargetConsumersConsumption")->Set(targetConsumersConsumption);
         Counters->GetCounter("Stats/ResultingConsumersConsumption")->Set(resultingConsumersConsumption);

@@ -262,6 +262,81 @@ Y_UNIT_TEST(Config_ConsumerLimits) {
     UNIT_ASSERT_VALUES_EQUAL(server->MemoryControllerCounters->GetCounter("Consumer/QueryExecution/Limit")->Val(), 15_MB);
 }
 
+Y_UNIT_TEST(RssAwareBudget) {
+    TPortManager pm;
+    TServerSettings serverSettings(pm.GetPort(2134));
+    serverSettings.SetDomainName("Root")
+        .SetUseRealThreads(false);
+
+    auto memoryControllerConfig = serverSettings.AppConfig->MutableMemoryControllerConfig();
+    memoryControllerConfig->SetHardLimitBytes(200_MB); // soft 150, target 100, shared cache 40..100
+    memoryControllerConfig->SetRssAwareBudget(true);
+    memoryControllerConfig->SetRssBudgetSlackBytes(10_MB);
+    memoryControllerConfig->SetReleaseAllocatorCachesOnPressure(true);
+
+    auto server = MakeIntrusive<TWithMemoryControllerServer>(serverSettings);
+    auto& runtime = *server->GetRuntime();
+    auto sharedCacheLimit = server->MemoryControllerCounters->GetCounter("Consumer/SharedCache/Limit");
+    auto rssExcess = server->MemoryControllerCounters->GetCounter("Stats/RssExcess");
+    auto releaseRequested = server->MemoryControllerCounters->GetCounter("Stats/AllocatorCachesReleaseRequested");
+
+    // no rss info: budget from allocated memory only
+    server->ProcessMemoryInfo->AllocatedMemory = 30_MB;
+    runtime.SimulateSleep(TDuration::Seconds(2));
+    UNIT_ASSERT_DOUBLES_EQUAL(sharedCacheLimit->Val(), static_cast<i64>(66_MB), static_cast<i64>(1_MB));
+    UNIT_ASSERT_VALUES_EQUAL(rssExcess->Val(), 0);
+    UNIT_ASSERT_VALUES_EQUAL(releaseRequested->Val(), 0);
+
+    // rss above allocated + slack: the excess is budgeted as other consumption
+    server->ProcessMemoryInfo->AnonRss = 50_MB;
+    runtime.SimulateSleep(TDuration::Seconds(2));
+    UNIT_ASSERT_DOUBLES_EQUAL(sharedCacheLimit->Val(), static_cast<i64>(57_MB), static_cast<i64>(1_MB));
+    UNIT_ASSERT_VALUES_EQUAL(rssExcess->Val(), 10_MB);
+    UNIT_ASSERT_VALUES_EQUAL(releaseRequested->Val(), 0);
+
+    // rss within slack: back to the allocated-memory budget
+    server->ProcessMemoryInfo->AnonRss = 35_MB;
+    runtime.SimulateSleep(TDuration::Seconds(2));
+    UNIT_ASSERT_DOUBLES_EQUAL(sharedCacheLimit->Val(), static_cast<i64>(66_MB), static_cast<i64>(1_MB));
+    UNIT_ASSERT_VALUES_EQUAL(rssExcess->Val(), 0);
+
+    // rss above soft limit while allocated is low: caches are cut and allocator caches get released
+    server->ProcessMemoryInfo->AnonRss = 180_MB;
+    server->ProcessMemoryInfo->AllocatorCachesMemory = 50_MB;
+    runtime.SimulateSleep(TDuration::Seconds(2));
+    UNIT_ASSERT_VALUES_EQUAL(sharedCacheLimit->Val(), 0);
+    UNIT_ASSERT_VALUES_EQUAL(rssExcess->Val(), 140_MB);
+    UNIT_ASSERT_VALUES_EQUAL(releaseRequested->Val(), 30_MB);
+
+    // rss below soft limit again: no release; budget 100 MB leaves caches at their minimums
+    server->ProcessMemoryInfo->AnonRss = 110_MB;
+    runtime.SimulateSleep(TDuration::Seconds(2));
+    UNIT_ASSERT_VALUES_EQUAL(releaseRequested->Val(), 0);
+    UNIT_ASSERT_VALUES_EQUAL(rssExcess->Val(), 70_MB);
+    UNIT_ASSERT_DOUBLES_EQUAL(sharedCacheLimit->Val(), static_cast<i64>(40_MB), static_cast<i64>(1_MB));
+}
+
+Y_UNIT_TEST(RssAwareBudget_Disabled) {
+    TPortManager pm;
+    TServerSettings serverSettings(pm.GetPort(2134));
+    serverSettings.SetDomainName("Root")
+        .SetUseRealThreads(false);
+
+    auto memoryControllerConfig = serverSettings.AppConfig->MutableMemoryControllerConfig();
+    memoryControllerConfig->SetHardLimitBytes(200_MB);
+
+    auto server = MakeIntrusive<TWithMemoryControllerServer>(serverSettings);
+    auto& runtime = *server->GetRuntime();
+
+    server->ProcessMemoryInfo->AllocatedMemory = 30_MB;
+    server->ProcessMemoryInfo->AnonRss = 180_MB;
+    server->ProcessMemoryInfo->AllocatorCachesMemory = 50_MB;
+    runtime.SimulateSleep(TDuration::Seconds(2));
+    UNIT_ASSERT_DOUBLES_EQUAL(server->MemoryControllerCounters->GetCounter("Consumer/SharedCache/Limit")->Val(), static_cast<i64>(66_MB), static_cast<i64>(1_MB));
+    UNIT_ASSERT_VALUES_EQUAL(server->MemoryControllerCounters->GetCounter("Stats/RssExcess")->Val(), 0);
+    UNIT_ASSERT_VALUES_EQUAL(server->MemoryControllerCounters->GetCounter("Stats/AllocatorCachesReleaseRequested")->Val(), 0);
+}
+
 Y_UNIT_TEST(SharedCache) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
