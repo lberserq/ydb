@@ -7,6 +7,7 @@ PY_SRCS(
     rename_tables.py
     encodings.py
     move_data.py
+    cut_history.py
 )
 
 PEERDIR(

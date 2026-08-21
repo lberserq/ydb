@@ -9,6 +9,7 @@ from ydb.tests.stress.olap_workload.workload.type.transactions import WorkloadTr
 from ydb.tests.stress.olap_workload.workload.type.rename_tables import WorkloadRenameTables
 from ydb.tests.stress.olap_workload.workload.type.encodings import WorkloadEncodings
 from ydb.tests.stress.olap_workload.workload.type.move_data import WorkloadMoveData
+from ydb.tests.stress.olap_workload.workload.type.cut_history import WorkloadCutHistory
 
 
 class WorkloadRunner:
@@ -55,10 +56,11 @@ class WorkloadRunner:
             WorkloadRenameTables(self.client, self.name, stop, 10),
             WorkloadEncodings(self.client, self.name, stop),
         ]
-        # Pool shrink/grow needs the console endpoint, so it is only enabled when
-        # the caller supplied one.
+        # Pool shrink/grow and tablet restarts need the console/message-bus endpoint,
+        # so both are only enabled when the caller supplied one.
         if self.endpoint:
             workloads.append(WorkloadMoveData(self.client, self.name, stop, self.endpoint, self.client.database))
+            workloads.append(WorkloadCutHistory(self.client, self.name, stop, self.endpoint))
         for w in workloads:
             w.start()
         started_at = started_at = time.time()

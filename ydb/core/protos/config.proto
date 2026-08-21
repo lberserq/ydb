@@ -2952,6 +2952,7 @@ message TColumnShardConfig {
     // 75/76: group-decommission features. Both are gated by feature flags
     // (EnableColumnshardMoveData / EnableCutHistory), not by this config.
     reserved 75;
+    reserved 76;
 }
 
 // Cluster config for the database-wide small-blobs quota. Per-database limits are derived from

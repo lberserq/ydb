@@ -1,5 +1,6 @@
 #include "blob_manager.h"
 #include "gc.h"
+#include "history_cutter.h"
 
 #include <ydb/core/base/blobstorage.h>
 #include <ydb/core/tx/columnshard/blobs_action/blob_manager_db.h>
@@ -12,6 +13,17 @@
 #define YDB_LOG_THIS_FILE_COMPONENT NKikimrServices::TX_COLUMNSHARD_BLOBS_BS
 
 namespace NKikimr::NOlap {
+
+namespace {
+// Shared monotonic counter for ALL TEvCollectGarbage requests issued by this process
+// (both regular GC batches and CutHistory hard barriers). BS enforces monotonicity per
+// (tablet, generation) space; using one counter ensures no collisions.
+static TAtomicCounter SharedGCPerGenerationCounter = 1;
+}   // anonymous namespace
+
+ui32 TBlobManager::AllocateGCPerGenerationCounter(const ui32 step) {
+    return static_cast<ui32>(SharedGCPerGenerationCounter.Add(step));
+}
 
 TLogoBlobID ParseLogoBlobId(TString blobId) {
     TLogoBlobID logoBlobId;
@@ -146,6 +158,23 @@ TBlobManager::TBlobManager(TIntrusivePtr<TTabletStorageInfo> tabletInfo, ui32 ge
 {
     BlobsManagerCounters.CurrentGen->Set(CurrentGen);
     BlobsManagerCounters.CurrentStep->Set(CurrentStep);
+}
+
+TBlobManager::~TBlobManager() = default;
+
+void TBlobManager::InitHistoryCutter(const std::shared_ptr<TBlobManager>& self,
+    const std::shared_ptr<NDataSharing::TStorageSharedBlobsManager>& sharedBlobs, const TActorId& tabletActorId) {
+    AFL_VERIFY(self.get() == this);
+    HistoryCutter = std::make_unique<NBlobOperations::NBlobStorage::THistoryCutterWrapper>(
+        TabletInfo, CurrentGen, self, sharedBlobs, tabletActorId, BlobsManagerCounters.HistoryCutterCounters);
+}
+
+NBlobOperations::NBlobStorage::THistoryCutterWrapper* TBlobManager::GetHistoryCutter() {
+    return HistoryCutter.get();
+}
+
+const NBlobOperations::NBlobStorage::THistoryCutterWrapper* TBlobManager::GetHistoryCutter() const {
+    return HistoryCutter.get();
 }
 
 void TBlobManager::RegisterControls(NKikimr::TControlBoard& /*icb*/) {
@@ -562,6 +591,15 @@ void TBlobManager::OnGCStartOnComplete(const std::optional<TGenStep>& genStep) {
         AFL_VERIFY(GCBarrierPreparation <= *genStep)("last", GCBarrierPreparation)("prepared", genStep);
         GCBarrierPreparation = *genStep;
     }
+}
+
+bool TBlobManager::HasNoBlobsInRange(const ui32 channel, const ui32 fromGen, const ui32 nextFromGen) const {
+    const auto inRange = [&](const auto& blob) {
+        const TLogoBlobID& logoBlobId = blob.first.GetLogoBlobId();
+        return logoBlobId.Channel() == channel && logoBlobId.Generation() >= fromGen && logoBlobId.Generation() < nextFromGen;
+    };
+    return !AnyOf(BlobsToDelete, inRange) && !AnyOf(BlobsToDeleteDelayed, inRange) &&
+           BlobsToKeep.HasNoBlobsInRange(channel, fromGen, nextFromGen);
 }
 
 void TBlobManager::OnBlobFree(const TUnifiedBlobId& blobId) {
