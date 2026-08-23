@@ -235,11 +235,15 @@ void TExecutorGCLogic::ApplyDelta(TGCTime time, TGCBlobDelta &delta) {
         TGCTime gcTime(blobId.Generation(), blobId.Step());
         Y_ENSURE(channel.KnownGcBarrier < gcTime);
         channel.CommittedDelta[gcTime].Created.push_back(blobId);
+        HistoryCutter.SeenBlob(blobId);
     }
 
     for (const TLogoBlobID &blobId : delta.Deleted) {
         auto &channel = ChannelInfo[blobId.Channel()];
         channel.CommittedDelta[time].Deleted.push_back(blobId);
+        // A DoNotKeep mark still pins its entry: the flag is delivered to the group the
+        // blob's generation resolves to, and cutting the entry makes that unresolvable.
+        HistoryCutter.SeenBlob(blobId);
     }
 }
 
@@ -508,14 +512,19 @@ void TExecutorGCLogic::TChannelInfo::SendCollectGarbage(TGCTime uncommittedTime,
             ui32 activeGroup = Max<ui32>();
             TVector<TLogoBlobID> *vec = nullptr;
 
+            // A generation below the first surviving history entry resolves to the sentinel
+            // group: the entry was cut, so the blob is already collected and its flag has
+            // nowhere to go. Sending it anyway fails forever and blocks the channel's GC.
             for (const auto &blobId : keep) {
                 if (activeGen != blobId.Generation()) {
                     activeGen = blobId.Generation();
                     activeGroup = channelInfo->GroupForGeneration(blobId.Generation());
-                    vec = &affectedGroups[activeGroup].first;
+                    vec = activeGroup == Max<ui32>() ? nullptr : &affectedGroups[activeGroup].first;
                 }
 
-                vec->push_back(blobId);
+                if (vec) {
+                    vec->push_back(blobId);
+                }
             }
 
             activeGen = Max<ui32>();
@@ -526,10 +535,12 @@ void TExecutorGCLogic::TChannelInfo::SendCollectGarbage(TGCTime uncommittedTime,
                 if (activeGen != blobId.Generation()) {
                     activeGen = blobId.Generation();
                     activeGroup = channelInfo->GroupForGeneration(blobId.Generation());
-                    vec = &affectedGroups[activeGroup].second;
+                    vec = activeGroup == Max<ui32>() ? nullptr : &affectedGroups[activeGroup].second;
                 }
 
-                vec->push_back(blobId);
+                if (vec) {
+                    vec->push_back(blobId);
+                }
             }
 
             for (auto &xpair : affectedGroups) {
