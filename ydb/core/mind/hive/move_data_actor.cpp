@@ -3,6 +3,7 @@
 #include <ydb/core/base/tablet.h>
 #include <ydb/core/base/tablet_pipe.h>
 #include <ydb/library/actors/core/actor_bootstrapped.h>
+#include <ydb/library/actors/core/log.h>
 
 namespace NKikimr::NHive {
 
@@ -23,6 +24,15 @@ public:
     std::vector<TPipeClient> PipeClients;
     i64 MoveDataInFlight = 0;
     THive* Hive;
+
+    // Single-slot retry state. PendingRetrySlot / WakeupGeneration form one logical pair
+    // and are only correct while maxInFlight == 1. Two concurrent retries would race on
+    // the same slot; the Y_DEBUG_ABORT_UNLESS in Retry() enforces this assumption.
+    static constexpr size_t InvalidSlot = Max<size_t>();
+
+    ui32 RetryNumber = 0;
+    ui64 WakeupGeneration = 0;
+    size_t PendingRetrySlot = InvalidSlot;
 
     TMoveDataActor(std::vector<TTabletId> tablets, const std::vector<TStorageGroupId>& groups, const TString& poolName, ui64 maxInFlight, THive* hive)
         : Tablets(std::move(tablets))
@@ -81,6 +91,9 @@ public:
             if (PipeClients[i].Tablet == tablet) {
                 NTabletPipe::CloseClient(SelfId(), PipeClients[i].Client);
                 --MoveDataInFlight;
+                RetryNumber = 0;
+                ++WakeupGeneration;
+                PendingRetrySlot = InvalidSlot;
                 Hive->Execute(Hive->CreateRestartTablet(ToFullTabletId(tablet)));
                 if (NextTablet != Tablets.end()) {
                     SendMoveData(i, *(NextTablet++));
@@ -107,14 +120,36 @@ public:
     }
 
     void Retry(TTabletId tablet) {
+        Y_DEBUG_ABORT_UNLESS(PipeClients.size() == 1,
+            "single PendingRetrySlot/WakeupGeneration pair is only correct while maxInFlight == 1");
         for (size_t i = 0; i < PipeClients.size(); ++i) {
-            if (PipeClients[i].Tablet == tablet) {
+            if (PipeClients[i].Tablet == tablet && bool(PipeClients[i].Client)) {
                 NTabletPipe::CloseClient(SelfId(), PipeClients[i].Client);
+                PipeClients[i].Client = TActorId{}; // prevent re-entry on spurious TEvClientDestroyed
                 --MoveDataInFlight;
-                SendMoveData(i, tablet);
+                PendingRetrySlot = i;
+                const ui32 shift = Min<ui32>(RetryNumber, 6u);
+                // Effective delay sequence: 100 ms, 200 ms, 400 ms, 800 ms, 1600 ms, 3200 ms, then 5000 ms cap
+                auto delay = Min(TDuration::MilliSeconds(100u * (1u << shift)), TDuration::Seconds(5));
+                ++WakeupGeneration;
+                Schedule(delay, new TEvents::TEvWakeup(WakeupGeneration));
+                ++RetryNumber;
+                LOG_WARN_S(*TlsActivationContext, NKikimrServices::HIVE,
+                    "TMoveDataActor: retry scheduled for tablet " << tablet
+                    << " attempt=" << RetryNumber
+                    << " delayMs=" << delay.MilliSeconds());
                 break;
             }
         }
+    }
+
+    void HandleWakeup(TEvents::TEvWakeup::TPtr& ev) {
+        if (ev->Get()->Tag != WakeupGeneration || PendingRetrySlot == InvalidSlot) {
+            return;
+        }
+        const size_t i = PendingRetrySlot;
+        PendingRetrySlot = InvalidSlot;
+        SendMoveData(i, PipeClients[i].Tablet);
     }
 
     STATEFN(StateWork) {
@@ -123,6 +158,7 @@ public:
             hFunc(TEvTablet::TEvMoveDataResponse, Handle);
             hFunc(TEvTabletPipe::TEvClientConnected, Handle);
             hFunc(TEvTabletPipe::TEvClientDestroyed, Handle);
+            hFunc(TEvents::TEvWakeup, HandleWakeup);
         }
     }
 };

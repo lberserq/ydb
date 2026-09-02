@@ -10038,6 +10038,156 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         runtime.WaitFor("TEvShrinkStoragePoolDone after registrar reconnect replayed CutTabletHistory", [&] { return done; });
     }
 
+    Y_UNIT_TEST(TestMoveDataRetryPaced) {
+        TTestBasicRuntime runtime(1, false);
+        Setup(runtime, true, 2, [](TAppPrepare& app) {
+            app.HiveConfig.SetCutHistoryAllowList("Dummy");
+        });
+
+        const ui64 hiveTablet = MakeDefaultHiveID();
+        const TActorId hiveActor = CreateTestBootstrapper(runtime,
+            CreateTestTabletInfo(hiveTablet, TTabletTypes::Hive), &CreateDefaultHive);
+        CreateTestBootstrapper(runtime,
+            CreateTestTabletInfo(MakeConsoleID(), TTabletTypes::Console), &NConsole::CreateConsole);
+        runtime.EnableScheduleForActor(hiveActor);
+        const TActorId senderA = runtime.AllocateEdgeActor(0);
+        const ui64 testerTablet = MakeTabletID(false, 1);
+
+        bool done = false;
+        auto doneObs = runtime.AddObserver<TEvHive::TEvShrinkStoragePoolDone>([&](auto&&) { done = true; });
+
+        THolder<TEvHive::TEvCreateTablet> createEv(
+            new TEvHive::TEvCreateTablet(testerTablet, 100500, TTabletTypes::Dummy,
+                                         {3, GetChannelBind("def1")}));
+        ui64 tabletId = SendCreateTestTablet(runtime, hiveTablet, testerTablet, std::move(createEv), 0, true);
+
+        // Count step-2 TEvMoveData EvSend events from TMoveDataActor.
+        // Observer installed HERE, before the ShrinkStoragePool loop, so that
+        // GrabEdgeEventRethrow's internal dispatch cannot miss the very first send.
+        TActorId moveDataActorId;
+        int sendMoveDataCount = 0;
+        bool disconnectSeen = false;
+        auto sendObs = runtime.AddObserver<IEventHandle>([&](IEventHandle::TPtr& ev) {
+            if (!ev) return;
+            if (ev->Type == TEvTablet::TEvMoveData::EventType &&
+                ev->GetTypeRewrite() == TEvTabletPipe::EvSend) {
+                if (!moveDataActorId) {
+                    moveDataActorId = ev->Sender;
+                }
+                if (ev->Sender == moveDataActorId) {
+                    ++sendMoveDataCount;
+                }
+            }
+        });
+
+        ui32 group = 0;
+        for (int attempt = 0;; ++attempt) {
+            UNIT_ASSERT_LE(attempt, 10);
+            auto request = std::make_unique<TEvHive::TEvShrinkStoragePool>();
+            request->Record.MutableSubDomain()->SetSchemeShard(TTestTxConfig::SchemeShard);
+            request->Record.MutableSubDomain()->SetPathId(1);
+            request->Record.SetStoragePool("def1");
+            request->Record.SetNewSize(1);
+            request->Record.SetVersion(1);
+            runtime.SendToPipe(hiveTablet, senderA, request.release(), 0, GetPipeConfigWithRetries());
+            TAutoPtr<IEventHandle> handle;
+            auto response = runtime.GrabEdgeEventRethrow<TEvHive::TEvShrinkStoragePoolReply>(
+                handle, TDuration::MilliSeconds(100));
+            if (response) {
+                group = response->Record.GetGroupsToRemove(0);
+                break;
+            }
+        }
+
+        // Block responses to prevent TMoveDataActor from completing while the target is down.
+        TBlockEvents<TEvTablet::TEvMoveDataResponse> blockResp(runtime);
+
+        // Wait for the initial TEvMoveData delivery (Bootstrap → SendMoveData → pipe → tablet).
+        {
+            TDispatchOptions opts;
+            opts.FinalEvents.emplace_back(TEvTablet::EvMoveData);
+            runtime.DispatchEvents(opts);
+        }
+        int initialCount = sendMoveDataCount; // == 1
+
+        // Block tablet boot so the pipe target stays dead during the pacing check.
+        // With CheckAliveness=true, the new pipe subscribes to Hive and waits;
+        // blocking boot keeps the notification from arriving until the liveness phase.
+        TBlockEvents<TEvLocal::TEvBootTablet> blockBoot(runtime);
+
+        // Kill the Dummy tablet without waiting for reboot.
+        ForwardToTablet(runtime, tabletId, senderA, new TEvents::TEvPoisonPill());
+
+        // Observe disconnect events; record retryAt at the first disconnect.
+        // sendObs captures resendTimes (via disconnectSeen) for the PACING assertion.
+        auto connFailObs = runtime.AddObserver<TEvTabletPipe::TEvClientConnected>(
+            [&](TEvTabletPipe::TEvClientConnected::TPtr& ev) {
+                if (ev->Get()->Status != NKikimrProto::OK && !disconnectSeen) {
+                    disconnectSeen = true;
+                }
+            });
+        auto destroyedObs = runtime.AddObserver<TEvTabletPipe::TEvClientDestroyed>(
+            [&](TEvTabletPipe::TEvClientDestroyed::TPtr&) {
+                disconnectSeen = true;
+            });
+
+        // Wait until the disconnect reaches TMoveDataActor and Retry() runs.
+        {
+            TDispatchOptions opts;
+            opts.CustomFinalCondition = [&]() { return disconnectSeen; };
+            opts.FinalEvents.emplace_back([](IEventHandle&) { return false; });
+            runtime.DispatchEvents(opts, TDuration::Seconds(5));
+        }
+        connFailObs.Remove();
+        destroyedObs.Remove();
+        UNIT_ASSERT(disconnectSeen);
+
+        // PACING: fixed code schedules a TEvWakeup (100 ms delay) in Retry();
+        // old code calls SendMoveData immediately — no wakeup ever scheduled.
+        // Add the observer now (before AdvanceCurrentTime) to catch the wakeup.
+        // Filter by Recipient == moveDataActorId: NTabletPipe's own retry mechanism
+        // also schedules TEvWakeup internally; we only care about the one that
+        // TMoveDataActor schedules to itself via Schedule() in Retry().
+        bool wakeupFired = false;
+        auto wakeupObs = runtime.AddObserver<TEvents::TEvWakeup>(
+            [&](TEvents::TEvWakeup::TPtr& ev) {
+                if (moveDataActorId && ev->Recipient == moveDataActorId) {
+                    wakeupFired = true;
+                }
+            });
+
+        // LIVENESS: advance 200 ms so the first backoff wakeup (100 ms) fires
+        // and HandleWakeup calls SendMoveData.
+        runtime.AdvanceCurrentTime(TDuration::MilliSeconds(200));
+        runtime.DispatchEvents({}, TDuration::MilliSeconds(50));
+        UNIT_ASSERT_GT(sendMoveDataCount, initialCount);
+
+        // PACING: with fix a wakeup must have fired (proving the delay occurred).
+        // Without fix Retry() skips the scheduler entirely → this assertion fails.
+        UNIT_ASSERT_C(wakeupFired,
+            "TMoveDataActor did not schedule a backoff wakeup — unfixed Retry() path");
+        wakeupObs.Remove();
+
+        // Unblock boot and responses so the actor can complete.
+        blockBoot.Unblock();
+        blockBoot.Stop();
+        blockResp.Unblock();
+        blockResp.Stop();
+
+        for (int attempt = 0; attempt < 10 && !done; ++attempt) {
+            for (ui32 channel = 0; channel < 3; ++channel) {
+                auto cutEv = std::make_unique<TEvTablet::TEvCutTabletHistory>();
+                cutEv->Record.SetTabletID(tabletId);
+                cutEv->Record.SetChannel(channel);
+                cutEv->Record.SetFromGeneration(0);
+                cutEv->Record.SetGroupID(group);
+                runtime.SendToPipe(hiveTablet, senderA, cutEv.release(), 0, GetPipeConfigWithRetries());
+            }
+            runtime.DispatchEvents({}, TDuration::MilliSeconds(100));
+        }
+        UNIT_ASSERT(done);
+    }
+
     Y_UNIT_TEST(TestLockedTabletMetricsAfterHiveRestart) {
         const ui64 hiveTablet = MakeDefaultHiveID();
         const ui64 testerTablet = MakeTabletID(false, 1);
