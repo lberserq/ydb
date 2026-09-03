@@ -68,6 +68,9 @@ message TTableServiceConfig {
         // (RFC dq_memory_quota_20): optional memory requests before growth, numeric memory availability
         // instead of the allocator yellow zone, explicit give-back. Off: allocator heuristics only.
         optional bool EnableOperatorMemoryQuota = 34 [default = false];
+
+        // Read once at RM actor Bootstrap; runtime CMS changes take effect only after node restart.
+        optional bool EnableMemoryControllerBudget = 35 [default = false];
     }
 
     message TSpillingServiceConfig {
