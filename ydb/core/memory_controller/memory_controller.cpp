@@ -499,7 +499,11 @@ private:
             Counters->GetCounter("Consumer/QueryExecution/Limit")->Set(config.QueueLimits[NLocalDb::KqpResourceManagerQueue]);
         }
         memoryStats.SetQueryExecutionConsumption(memoryStats.GetQueryExecutionConsumption() + queryExecutionConsumption);
-        memoryStats.SetQueryExecutionLimit(config.QueueLimits[NLocalDb::KqpResourceManagerQueue]);
+        // when QE consumer is registered, publish the applied limit (self-config or formula); RB queue gets the same value
+        ui64 qeAppliedLimit = (qeConsumerIt != Consumers.end() && SelfConfigQueryExecutionLimit)
+            ? *SelfConfigQueryExecutionLimit
+            : config.QueueLimits[NLocalDb::KqpResourceManagerQueue];
+        memoryStats.SetQueryExecutionLimit(qeAppliedLimit);
 
         // Note: for now ResourceBroker and its queues aren't MemoryController consumers and don't share limits with other caches
         ApplyResourceBrokerConfig(config);
@@ -629,9 +633,10 @@ private:
                 break;
             }
             case EMemoryConsumerKind::QueryExecution: {
-                // Self-config from RB takes priority (ctor-fixed); floor to formula value so operator zero never kills QE
-                ui64 limit = Max(SelfConfigQueryExecutionLimit.value_or(0),
-                    GetQueryExecutionLimitBytes(Config, hardLimitBytes));
+                // Self-config from RB is authoritative (ctor-fixed); RM-side zero-ignore is the only floor guard
+                ui64 limit = SelfConfigQueryExecutionLimit
+                    ? *SelfConfigQueryExecutionLimit
+                    : GetQueryExecutionLimitBytes(Config, hardLimitBytes);
                 result.MinBytes = result.MaxBytes = limit; // min=max: static consumer, parity with RB queue limit
                 break;
             }

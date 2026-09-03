@@ -407,6 +407,8 @@ public:
     ::NMonitoring::TDynamicCounters::TCounterPtr RmMemory;
     ::NMonitoring::TDynamicCounters::TCounterPtr RmExternalMemory;
     ::NMonitoring::TDynamicCounters::TCounterPtr RmNotEnoughMemory;
+    ::NMonitoring::TDynamicCounters::TCounterPtr RmOptionalQuotaDenied;
+    ::NMonitoring::TDynamicCounters::TCounterPtr RmOptionalQuotaDeniedBytes;
     ::NMonitoring::TDynamicCounters::TCounterPtr RmNotEnoughComputeActors;
     ::NMonitoring::TDynamicCounters::TCounterPtr RmExtraMemAllocs;
     ::NMonitoring::TDynamicCounters::TCounterPtr RmOnStartAllocs;
