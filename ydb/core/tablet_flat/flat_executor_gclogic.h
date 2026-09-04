@@ -12,6 +12,10 @@
 namespace NKikimr {
 namespace NTabletFlatExecutor {
 
+namespace NFlatExecutorSetup {
+    struct ITablet;
+}
+
 struct TGCTime {
     ui32 Generation;
     ui32 Step;
@@ -39,7 +43,13 @@ struct TGCLogEntry {
 
 class TExecutorGCLogic {
 public:
+    // False for channels the tablet writes past the executor (ITablet::
+    // HasExternallyWrittenBlobs): cutting those strands their blobs below the surviving
+    // history, where GroupFor() resolves them to the Max<ui32> sentinel forever.
+    bool IsHistoryCuttingSound(ui32 channel) const;
+
     TExecutorGCLogic(TIntrusiveConstPtr<TTabletStorageInfo>, TAutoPtr<NPageCollection::TSteppedCookieAllocator>);
+    void SetOwner(NFlatExecutorSetup::ITablet* owner) { Owner = owner; }
     void WriteToLog(TLogCommit &logEntry);
     TGCLogEntry SnapshotLog(ui32 step);
     void SnapToLog(NKikimrExecutorFlat::TLogSnapshot &logSnapshot, ui32 step);
@@ -59,6 +69,12 @@ public:
     void Confirm(const TActorContext &ctx);
 
     THistoryCutter HistoryCutter;
+
+    // Marks dropped by the sentinel guard since the last drain; the executor moves
+    // this into the GcSentinelDroppedMarks cumulative counter on its periodic
+    // counters update (open item 7).
+    ui64 TakeSentinelDroppedMarks() { return std::exchange(SentinelDroppedMarks, 0); }
+    ui64 SentinelDroppedMarks = 0;
 
 
     struct TIntrospection {
@@ -86,6 +102,9 @@ public:
     TIntrospection IntrospectStateSize() const;
 protected:
     const TIntrusiveConstPtr<TTabletStorageInfo> TabletStorageInfo;
+    // Not owned; set by the executor once it adopts this logic. Null during boot and
+    // in unit tests, where no channel is externally written.
+    NFlatExecutorSetup::ITablet* Owner = nullptr;
     const TAutoPtr<NPageCollection::TSteppedCookieAllocator> Cookies;
     const ui32 Generation;
     NPageCollection::TSlicer Slicer;
@@ -113,7 +132,9 @@ protected:
         ui32 FailCount;
 
         inline TChannelInfo();
-        void SendCollectGarbage(TGCTime uncommittedTime, const TTabletStorageInfo *tabletStorageInfo, ui32 channel, ui32 generation, const TActorContext& executor);
+        // Returns the number of GC marks dropped by the sentinel guard (group resolves
+        // to Max<ui32>() below the first surviving history entry).
+        ui64 SendCollectGarbage(TGCTime uncommittedTime, const TTabletStorageInfo *tabletStorageInfo, ui32 channel, ui32 generation, const TActorContext& executor);
         void SendCollectGarbageEntry(const TActorContext &ctx, TVector<TLogoBlobID> &&keep, TVector<TLogoBlobID> &&notKeep, ui64 tabletid, ui32 channel, ui32 bsgroup, ui32 generation, bool hard, std::optional<TGCTime> barrier = std::nullopt);
         bool OnCollectGarbageSuccess();
         void OnCollectGarbageFailure();
