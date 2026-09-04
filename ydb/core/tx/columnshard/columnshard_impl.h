@@ -31,9 +31,6 @@
 
 #include <ydb/core/base/blobstorage_grouptype.h>
 #include <ydb/core/base/tablet_pipecache.h>
-#include <ydb/core/cms/console/configs_dispatcher.h>
-#include <ydb/core/cms/console/console.h>
-#include <ydb/core/protos/config.pb.h>
 #include <ydb/core/statistics/events.h>
 #include <ydb/core/tablet/tablet_counters.h>
 #include <ydb/core/tablet/tablet_pipe_client_cache.h>
@@ -52,6 +49,22 @@
 
 #include <ydb/services/metadata/abstract/common.h>
 #include <ydb/services/metadata/service.h>
+
+#include <memory>
+
+namespace NKikimrConfig {
+class TColumnShardConfig;
+}
+
+namespace NKikimr::NConsole {
+namespace TEvConfigsDispatcher {
+struct TEvSetConfigSubscriptionResponse;
+}
+
+namespace TEvConsole {
+struct TEvConfigNotificationRequest;
+}
+}   // namespace NKikimr::NConsole
 
 namespace NKikimr::NOlap {
 class TCleanupPortionsColumnEngineChanges;
@@ -302,8 +315,8 @@ class TColumnShard: public TActor<TColumnShard>, public NTabletFlatExecutor::TTa
     void Handle(TEvPrivate::TEvTieringModified::TPtr& ev, const TActorContext&);
     void Handle(TEvPrivate::TEvNormalizerResult::TPtr& ev, const TActorContext&);
 
-    void Handle(NConsole::TEvConfigsDispatcher::TEvSetConfigSubscriptionResponse::TPtr& ev);
-    void Handle(NConsole::TEvConsole::TEvConfigNotificationRequest::TPtr& ev);
+    void Handle(TAutoPtr<NActors::TEventHandle<NConsole::TEvConfigsDispatcher::TEvSetConfigSubscriptionResponse>>& ev);
+    void Handle(TAutoPtr<NActors::TEventHandle<NConsole::TEvConsole::TEvConfigNotificationRequest>>& ev);
     void Handle(TEvPrivate::TEvRetryConfigSubscription::TPtr& ev);
     void ApplyColumnShardConfig();
     void SubscribeToColumnShardConfig();
@@ -331,6 +344,11 @@ class TColumnShard: public TActor<TColumnShard>, public NTabletFlatExecutor::TTa
     void Handle(TEvDataShard::TEvCancelBackup::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvCancelRestore::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvCompactTable::TPtr& ev, const TActorContext& ctx);
+    void Handle(TEvTablet::TEvMoveData::TPtr& ev, const TActorContext& ctx);
+    virtual void MoveDataCompleted(const TActorContext& ctx) override;
+    // Evaluates the response gate. Split out of MoveDataCompleted so the periodic wakeup
+    // can drive it without claiming the executor's vacuum has finished.
+    void CheckMoveDataGate(const TActorContext& ctx);
 
     void Handle(TEvColumnShard::TEvOverloadUnsubscribe::TPtr& ev, const TActorContext& ctx);
     void Handle(NLongTxService::TEvLongTxService::TEvLockStatus::TPtr& ev, const TActorContext& ctx);
@@ -441,83 +459,7 @@ protected:
         }
     }
 
-    STFUNC(StateWork) {
-        const TLogContextGuard gLogging = NActors::TLogContextBuilder::Build(NKikimrServices::TX_COLUMNSHARD)("tablet_id", TabletID())(
-            "self_id", SelfId())("ev", ev->GetTypeName());
-        TRACE_EVENT(NKikimrServices::TX_COLUMNSHARD);
-        switch (ev->GetTypeRewrite()) {
-            HFunc(TEvTxProcessing::TEvReadSet, Handle);
-            HFunc(TEvTxProcessing::TEvReadSetAck, Handle);
-
-            HFunc(TEvTabletPipe::TEvClientConnected, Handle);
-            HFunc(TEvTabletPipe::TEvClientDestroyed, Handle);
-            HFunc(TEvTabletPipe::TEvServerConnected, Handle);
-            HFunc(TEvTabletPipe::TEvServerDisconnected, Handle);
-            HFunc(TEvColumnShard::TEvProposeTransaction, Handle);
-            HFunc(TEvColumnShard::TEvCheckPlannedTransaction, Handle);
-            HFunc(TEvDataShard::TEvCancelTransactionProposal, Handle);
-            HFunc(TEvColumnShard::TEvNotifyTxCompletion, Handle);
-            HFunc(TEvDataShard::TEvKqpScan, Handle);
-            HFunc(TEvColumnShard::TEvInternalScan, Handle);
-            HFunc(TEvTxProcessing::TEvPlanStep, Handle);
-            HFunc(TEvPrivate::TEvWriteBlobsResult, Handle);
-            HFunc(TEvPrivate::TEvStartCompaction, Handle);
-            HFunc(TEvPrivate::TEvMetadataAccessorsInfo, Handle);
-            HFunc(NPrivateEvents::NWrite::TEvWritePortionResult, Handle);
-
-            HFunc(TEvMediatorTimecast::TEvRegisterTabletResult, Handle);
-            HFunc(TEvMediatorTimecast::TEvNotifyPlanStep, Handle);
-            HFunc(TEvPrivate::TEvWriteIndex, Handle);
-            HFunc(TEvPrivate::TEvScanStats, Handle);
-            HFunc(TEvPrivate::TEvReadFinished, Handle);
-            HFunc(TEvPrivate::TEvPeriodicWakeup, Handle);
-            HFunc(NActors::TEvents::TEvWakeup, Handle);
-            HFunc(TEvPrivate::TEvPingSnapshotsUsage, Handle);
-            hFunc(TEvPrivate::TEvReportBaseStatistics, Handle);
-            hFunc(TEvPrivate::TEvReportExecutorStatistics, Handle);
-            HFunc(NEvents::TDataEvents::TEvWrite, Handle);
-            HFunc(TEvPrivate::TEvWriteDraft, Handle);
-            HFunc(TEvPrivate::TEvGarbageCollectionFinished, Handle);
-            HFunc(TEvPrivate::TEvTieringModified, Handle);
-
-            HFunc(NActors::TEvents::TEvUndelivered, Handle);
-
-            HFunc(NOlap::NBlobOperations::NEvents::TEvDeleteSharedBlobs, Handle);
-            HFunc(NOlap::NBackground::TEvExecuteGeneralLocalTransaction, Handle);
-            HFunc(NOlap::NBackground::TEvRemoveSession, Handle);
-            HFunc(NOlap::NDataSharing::NEvents::TEvApplyLinksModification, Handle);
-            HFunc(NOlap::NDataSharing::NEvents::TEvApplyLinksModificationFinished, Handle);
-
-            HFunc(NOlap::NDataSharing::NEvents::TEvProposeFromInitiator, Handle);
-            HFunc(NOlap::NDataSharing::NEvents::TEvConfirmFromInitiator, Handle);
-            HFunc(NOlap::NDataSharing::NEvents::TEvStartToSource, Handle);
-            HFunc(NOlap::NDataSharing::NEvents::TEvSendDataFromSource, Handle);
-            HFunc(NOlap::NDataSharing::NEvents::TEvAckDataToSource, Handle);
-            HFunc(NOlap::NDataSharing::NEvents::TEvFinishedFromSource, Handle);
-            HFunc(NOlap::NDataSharing::NEvents::TEvAckFinishToSource, Handle);
-            HFunc(NOlap::NDataSharing::NEvents::TEvAckFinishFromInitiator, Handle);
-            HFunc(NColumnShard::TEvPrivate::TEvAskTabletDataAccessors, Handle);
-            HFunc(NColumnShard::TEvPrivate::TEvAskColumnData, Handle);
-            HFunc(TEvTxProxySchemeCache::TEvWatchNotifyUpdated, Handle);
-            HFunc(TEvTxProxySchemeCache::TEvWatchNotifyUnavailable, Handle);
-            HFunc(TEvColumnShard::TEvOverloadUnsubscribe, Handle);
-            HFunc(NLongTxService::TEvLongTxService::TEvLockStatus, Handle);
-            HFunc(TEvDataShard::TEvCancelBackup, Handle);
-            HFunc(TEvDataShard::TEvCancelRestore, Handle);
-            HFunc(TEvDataShard::TEvCompactTable, Handle);
-
-            hFunc(NConsole::TEvConfigsDispatcher::TEvSetConfigSubscriptionResponse, Handle);
-            hFunc(NConsole::TEvConsole::TEvConfigNotificationRequest, Handle);
-            hFunc(TEvPrivate::TEvRetryConfigSubscription, Handle);
-
-            default:
-                if (!HandleDefaultEvents(ev, SelfId())) {
-                    LOG_S_WARN("TColumnShard.StateWork at " << TabletID() << " unhandled event type: " << ev->GetTypeName()
-                                                            << " event: " << ev->ToString());
-                }
-                break;
-        }
-    }
+    STFUNC(StateWork);
 
 private:
     std::unique_ptr<TTabletCountersBase> TabletCountersHolder;
@@ -572,13 +514,18 @@ private:
 
     TInFlightReadsTracker InFlightReadsTracker;
     TTablesManager TablesManager;
-    // Local CMS snapshot of ColumnShardConfig
-    NKikimrConfig::TColumnShardConfig ColumnShardConfig;
+    // Local CMS snapshot of ColumnShardConfig. Heap-allocated so this header
+    // does not need a complete NKikimrConfig::TColumnShardConfig / config.pb.h.
+    std::unique_ptr<NKikimrConfig::TColumnShardConfig> ColumnShardConfig;
     std::shared_ptr<NSubscriber::TManager> Subscribers;
     std::shared_ptr<TTiersManager> Tiers;
     std::unique_ptr<NTabletPipe::IClientCache> PipeClientCache;
     NOlap::NResourceBroker::NSubscribe::TTaskContext CompactTaskSubscription;
     NOlap::NResourceBroker::NSubscribe::TTaskContext TTLTaskSubscription;
+    // The move's accessor requests are scheduled like TTL's but must not be *counted* as
+    // TTL's: one string drives both the broker queue and the ResourceType label, so sharing
+    // it made a stalled move indistinguishable from idle tiering in the sensors.
+    NOlap::NResourceBroker::NSubscribe::TTaskContext MoveDataTaskSubscription;
 
     ui64 InProgressTxId = 0;
     bool ProgressTxScheduled = false;
@@ -596,6 +543,33 @@ private:
 
     TActorId StatsReportPipe;
     std::unique_ptr<TEvDataShard::TEvPeriodicTableStats> LastStats;
+
+    // Stateless v1: no persistence; on restart Hive re-sends TEvMoveData.
+    struct TMoveDataState {
+        TActorId HiveSender;
+        THashSet<ui32> TargetGroups;
+        bool Active = false;
+        // Set to true when the executor calls MoveDataCompleted(); signals that
+        // vacuum is done and only the HasBlobsForGroups gate remains.
+        bool VacuumCompleted = false;
+        // The completion gate scans the GC queues; cap its cadence instead of
+        // paying the scans on every periodic wakeup tick. Default-initialized to the
+        // epoch so the first check fires immediately. The effective interval is
+        // max(MoveDataGateCheckCadence, PeriodicWakeupActivationPeriod) — the cadence
+        // is a lower bound; wakeup granularity is acceptable for an hours-scale
+        // decommission operation.
+        TInstant LastGateCheckAt;
+        // The actualizer's rejection count is cumulative per session; remember what was
+        // already reported so the sensor stays a rate rather than a repeated total.
+        ui64 ReportedRejections = 0;
+    };
+
+    static constexpr TDuration MoveDataGateCheckCadence = TDuration::Seconds(5);
+
+    TMoveDataState MoveDataState;
+
+    // Number of metadata-accessor requests this tablet has in flight; gates SetupMetadata.
+    std::shared_ptr<TAtomicCounter> MetadataRequestsInFlight = std::make_shared<TAtomicCounter>();
 
     // In-flight forced-compaction requests (ALTER TABLE ... COMPACT). Kept in memory only, mirroring
     // DataShard's CompactionWaiters: on restart/move the SchemeShard's persisted queue re-sends
@@ -660,6 +634,10 @@ private:
         const std::shared_ptr<NPrioritiesQueue::TAllocationGuard>& guard);
 
     void SetupMetadata();
+    // Re-arms only the move's accessor requests, ungated: they must not queue behind tiering's.
+    void SetupMoveDataMetadata();
+    void StartMetadataRequests(
+        std::vector<NOlap::TCSMetadataRequest>&& requests, const NOlap::NResourceBroker::NSubscribe::TTaskContext& taskContext);
     bool SetupTtl();
     void SetupCleanupPortions(const NOlap::ISnapshotHolders& snapshotHolders);
     void SetupCleanupTables(const NOlap::ISnapshotHolders& snapshotHolders);
@@ -784,6 +762,7 @@ public:
     }
 
     TColumnShard(TTabletStorageInfo* info, const TActorId& tablet);
+    ~TColumnShard();
 };
 
 }   // namespace NKikimr::NColumnShard

@@ -11,6 +11,7 @@
 
 #include <ydb/core/cms/console/configs_dispatcher.h>
 #include <ydb/core/cms/console/console.h>
+#include <ydb/core/protos/config.pb.h>
 #include <ydb/core/protos/table_stats.pb.h>
 #include <ydb/core/tx/columnshard/bg_tasks/adapter/adapter.h>
 #include <ydb/core/tx/columnshard/blobs_action/abstract/storages_manager.h>
@@ -164,7 +165,7 @@ void TColumnShard::OnActivateExecutor(const TActorContext& ctx) {
     NormalizerController.SetDataAccessorsManager(DataAccessorsManager);
     PrioritizationClientId = NPrioritiesQueue::TCompServiceOperator::RegisterClient();
 
-    ColumnShardConfig = AppData(ctx)->ColumnShardConfig;
+    *ColumnShardConfig = AppData(ctx)->ColumnShardConfig;
     SubscribeToColumnShardConfig();
 
     Execute(CreateTxInitSchema(), ctx);
@@ -202,18 +203,18 @@ void TColumnShard::ApplyColumnShardConfig() {
     if (!HasIndex()) {
         return;
     }
-    MutableIndexAs<NOlap::TColumnEngineForLogs>().GetOptimizerRuntimeSettings()->ApplyFromConfig(ColumnShardConfig);
+    MutableIndexAs<NOlap::TColumnEngineForLogs>().GetOptimizerRuntimeSettings()->ApplyFromConfig(*ColumnShardConfig);
 }
 
 void TColumnShard::Handle(NConsole::TEvConsole::TEvConfigNotificationRequest::TPtr& ev) {
     auto& event = ev->Get()->Record;
 
-    ColumnShardConfig.Swap(event.MutableConfig()->MutableColumnShardConfig());
+    ColumnShardConfig->Swap(event.MutableConfig()->MutableColumnShardConfig());
     ApplyColumnShardConfig();
     YDB_LOG_INFO("",
         {"event", "columnshard_config_updated"},
-        {"has_node_portions_count_limit", ColumnShardConfig.HasNodePortionsCountLimit()},
-        {"node_portions_count_limit", ColumnShardConfig.HasNodePortionsCountLimit() ? ColumnShardConfig.GetNodePortionsCountLimit() : 0});
+        {"has_node_portions_count_limit", ColumnShardConfig->HasNodePortionsCountLimit()},
+        {"node_portions_count_limit", ColumnShardConfig->HasNodePortionsCountLimit() ? ColumnShardConfig->GetNodePortionsCountLimit() : 0});
 
     auto responseEv = MakeHolder<NConsole::TEvConsole::TEvConfigNotificationResponse>(event);
     Send(ev->Sender, responseEv.Release(), IEventHandle::FlagTrackDelivery, ev->Cookie);
@@ -332,6 +333,16 @@ void TColumnShard::Handle(TEvPrivate::TEvPeriodicWakeup::TPtr& ev, const TActorC
         SendWaitPlanStep(GetOutdatedStep());
         EnqueueBackgroundActivities();
         ctx.Schedule(PeriodicWakeupActivationPeriod, new TEvPrivate::TEvPeriodicWakeup());
+    }
+
+    // Retry the completion gate while a move is active — at most once per cadence, since
+    // the gate scans the GC queues. Deliberately not conditioned on VacuumCompleted: that
+    // flag is set only by the executor's vacuum callback, so gating the retry on it made
+    // the fallback depend on the very signal it exists to survive. A tablet whose vacuum
+    // callback never arrived then sat at Active=1 forever without evaluating the gate once.
+    if (MoveDataState.Active && ctx.Now() - MoveDataState.LastGateCheckAt >= MoveDataGateCheckCadence) {
+        MoveDataState.LastGateCheckAt = ctx.Now();
+        CheckMoveDataGate(ctx);
     }
 }
 
@@ -646,6 +657,114 @@ void TColumnShard::ScheduleExecutorStatistics() {
             {"reportExecutorStatisticsPeriodMs", statistics.GetReportExecutorStatisticsPeriodMs()},
             {"scheduleDuration", scheduleDuration});
     }
+}
+
+void TColumnShard::Handle(TEvTablet::TEvMoveData::TPtr& ev, const TActorContext&) {
+    if (!HasAppData() || !AppData()->FeatureFlags.GetEnableColumnshardGroupDecommission()) {
+        TTabletExecutedFlat::Handle(ev);
+        return;
+    }
+
+    const auto& record = ev->Get()->Record;
+    MoveDataState.HiveSender = ev->Sender;
+
+    if (MoveDataState.Active) {
+        // Hive retry or re-assignment.
+        bool newGroupsAdded = false;
+        for (const auto groupId : record.GetGroups()) {
+            newGroupsAdded |= MoveDataState.TargetGroups.emplace(groupId).second;
+        }
+        LOG_S_INFO("TColumnShard::Handle TEvMoveData: merge resend, newGroups="
+                   << newGroupsAdded << " totalGroups=" << MoveDataState.TargetGroups.size() << " at tablet " << TabletID());
+        if (newGroupsAdded && HasIndex()) {
+            // Restart actualization with the extended group set. The vacuum leg is not restarted:
+            // its scope is local-DB cleanup, independent of which data groups are targeted.
+            auto& index = MutableIndexAs<NOlap::TColumnEngineForLogs>();
+            index.StopMoveData();
+            index.StartMoveData(MoveDataState.TargetGroups);
+        }
+        return;
+    }
+
+    MoveDataState.TargetGroups.clear();
+    for (const auto groupId : record.GetGroups()) {
+        MoveDataState.TargetGroups.emplace(groupId);
+    }
+    if (MoveDataState.TargetGroups.empty()) {
+        LOG_S_INFO("TColumnShard::Handle TEvMoveData: empty group list, vacuum-only at tablet " << TabletID());
+        MoveDataState.Active = true;
+        MoveDataState.VacuumCompleted = false;
+        Counters.GetCSCounters().OnMoveDataStarted();
+        Executor()->StartMoveDataVacuumFromOwner();
+        return;
+    }
+    MoveDataState.Active = true;
+    MoveDataState.VacuumCompleted = false;
+
+    LOG_S_INFO(
+        "TColumnShard::Handle TEvMoveData: starting move for " << MoveDataState.TargetGroups.size() << " groups at tablet " << TabletID());
+
+    Counters.GetCSCounters().OnMoveDataStarted();
+    if (HasIndex()) {
+        MutableIndexAs<NOlap::TColumnEngineForLogs>().StartMoveData(MoveDataState.TargetGroups);
+    }
+    // Start vacuum in parallel with rewriting (F5). TEvMoveDataResponse is gated by
+    // ClassifyMoveDataGate.
+    Executor()->StartMoveDataVacuumFromOwner();
+}
+
+void TColumnShard::MoveDataCompleted(const TActorContext& ctx) {
+    if (!MoveDataState.Active) {
+        return;
+    }
+    MoveDataState.VacuumCompleted = true;
+    CheckMoveDataGate(ctx);
+}
+
+void TColumnShard::CheckMoveDataGate(const TActorContext& ctx) {
+    if (!MoveDataState.Active) {
+        return;
+    }
+
+    NOlap::NActualizer::TMoveDataQueueSizes queues;
+    if (HasIndex()) {
+        queues = GetIndexAs<NOlap::TColumnEngineForLogs>().GetMoveDataQueueSizes();
+    }
+    Counters.GetCSCounters().OnMoveDataQueues(queues.Pending, queues.ConfirmedToMove, queues.InFlight);
+    if (queues.Rejected > MoveDataState.ReportedRejections) {
+        Counters.GetCSCounters().OnMoveDataPortionsRejected(queues.Rejected - MoveDataState.ReportedRejections);
+        MoveDataState.ReportedRejections = queues.Rejected;
+    }
+    // HasBlobsForGroups walks BlobsToKeep, BlobsToDelete, BlobsToDeleteDelayed and the
+    // shared/borrowed registries; as a plain argument it ran on every wakeup even when the
+    // vacuum or the queues already blocked the gate. Short-circuit so the scan is paid for
+    // only once the cheap gates pass - the classifier returns before reading it anyway.
+    const bool cheapGatesPass = MoveDataState.VacuumCompleted && queues.GetTotal() == 0;
+    switch (NOlap::NActualizer::ClassifyMoveDataGate(MoveDataState.VacuumCompleted, queues,
+        cheapGatesPass && GetStoragesManager()->GetDefaultOperator()->HasBlobsForGroups(MoveDataState.TargetGroups))) {
+        case NOlap::NActualizer::EMoveDataGate::BlockedByVacuum:
+            Counters.GetCSCounters().OnMoveDataGateBlockedByVacuum();
+            return;
+        case NOlap::NActualizer::EMoveDataGate::BlockedByPortions:
+            Counters.GetCSCounters().OnMoveDataGateBlockedByPortions();
+            return;
+        case NOlap::NActualizer::EMoveDataGate::BlockedByGC:
+            Counters.GetCSCounters().OnMoveDataGateBlockedByGC();
+            LOG_S_INFO("TColumnShard::MoveDataCompleted: blobs still pending GC, will re-check on next wakeup at tablet " << TabletID());
+            return;
+        case NOlap::NActualizer::EMoveDataGate::Ready:
+            break;
+    }
+    LOG_S_INFO("TColumnShard::MoveData gate passed at tablet " << TabletID());
+
+    if (HasIndex()) {
+        MutableIndexAs<NOlap::TColumnEngineForLogs>().StopMoveData();
+    }
+
+    ctx.Send(MoveDataState.HiveSender, new TEvTablet::TEvMoveDataResponse(TabletID(), NKikimrTabletBase::TEvMoveDataResponse::Success));
+
+    Counters.GetCSCounters().OnMoveDataFinished();
+    MoveDataState = TMoveDataState{};
 }
 
 }   // namespace NKikimr::NColumnShard

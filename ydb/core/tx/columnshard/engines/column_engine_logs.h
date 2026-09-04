@@ -154,6 +154,10 @@ public:
         return GranulesStorage->CollectMetadataRequests();
     }
 
+    std::vector<TCSMetadataRequest> CollectMoveDataMetadataRequests() const {
+        return GranulesStorage->CollectMoveDataMetadataRequests();
+    }
+
     ui64 GetCompactionPriority(const std::set<TInternalPathId>& pathIds, const std::optional<ui64> waitingPriority) const noexcept override;
     std::vector<std::shared_ptr<TColumnEngineChanges>> StartCompaction(
         const std::shared_ptr<NDataLocks::TManager>& dataLocksManager) noexcept override;
@@ -166,10 +170,31 @@ public:
     std::shared_ptr<TCleanupTablesColumnEngineChanges> StartCleanupTables(
         const THashSet<TInternalPathId>& pathsToDrop, const std::shared_ptr<NDataLocks::TManager>& dataLocksManager) noexcept override;
     std::vector<std::shared_ptr<TTTLColumnEngineChanges>> StartTtl(const THashMap<TInternalPathId, TTiering>& pathEviction,
-        const std::shared_ptr<NDataLocks::TManager>& locksManager, const ui64 memoryUsageLimit) noexcept override;
+        const std::shared_ptr<NDataLocks::TManager>& locksManager, const ui64 memoryUsageLimit,
+        const bool moveDataOnly = false) noexcept override;
 
     void ReturnToIndexes(const THashMap<TInternalPathId, THashSet<ui64>>& portions) const {
         return GranulesStorage->ReturnToIndexes(portions);
+    }
+
+    void StartMoveData(const THashSet<ui32>& targetGroups) {
+        for (auto& [pathId, granule] : GranulesStorage->GetTables()) {
+            granule->StartMoveData(targetGroups);
+        }
+    }
+
+    void StopMoveData() {
+        for (auto& [pathId, granule] : GranulesStorage->GetTables()) {
+            granule->StopMoveData();
+        }
+    }
+
+    NActualizer::TMoveDataQueueSizes GetMoveDataQueueSizes() const {
+        NActualizer::TMoveDataQueueSizes result;
+        for (auto& [pathId, granule] : GranulesStorage->GetTables()) {
+            result += granule->GetMoveDataQueueSizes();
+        }
+        return result;
     }
 
     virtual bool ApplyChangesOnTxCreate(std::shared_ptr<TColumnEngineChanges> indexChanges, const TSnapshot& snapshot) noexcept override;
@@ -180,10 +205,8 @@ public:
     void RegisterSchemaVersion(const TSnapshot& snapshot, const ui64 presetId, const TSchemaInitializationData& schema) override;
     void RegisterOldSchemaVersion(const TSnapshot& snapshot, const ui64 presetId, const TSchemaInitializationData& schema) override;
 
-    std::vector<TSelectedPortionInfo> Select(TInternalPathId pathId, TSnapshot snapshot, const TPKRangesFilter& pkRangesFilter,
-        const bool withNonconflicting, const bool withConflicting,
-        const std::optional<THashSet<TInsertWriteId>>& withUncommittedOnlyForTheseWrites, const std::shared_ptr<NLWTrace::TOrbit>& orbit,
-        ui64 txId = 0, ui64 scanId = 0) const override;
+    std::vector<TSelectedPortionInfo> Select(TInternalPathId pathId, const NReader::TReadDescription& readDescription,
+        const std::shared_ptr<NDataLocks::TManager>& dataLocksManager) const override;
 
     bool IsPortionExists(const TInternalPathId pathId, const ui64 portionId) const {
         return !!GranulesStorage->GetPortionOptional(pathId, portionId);
