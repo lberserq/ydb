@@ -85,6 +85,10 @@ public:
         return std::make_pair(Database, PoolId);
     }
 
+    bool HasPoolAccounting() const {
+        return !PoolId.empty() && MemoryPoolPercent > 0;
+    }
+
     bool IsReasonableToStartSpilling() {
         return (PoolMemoryCookie && PoolMemoryCookie->SpillingPercentReached.load())
             || (TotalMemoryCookie && TotalMemoryCookie->SpillingPercentReached.load());
@@ -106,8 +110,11 @@ public:
             << ", Database: " << Database;
 
         if (!PoolId.empty()) {
-            res << ", PoolId: " << PoolId
-                << ", MemoryPoolPercent: " << Sprintf("%.2f", MemoryPoolPercent > 0 ? MemoryPoolPercent : 100);
+            res << ", PoolId: " << PoolId;
+        }
+
+        if (HasPoolAccounting()) {
+            res << ", MemoryPoolPercent: " << Sprintf("%.2f", MemoryPoolPercent);
         }
 
         if (CollectBacktrace) {
