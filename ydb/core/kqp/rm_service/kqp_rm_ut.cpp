@@ -194,8 +194,9 @@ public:
         UNIT_ASSERT_VALUES_EQUAL(t->GetCounter("InFlyTasks")->Val(), infly);
     }
 
-    TIntrusivePtr<NRm::TTxState> MakeTx(ui64 txId, std::shared_ptr<NRm::IKqpResourceManager> rm) {
-        return MakeIntrusive<NRm::TTxState>(rm, txId, TInstant::Now(), "", (double)100, "", false);
+    TIntrusivePtr<NRm::TTxState> MakeTx(ui64 txId, std::shared_ptr<NRm::IKqpResourceManager> rm,
+            const TString& poolId = "", double memoryPoolPercent = 100, const TString& database = "") {
+        return MakeIntrusive<NRm::TTxState>(rm, txId, TInstant::Now(), poolId, memoryPoolPercent, database, false);
     }
 
     void AssertResourceManagerStats(
@@ -283,6 +284,8 @@ public:
         UNIT_TEST(SnapshotSharingByExchanger);
         UNIT_TEST(NodesMembershipByExchanger);
         UNIT_TEST(DisonnectNodes);
+        UNIT_TEST(PoolMemoryNotCreditedOnFree);
+        UNIT_TEST(PoolMemoryNotCreditedOnFailedAlloc);
     UNIT_TEST_SUITE_END();
 
     void SingleTask();
@@ -300,6 +303,8 @@ public:
     void NodesMembership();
     void NodesMembershipByExchanger();
     void DisonnectNodes();
+    void PoolMemoryNotCreditedOnFree();
+    void PoolMemoryNotCreditedOnFailedAlloc();
 
 private:
     THolder<TTestBasicRuntime> Runtime;
@@ -719,6 +724,65 @@ void KqpRm::DisonnectNodes() {
     Runtime->DispatchEvents(TDispatchOptions(), TDuration::Seconds(1));
 
     CheckSnapshot(0, {{1000, 100}}, rm_first);
+}
+
+void KqpRm::PoolMemoryNotCreditedOnFree() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    auto txLimited = MakeTx(1, rm, "pool", 50, "db");
+    auto txDisabled = MakeTx(2, rm, "pool", -1, "db");
+
+    NRm::TKqpResourcesRequest limitedRequest{.ExecutionUnits = 0, .Memory = 300};
+    NRm::TKqpResourcesRequest disabledRequest{.ExecutionUnits = 0, .Memory = 400};
+
+    bool allocated = rm->AllocateResources(*txLimited, 1, limitedRequest);
+    UNIT_ASSERT(allocated);
+    AssertResourceManagerStats(rm, 700, 100);
+
+    allocated = rm->AllocateResources(*txDisabled, 2, disabledRequest);
+    UNIT_ASSERT(allocated);
+    AssertResourceManagerStats(rm, 300, 100);
+
+    rm->FreeResources(*txDisabled, 2, disabledRequest);
+    AssertResourceManagerStats(rm, 700, 100);
+
+    // 50% of the 1000 node limit is 500 and txLimited still holds 300 of it
+    allocated = rm->AllocateResources(*txLimited, 3, limitedRequest);
+    UNIT_ASSERT(!allocated);
+    AssertResourceManagerStats(rm, 700, 100);
+}
+
+void KqpRm::PoolMemoryNotCreditedOnFailedAlloc() {
+    auto config = MakeKqpResourceManagerConfig();
+    config.SetQueryMemoryLimit(200'000);
+
+    StartRms({config, MakeKqpResourceManagerConfig()});
+    NKikimr::TActorSystemStub stub;
+
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    auto txLimited = MakeTx(1, rm, "pool", 10, "db");
+    auto txDisabled = MakeTx(2, rm, "pool", -1, "db");
+
+    bool allocated = rm->AllocateResources(*txLimited, 1,
+        NRm::TKqpResourcesRequest{.ExecutionUnits = 0, .Memory = 15'000});
+    UNIT_ASSERT(allocated);
+    AssertResourceManagerStats(rm, 185'000, 100);
+
+    // the node total has room, but the resource broker queue limit of 50'000 refuses this task
+    allocated = rm->AllocateResources(*txDisabled, 2,
+        NRm::TKqpResourcesRequest{.ExecutionUnits = 0, .Memory = 60'000});
+    UNIT_ASSERT(!allocated);
+    AssertResourceManagerStats(rm, 185'000, 100);
+
+    // the pool limit is 20'000 and txLimited still holds 15'000 of it
+    allocated = rm->AllocateResources(*txLimited, 3,
+        NRm::TKqpResourcesRequest{.ExecutionUnits = 0, .Memory = 10'000});
+    UNIT_ASSERT(!allocated);
+    AssertResourceManagerStats(rm, 185'000, 100);
 }
 
 } // namespace NKqp
