@@ -8,7 +8,6 @@
 #include <ydb/core/scheme/scheme_tablecell.h>
 #include <ydb/core/tx/scheme_board/events.h>
 #include <ydb/core/tx/scheme_board/subscriber.h>
-#include <ydb/core/resource_pools/resource_pool_settings.h>
 #include <ydb/core/cms/console/configs_dispatcher.h>
 #include <ydb/core/cms/console/console.h>
 
@@ -42,7 +41,7 @@ public:
         const NKikimrConfig::TTableServiceConfig::TResourceManager& initialConfig)
         : Cache_(std::move(cache))
         , ResourceManager(rm)
-        , Tx(MakeIntrusive<NRm::TTxState>(ResourceManager, LevelCacheTxId, TInstant::Now(), NKikimr::NResourcePool::DEFAULT_POOL_ID, 100.0, AppData()->TenantName, false))
+        , Tx(MakeIntrusive<NRm::TTxState>(ResourceManager, LevelCacheTxId, TInstant::Now(), "", -1.0, AppData()->TenantName, false))
         , RmConfig(initialConfig)
     {}
 

@@ -103,6 +103,8 @@ public:
     }
 
     void Release(ui64 value) {
+        Y_DEBUG_ABORT_UNLESS(Used >= value);
+
         if (Used > value) {
             Used -= value;
         } else {
@@ -278,7 +280,7 @@ public:
                 tx.TotalMemoryCookie = TotalMemoryResource->GetSpillingCookie();
             }
 
-            if (hasScanQueryMemory && !tx.PoolId.empty() && tx.MemoryPoolPercent > 0) {
+            if (hasScanQueryMemory && tx.HasPoolAccounting()) {
                 auto [it, success] = MemoryNamedPools.emplace(tx.MakePoolId(), nullptr);
 
                 if (success) {
@@ -318,7 +320,7 @@ public:
                 tx.AckFailedMemoryAlloc(resources.Memory);
                 with_lock (Lock) {
                     TotalMemoryResource->Release(resources.Memory);
-                    if (!tx.PoolId.empty()) {
+                    if (tx.HasPoolAccounting()) {
                         auto it = MemoryNamedPools.find(tx.MakePoolId());
                         if (it != MemoryNamedPools.end()) {
                             it->second->Release(resources.Memory);
@@ -387,7 +389,7 @@ public:
         if (resources.Memory > 0) {
             with_lock (Lock) {
                 TotalMemoryResource->Release(resources.Memory);
-                if (!tx.PoolId.empty()) {
+                if (tx.HasPoolAccounting()) {
                     auto it = MemoryNamedPools.find(tx.MakePoolId());
                     if (it != MemoryNamedPools.end()) {
                         it->second->Release(resources.Memory);
@@ -897,6 +899,10 @@ private:
                     str << "ScanQuery memory resource: " << ResourceManager->TotalMemoryResource->ToString() << Endl;
                     str << "External DataQuery memory: " << ResourceManager->ExternalDataQueryMemory.load() << Endl;
                     str << "ExecutionUnits resource: " << ResourceManager->ExecutionUnitsResource.load() << Endl;
+                    for (const auto& [poolKey, poolMemory] : ResourceManager->MemoryNamedPools) {
+                        str << "Pool memory resource " << poolKey.first << '/' << poolKey.second
+                            << ": " << poolMemory->ToString() << Endl;
+                    }
                 }
                 str << "Last resource broker task id: " << ResourceManager->LastResourceBrokerTaskId.load() << Endl;
                 if (WbState.LastPublishTime) {
