@@ -90,7 +90,7 @@ bool LimitCPU(TIntrusivePtr<TUserRequestContext> ctx) {
 }
 
 double GetMemoryPoolPercent(const TIntrusivePtr<TUserRequestContext>& ctx) {
-    return ctx->PoolConfig.has_value() ? ctx->PoolConfig->TotalMemoryLimitPercentPerNode : -1;
+    return ctx->PoolId && ctx->PoolConfig.has_value() ? ctx->PoolConfig->TotalMemoryLimitPercentPerNode : -1;
 }
 
 }

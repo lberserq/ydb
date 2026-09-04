@@ -85,6 +85,7 @@ public:
         return std::make_pair(Database, PoolId);
     }
 
+    // an explicitly configured 0 percent is treated as unlimited here, not reject-all
     bool HasPoolAccounting() const {
         return !PoolId.empty() && MemoryPoolPercent > 0;
     }

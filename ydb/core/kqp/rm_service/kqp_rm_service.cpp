@@ -280,7 +280,6 @@ public:
                 tx.TotalMemoryCookie = TotalMemoryResource->GetSpillingCookie();
             }
 
-            // -1 disables pool accounting; an explicitly configured 0 is treated as unlimited, not reject-all
             if (hasScanQueryMemory && tx.HasPoolAccounting()) {
                 auto [it, success] = MemoryNamedPools.emplace(tx.MakePoolId(), nullptr);
 
