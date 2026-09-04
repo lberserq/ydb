@@ -900,6 +900,10 @@ private:
                     str << "ScanQuery memory resource: " << ResourceManager->TotalMemoryResource->ToString() << Endl;
                     str << "External DataQuery memory: " << ResourceManager->ExternalDataQueryMemory.load() << Endl;
                     str << "ExecutionUnits resource: " << ResourceManager->ExecutionUnitsResource.load() << Endl;
+                    for (const auto& [poolKey, poolMemory] : ResourceManager->MemoryNamedPools) {
+                        str << "Pool memory resource " << poolKey.first << '/' << poolKey.second
+                            << ": " << poolMemory->ToString() << Endl;
+                    }
                 }
                 str << "Last resource broker task id: " << ResourceManager->LastResourceBrokerTaskId.load() << Endl;
                 if (WbState.LastPublishTime) {
