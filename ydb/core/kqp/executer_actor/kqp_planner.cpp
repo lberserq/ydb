@@ -89,6 +89,10 @@ bool LimitCPU(TIntrusivePtr<TUserRequestContext> ctx) {
     return ctx->PoolId && ctx->PoolConfig.has_value() && ctx->PoolConfig->TotalCpuLimitPercentPerNode > 0;
 }
 
+double GetMemoryPoolPercent(const TIntrusivePtr<TUserRequestContext>& ctx) {
+    return ctx->PoolConfig.has_value() ? ctx->PoolConfig->TotalMemoryLimitPercentPerNode : -1;
+}
+
 }
 
 bool TKqpPlanner::UseMockEmptyPlanner = false;
@@ -301,8 +305,9 @@ std::unique_ptr<TEvKqpNode::TEvStartKqpTasksRequest> TKqpPlanner::SerializeReque
     request.SetPoolId(UserRequestContext->PoolId);
     request.SetUseBatchPool(UserRequestContext->UseBatchPool);
 
+    request.SetMemoryPoolPercent(GetMemoryPoolPercent(UserRequestContext));
+
     if (UserRequestContext->PoolConfig.has_value()) {
-        request.SetMemoryPoolPercent(UserRequestContext->PoolConfig->TotalMemoryLimitPercentPerNode);
         request.SetPoolMaxCpuShare(UserRequestContext->PoolConfig->TotalCpuLimitPercentPerNode / 100.0);
     }
 
@@ -540,10 +545,7 @@ TString TKqpPlanner::ExecuteDataComputeTask(ui64 taskId, ui32 computeTasksSize) 
     auto* taskDesc = TasksGraph.ArenaSerializeTaskToProto(task, true);
 
     if (!TxInfo) {
-        double memoryPoolPercent = 100;
-        if (UserRequestContext->PoolConfig.has_value()) {
-            memoryPoolPercent = UserRequestContext->PoolConfig->TotalMemoryLimitPercentPerNode;
-        }
+        const double memoryPoolPercent = GetMemoryPoolPercent(UserRequestContext);
 
         TxInfo = MakeIntrusive<NRm::TTxState>(
             ResourceManager_, TxId, TInstant::Now(), UserRequestContext->PoolId, memoryPoolPercent, Database,

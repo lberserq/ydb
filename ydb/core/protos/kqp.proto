@@ -669,7 +669,7 @@ message TEvStartKqpTasksRequest {
     optional uint64 OutputChunkMaxSize = 7 [default = 0]; // 0 - use some default value
     optional string SerializedGUCSettings = 8;
     optional string PoolId = 9;
-    optional double MemoryPoolPercent = 10 [default = 100];
+    optional double MemoryPoolPercent = 10 [default = -1];
     optional string Database = 11;
     optional string DatabaseId = 17; // used as unique id in case database was removed/added with the same name
     optional uint64 LockTxId = 13;
