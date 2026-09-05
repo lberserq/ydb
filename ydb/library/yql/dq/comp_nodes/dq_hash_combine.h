@@ -20,6 +20,14 @@ struct TDqHashCombineTestState {
     bool QuotaBound = false;      // an operator memory quota was bound when the operator last read the pressure
     i64 LastAvailability = 0;     // the availability it read from that quota
     size_t InputRows = 0;
+    // how the row-sampled pressure refresh actually went: a bound refresh reads the quota, an unbound one
+    // falls back to the allocator heuristics
+    size_t PressureChecks = 0;
+    size_t BoundRefreshes = 0;
+    size_t UnboundRefreshes = 0;
+    size_t LastBoundRow = 0;   // InputRows at the last bound refresh
+    ui64 QuotaPtrFirst = 0;    // the quota pointer the operator saw first and last, to catch it changing
+    ui64 QuotaPtrLast = 0;
 };
 
 using TTestStateCallback = std::function<void(const TDqHashCombineTestState&)>;

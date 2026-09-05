@@ -1347,6 +1347,12 @@ protected:
             .QuotaBound = QuotaWasBound,
             .LastAvailability = LastAvailability,
             .InputRows = InputRows,
+            .PressureChecks = PressureChecks,
+            .BoundRefreshes = BoundRefreshes,
+            .UnboundRefreshes = UnboundRefreshes,
+            .LastBoundRow = LastBoundRow,
+            .QuotaPtrFirst = QuotaPtrFirst,
+            .QuotaPtrLast = QuotaPtrLast,
         });
     }
 
@@ -1357,12 +1363,20 @@ protected:
     void RefreshPressure() {
         if (auto* quota = NYql::NDq::GetDqOperatorMemoryQuota()) {
             const i64 availability = quota->GetMemoryAvailability();
-            QuotaWasBound = true;      // test diagnostics only, see TDqHashCombineTestState
+            // test diagnostics only, see TDqHashCombineTestState
+            QuotaWasBound = true;
+            ++BoundRefreshes;
+            LastBoundRow = InputRows;
+            QuotaPtrLast = reinterpret_cast<ui64>(quota);
+            if (!QuotaPtrFirst) {
+                QuotaPtrFirst = QuotaPtrLast;
+            }
             LastAvailability = availability;
             Pressure.HasMemory = availability > 0 && !SoftPressure;
             Pressure.HardSpillingTime = availability < 0 || TlsAllocState->GetMaximumLimitValueReached();
             PressureRefreshCountdown = PressureRefreshInterval;
         } else {
+            ++UnboundRefreshes; // test diagnostics only
             Pressure.HasMemory = !TlsAllocState->IsMemoryYellowZoneEnabled();
             Pressure.HardSpillingTime = !Pressure.HasMemory || TlsAllocState->GetMaximumLimitValueReached();
         }
@@ -1370,6 +1384,7 @@ protected:
     }
 
     Y_FORCE_INLINE void MaybeRefreshPressure() {
+        ++PressureChecks; // test diagnostics only
         if (PressureRefreshCountdown == 0 || !NYql::NDq::GetDqOperatorMemoryQuota()) {
             RefreshPressure();
         } else {
@@ -1664,6 +1679,12 @@ protected:
     size_t ShrinksRequested = 0;
     bool QuotaWasBound = false; // test diagnostics, reported through TDqHashCombineTestState
     i64 LastAvailability = 0;
+    size_t PressureChecks = 0;
+    size_t BoundRefreshes = 0;
+    size_t UnboundRefreshes = 0;
+    size_t LastBoundRow = 0;
+    ui64 QuotaPtrFirst = 0;
+    ui64 QuotaPtrLast = 0;
 
     size_t InputUnpackedWidth;
     const NDqHashOperatorCommon::TCombinerNodes& Nodes;

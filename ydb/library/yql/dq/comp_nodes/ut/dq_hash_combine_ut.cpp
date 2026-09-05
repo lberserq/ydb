@@ -149,6 +149,12 @@ struct TOperatorEndState
     bool QuotaBound = false;
     i64 LastAvailability = 0;
     size_t InputRows = 0;
+    size_t PressureChecks = 0;
+    size_t BoundRefreshes = 0;
+    size_t UnboundRefreshes = 0;
+    size_t LastBoundRow = 0;
+    ui64 QuotaPtrFirst = 0;
+    ui64 QuotaPtrLast = 0;
 
     // what the operator saw, for a test that expected a spill or a drain and did not get one
     TString DebugString() const {
@@ -159,7 +165,13 @@ struct TOperatorEndState
             << " inputRows=" << InputRows
             << " spills=" << SpillsStarted
             << " drains=" << DrainsStarted
-            << " shrinks=" << ShrinksRequested;
+            << " shrinks=" << ShrinksRequested
+            << " checks=" << PressureChecks
+            << " boundRefreshes=" << BoundRefreshes
+            << " unboundRefreshes=" << UnboundRefreshes
+            << " lastBoundRow=" << LastBoundRow
+            << " quotaPtrFirst=" << QuotaPtrFirst
+            << " quotaPtrLast=" << QuotaPtrLast;
     }
 };
 
@@ -173,6 +185,12 @@ void SetTestEndStateUpdater(THolder<IComputationGraph>& graph, TOperatorEndState
         endState.QuotaBound = endState.QuotaBound || state.QuotaBound;
         endState.LastAvailability = state.LastAvailability;
         endState.InputRows = std::max(endState.InputRows, state.InputRows);
+        endState.PressureChecks = std::max(endState.PressureChecks, state.PressureChecks);
+        endState.BoundRefreshes = std::max(endState.BoundRefreshes, state.BoundRefreshes);
+        endState.UnboundRefreshes = std::max(endState.UnboundRefreshes, state.UnboundRefreshes);
+        endState.LastBoundRow = std::max(endState.LastBoundRow, state.LastBoundRow);
+        endState.QuotaPtrFirst = state.QuotaPtrFirst ? state.QuotaPtrFirst : endState.QuotaPtrFirst;
+        endState.QuotaPtrLast = state.QuotaPtrLast ? state.QuotaPtrLast : endState.QuotaPtrLast;
     });
 }
 
