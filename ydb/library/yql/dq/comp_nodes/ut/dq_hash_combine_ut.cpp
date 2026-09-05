@@ -1337,27 +1337,48 @@ Y_UNIT_TEST_SUITE(TDqHashCombineTest) {
     constexpr size_t SpillTriggerRepeats = 5;
     constexpr size_t SpillTriggerRow = SpillTriggerKeys / 2;
 
+    // What the test side saw around the trigger, to pair with the operator's own view in TOperatorEndState.
+    struct TSpillTriggerState {
+        size_t TriggerRow = 0;
+        size_t ReadsAtTrigger = 0;   // availability polls the operator had made when the trigger fired
+        i64 AvailabilityAfterWrite = 0; // read back through the interface right after writing it
+
+        void Record(const size_t rowNum, const TScriptedMemoryQuota& quota) {
+            TriggerRow = rowNum;
+            AvailabilityAfterWrite = quota.GetMemoryAvailability();
+            ReadsAtTrigger = quota.AvailabilityReads; // after the probe above, so it is not counted as a poll
+        }
+
+        TString DebugString(const TScriptedMemoryQuota& quota) const {
+            return TStringBuilder()
+                << "triggerRow=" << TriggerRow
+                << " readsAtTrigger=" << ReadsAtTrigger
+                << " availabilityAfterWrite=" << AvailabilityAfterWrite
+                << " availabilityAtEnd=" << quota.Availability
+                << " reads=" << quota.AvailabilityReads;
+        }
+    };
+
     Y_UNIT_TEST_QUAD(TestBoundAggregationSpillsOnNegativeAvailability, UseLLVM, UseFlow) {
         TDqSetup<UseLLVM, true> setup(GetDqNodeFactory());
         TScriptedMemoryQuota quota(setup.Alloc);
-        size_t triggerRow = 0;
-        size_t readsAtTrigger = 0;
+        TSpillTriggerState trigger;
         auto endState = RunDqAggregateWideTest(setup, UseFlow, [&](TComputationContext& ctx, std::vector<TType*>& columnTypes, ui32 keyWidth, auto& refMap) {
             return new TWideKVStream(ctx, SpillTriggerKeys, SpillTriggerRepeats, columnTypes, keyWidth, refMap, [&](const size_t rowNum, [[maybe_unused]] bool& yield) {
                 if (rowNum == SpillTriggerRow) {
                     quota.Availability = -1; // the node is over target: the operator must give memory back
-                    triggerRow = rowNum;
-                    readsAtTrigger = quota.AvailabilityReads;
+                    trigger.Record(rowNum, quota);
                 }
             });
         }, 2, false, false, &quota);
         // report which link of trigger -> poll -> spill broke, the spill is not reproducible everywhere
-        UNIT_ASSERT_VALUES_EQUAL_C(triggerRow, SpillTriggerRow, "the input never reached the trigger row");
-        UNIT_ASSERT_GT_C(quota.AvailabilityReads, readsAtTrigger,
-            "the operator did not poll the quota after the trigger: " << endState.DebugString());
-        UNIT_ASSERT_GE_C(endState.SpillsStarted, 1, endState.DebugString());
-        UNIT_ASSERT_GE_C(endState.ShrinksRequested, 1, endState.DebugString());
-        UNIT_ASSERT_GE_C(quota.Shrinks, 1, endState.DebugString());
+        const TString state = TStringBuilder() << endState.DebugString() << " " << trigger.DebugString(quota);
+        UNIT_ASSERT_VALUES_EQUAL_C(trigger.TriggerRow, SpillTriggerRow, "the input never reached the trigger row");
+        UNIT_ASSERT_GT_C(quota.AvailabilityReads, trigger.ReadsAtTrigger,
+            "the operator did not poll the quota after the trigger: " << state);
+        UNIT_ASSERT_GE_C(endState.SpillsStarted, 1, state);
+        UNIT_ASSERT_GE_C(endState.ShrinksRequested, 1, state);
+        UNIT_ASSERT_GE_C(quota.Shrinks, 1, state);
     }
 
     Y_UNIT_TEST_QUAD(TestBoundAggregationRefillsAfterShrink, UseLLVM, UseFlow) {
@@ -1457,14 +1478,12 @@ Y_UNIT_TEST_SUITE(TDqHashCombineTest) {
         TScriptedMemoryQuota quota(setup.Alloc);
         auto preallocated = std::make_shared<TPreallocatedSpillerFactory>(100_MB);
         const ui64 offloadedBefore = setup.Alloc.Ref().GetOffloadedBytes();
-        size_t triggerRow = 0;
-        size_t readsAtTrigger = 0;
+        TSpillTriggerState trigger;
         auto endState = RunDqAggregateWideTest(setup, UseFlow, [&](TComputationContext& ctx, std::vector<TType*>& columnTypes, ui32 keyWidth, auto& refMap) {
             return new TWideKVStream(ctx, SpillTriggerKeys, SpillTriggerRepeats, columnTypes, keyWidth, refMap, [&](const size_t rowNum, [[maybe_unused]] bool& yield) {
                 if (rowNum == SpillTriggerRow) {
                     quota.Availability = -1;
-                    triggerRow = rowNum;
-                    readsAtTrigger = quota.AvailabilityReads;
+                    trigger.Record(rowNum, quota);
                 }
             });
         }, 2, false, false, &quota, std::make_shared<TSlowSpillerFactory>(preallocated));
@@ -1474,12 +1493,13 @@ Y_UNIT_TEST_SUITE(TDqHashCombineTest) {
                 spilledBytes += size;
             }
         }
-        UNIT_ASSERT_VALUES_EQUAL_C(triggerRow, SpillTriggerRow, "the input never reached the trigger row");
-        UNIT_ASSERT_GT_C(quota.AvailabilityReads, readsAtTrigger,
-            "the operator did not poll the quota after the trigger: " << endState.DebugString());
-        UNIT_ASSERT_GT_C(spilledBytes, 0, endState.DebugString());
+        const TString state = TStringBuilder() << endState.DebugString() << " " << trigger.DebugString(quota);
+        UNIT_ASSERT_VALUES_EQUAL_C(trigger.TriggerRow, SpillTriggerRow, "the input never reached the trigger row");
+        UNIT_ASSERT_GT_C(quota.AvailabilityReads, trigger.ReadsAtTrigger,
+            "the operator did not poll the quota after the trigger: " << state);
+        UNIT_ASSERT_GT_C(spilledBytes, 0, state);
         // the packer buffers of the spiller adapters are accounted in the task allocator while the quota is bound
-        UNIT_ASSERT_GT_C(setup.Alloc.Ref().GetOffloadedBytes(), offloadedBefore, endState.DebugString());
+        UNIT_ASSERT_GT_C(setup.Alloc.Ref().GetOffloadedBytes(), offloadedBefore, state);
     }
 
     Y_UNIT_TEST_QUAD(TestBoundTeardownDuringStateSpilling, UseLLVM, UseFlow) {
