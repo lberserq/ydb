@@ -316,17 +316,19 @@ public:
                 auto [it, success] = MemoryNamedPools.emplace(tx.MakePoolId(), nullptr);
 
                 if (success) {
-                    auto regKey = std::make_pair(tx.Database, tx.PoolId);
-                    auto [regIt, regNew] = PoolSensorRegistry.emplace(regKey, TPoolSensors{});
-                    if (regNew && Counters && ActorSystem &&
+                    TPoolSensors* sensors = nullptr;
+                    if (Counters && ActorSystem &&
                             AppData(ActorSystem)->FeatureFlags.GetEnableResourcePoolsCounters()) {
-                        auto sg = Counters->GetWorkloadManagerCounters()
-                            ->GetSubgroup("pool", TStringBuilder() << tx.Database << "/" << tx.PoolId);
-                        regIt->second.Limit = sg->GetCounter("MemoryLimit", false);
-                        regIt->second.Allocated = sg->GetCounter("MemoryAllocated", false);
-                        regIt->second.DeniedRequests = sg->GetCounter("MemoryDeniedRequests", true);
+                        auto& registered = PoolSensorRegistry[std::make_pair(tx.Database, tx.PoolId)];
+                        if (!registered.Limit) {
+                            auto sg = Counters->GetWorkloadManagerCounters()
+                                ->GetSubgroup("pool", TStringBuilder() << tx.Database << "/" << tx.PoolId);
+                            registered.Limit = sg->GetCounter("MemoryLimit", false);
+                            registered.Allocated = sg->GetCounter("MemoryAllocated", false);
+                            registered.DeniedRequests = sg->GetCounter("MemoryDeniedRequests", true);
+                        }
+                        sensors = &registered;
                     }
-                    TPoolSensors* sensors = regIt->second.Limit ? &regIt->second : nullptr;
                     it->second = MakeIntrusive<TMemoryResource>(TotalMemoryResource->GetLimit(), tx.MemoryPoolPercent, SpillingPercent.load(), sensors);
                 } else {
                     it->second->SetNewLimit(TotalMemoryResource->GetLimit(), tx.MemoryPoolPercent, SpillingPercent.load());
