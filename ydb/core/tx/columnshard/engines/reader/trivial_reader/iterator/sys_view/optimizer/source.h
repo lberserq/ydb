@@ -32,7 +32,8 @@ public:
         , OptimizerTasks(std::move(tasks))
         , ExternalPathId(externalPathId)
     {
-        if (context->GetReadMetadata()->IsSorted() && HasAppData() && AppDataVerified().FeatureFlags.GetEnableSysViewOrderByLimitPushdown()) {
+        if (context->GetReadMetadata()->IsSorted() && context->GetReadMetadata()->HasLimit() &&
+            context->GetReadMetadata()->OrderByLimitAllowed()) {
             std::sort(OptimizerTasks.begin(), OptimizerTasks.end());
         }
     }
