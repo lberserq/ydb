@@ -983,9 +983,16 @@ private:
             struct TPoolRow { TString Database; TString Pool; ui64 Limit; ui64 Used; ui64 DeniedRequests; };
             TVector<TPoolRow> poolSnapshot;
             with_lock (ResourceManager->Lock) {
-                poolSnapshot.reserve(ResourceManager->MemoryNamedPools.size());
+                poolSnapshot.reserve(ResourceManager->MemoryNamedPools.size() + ResourceManager->PoolSensorRegistry.size());
                 for (const auto& [key, pool] : ResourceManager->MemoryNamedPools) {
                     poolSnapshot.push_back({key.first, key.second, pool->GetLimit(), pool->GetUsed(), pool->GetDeniedRequests()});
+                }
+                for (const auto& [key, sensors] : ResourceManager->PoolSensorRegistry) {
+                    if (ResourceManager->MemoryNamedPools.contains(key)) {
+                        continue;
+                    }
+                    poolSnapshot.push_back({key.first, key.second, static_cast<ui64>(sensors.Limit->Val()),
+                        static_cast<ui64>(sensors.Allocated->Val()), static_cast<ui64>(sensors.DeniedRequests->Val())});
                 }
             }
             if (!poolSnapshot.empty()) {

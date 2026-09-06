@@ -9,6 +9,7 @@
 #include <ydb/core/kqp/node_service/kqp_query_control_plane.h>
 
 #include <ydb/library/actors/core/interconnect.h>
+#include <ydb/library/actors/core/mon.h>
 #include <ydb/library/actors/interconnect/interconnect_impl.h>
 
 #include <library/cpp/testing/unittest/registar.h>
@@ -96,6 +97,24 @@ TResourceBrokerConfig MakeResourceBrokerTestConfig() {
 
     return config;
 }
+
+struct TMockMonRequest : public NMonitoring::IMonHttpRequest {
+    IOutputStream& Output() override { Y_ABORT("Not implemented"); }
+    HTTP_METHOD GetMethod() const override { Y_ABORT("Not implemented"); }
+    TStringBuf GetPath() const override { Y_ABORT("Not implemented"); }
+    TStringBuf GetPathInfo() const override { Y_ABORT("Not implemented"); }
+    TStringBuf GetUri() const override { Y_ABORT("Not implemented"); }
+    const TCgiParameters& GetParams() const override { Y_ABORT("Not implemented"); }
+    const TCgiParameters& GetPostParams() const override { Y_ABORT("Not implemented"); }
+    TStringBuf GetPostContent() const override { Y_ABORT("Not implemented"); }
+    const THttpHeaders& GetHeaders() const override { Y_ABORT("Not implemented"); }
+    TStringBuf GetHeader(TStringBuf) const override { Y_ABORT("Not implemented"); }
+    TStringBuf GetCookie(TStringBuf) const override { Y_ABORT("Not implemented"); }
+    TString GetRemoteAddr() const override { Y_ABORT("Not implemented"); }
+    TString GetServiceTitle() const override { Y_ABORT("Not implemented"); }
+    NMonitoring::IMonPage* GetPage() const override { Y_ABORT("Not implemented"); }
+    NMonitoring::IMonHttpRequest* MakeChild(NMonitoring::IMonPage*, const TString&) const override { Y_ABORT("Not implemented"); }
+};
 
 NKikimrConfig::TTableServiceConfig::TResourceManager MakeKqpResourceManagerConfig() {
     NKikimrConfig::TTableServiceConfig::TResourceManager config;
@@ -216,6 +235,17 @@ public:
         return wm ? wm->FindSubgroup("pool", database + "/" + poolId) : nullptr;
     }
 
+    TString RenderRmMonPage() {
+        TMockMonRequest request;
+        auto edge = Runtime->AllocateEdgeActor();
+        Runtime->Send(new IEventHandle(ResourceManagers.front(), edge, new NMon::TEvHttpInfo(request)), 0, true);
+
+        TAutoPtr<IEventHandle> handle;
+        auto* response = Runtime->GrabEdgeEvent<NMon::TEvHttpInfoRes>(handle);
+        UNIT_ASSERT(response);
+        return response->Answer;
+    }
+
     void SetPoolsCountersFlag(bool value) {
         for (ui32 nodeIndex = 0; nodeIndex < Runtime->GetNodeCount(); ++nodeIndex) {
             Runtime->GetAppData(nodeIndex).FeatureFlags.SetEnableResourcePoolsCounters(value);
@@ -311,6 +341,7 @@ public:
         UNIT_TEST(P11PoolDenied);
         UNIT_TEST(P14PoolSensorsPersistAcrossIdle);
         UNIT_TEST(P15PoolSensorsAppearAfterFlagEnabled);
+        UNIT_TEST(P16MonPageListsIdlePool);
     UNIT_TEST_SUITE_END();
 
     void SingleTask();
@@ -332,6 +363,7 @@ public:
     void P11PoolDenied();
     void P14PoolSensorsPersistAcrossIdle();
     void P15PoolSensorsAppearAfterFlagEnabled();
+    void P16MonPageListsIdlePool();
 
 private:
     THolder<TTestBasicRuntime> Runtime;
@@ -877,6 +909,33 @@ void KqpRm::P15PoolSensorsAppearAfterFlagEnabled() {
         UNIT_ASSERT_VALUES_EQUAL(sensorGroup->GetCounter("MemoryLimit", false)->Val(), 100);
         UNIT_ASSERT_VALUES_EQUAL(sensorGroup->GetCounter("MemoryAllocated", false)->Val(), (i64)chunk);
     }
+}
+
+void KqpRm::P16MonPageListsIdlePool() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    // Pool = 10% of 1000 = 100; chunk = 40
+    constexpr double poolPercent = 10;
+    constexpr ui64 chunk = 40;
+    NRm::TKqpResourcesRequest req{.Memory = chunk};
+
+    {
+        auto tx = MakePoolTx(1, rm, "pool_idle", poolPercent);
+        UNIT_ASSERT(rm->AllocateResources(*tx, 1, req));
+        rm->FreeResources(*tx, 1, req); // pool record erased (used==0)
+    }
+
+    auto liveTx = MakePoolTx(2, rm, "pool_live", poolPercent);
+    UNIT_ASSERT(rm->AllocateResources(*liveTx, 1, req));
+
+    const TString page = RenderRmMonPage();
+    UNIT_ASSERT_STRING_CONTAINS(page, "<td>db1</td><td>pool_idle</td><td>100</td><td>0</td><td>0</td>");
+    UNIT_ASSERT_STRING_CONTAINS(page, "<td>db1</td><td>pool_live</td><td>100</td><td>40</td><td>0</td>");
+
+    const size_t live = page.find("<td>pool_live</td>");
+    UNIT_ASSERT_VALUES_EQUAL(page.find("<td>pool_live</td>", live + 1), TString::npos);
 }
 
 } // namespace NKqp
