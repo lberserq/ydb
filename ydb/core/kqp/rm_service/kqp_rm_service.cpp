@@ -12,7 +12,8 @@
 #include <ydb/core/mon/mon.h>
 #include <ydb/core/node_whiteboard/node_whiteboard.h>
 #include <ydb/core/tablet/resource_broker.h>
-
+#include <ydb/core/base/memory_controller_iface.h>
+#include <yql/essentials/minikql/aligned_page_pool.h>
 
 #include <ydb/library/actors/core/actor_bootstrapped.h>
 #include <ydb/library/actors/core/actor.h>
@@ -61,9 +62,16 @@ ui64 Percentage(ui64 limit, double percent) {
     return static_cast<double>(limit) / 100 * percent + MYEPS;
 }
 
+struct TPoolSensors {
+    NMonitoring::TDynamicCounters::TCounterPtr Limit;
+    NMonitoring::TDynamicCounters::TCounterPtr Allocated;
+    NMonitoring::TDynamicCounters::TCounterPtr DeniedRequests;
+};
+
 class TMemoryResource : public TAtomicRefCount<TMemoryResource> {
 public:
-    explicit TMemoryResource(ui64 baseLimit, double memoryPoolPercent, double overPercent)
+    explicit TMemoryResource(ui64 baseLimit, double memoryPoolPercent, double overPercent,
+                             const NMonitoring::TDynamicCounterPtr& sensorGroup = nullptr)
         : BaseLimit(baseLimit)
         , Used(0)
         , MemoryPoolPercent(memoryPoolPercent)
@@ -71,10 +79,29 @@ public:
         , SpillingCookie(MakeIntrusive<TMemoryResourceCookie>())
     {
         SetActualLimits();
+        if (sensorGroup) {
+            Sensors = std::make_unique<TPoolSensors>();
+            Sensors->Limit = sensorGroup->GetCounter("MemoryLimit", false);
+            Sensors->Allocated = sensorGroup->GetCounter("MemoryAllocated", false);
+            Sensors->DeniedRequests = sensorGroup->GetCounter("MemoryDeniedRequests", true);
+            Sensors->Limit->Set(Limit);
+        }
+    }
+
+    ~TMemoryResource() {
+        if (Sensors) {
+            Sensors->Limit->Set(0);
+            Sensors->Allocated->Set(0);
+        }
     }
 
     ui64 Available() const {
         return Limit > Used ? Limit - Used : 0;
+    }
+
+    // bytes left before the spilling threshold, negative when the threshold is exceeded
+    i64 GetMemoryAvailability() const {
+        return static_cast<i64>(Limit) - static_cast<i64>(Used) - static_cast<i64>(OverLimit);
     }
 
     bool Has(ui64 amount) const {
@@ -85,6 +112,7 @@ public:
         if (Available() >= value) {
             Used += value;
             UpdateCookie();
+            if (Sensors) Sensors->Allocated->Set(Used);
             return true;
         }
         return false;
@@ -95,7 +123,7 @@ public:
     }
 
     void UpdateCookie() {
-        SpillingCookie->SpillingPercentReached.store(Available() < OverLimit);
+        SpillingCookie->MemoryAvailability.store(GetMemoryAvailability());
     }
 
     ui64 GetUsed() const {
@@ -110,6 +138,7 @@ public:
         }
 
         UpdateCookie();
+        if (Sensors) Sensors->Allocated->Set(Used);
     }
 
     void SetNewLimit(ui64 baseLimit, double memoryPoolPercent, double overPercent) {
@@ -125,10 +154,20 @@ public:
     void SetActualLimits() {
         Limit = Percentage(BaseLimit, MemoryPoolPercent);
         OverLimit = OverPercentage(Limit, OverPercent);
+        UpdateCookie();
+        if (Sensors) Sensors->Limit->Set(Limit);
     }
 
     ui64 GetLimit() const {
         return Limit;
+    }
+
+    // pool-limit acquire refusal; a higher layer may still serve the caller from already-granted quota;
+    // node-total exhaustion and RB refusals do NOT bump this (different causes)
+    void RecordDeniedRequest() {
+        if (Sensors) {
+            Sensors->DeniedRequests->Inc();
+        }
     }
 
     TString ToString() const {
@@ -144,6 +183,7 @@ private:
     double OverPercent;
 
     TIntrusivePtr<TMemoryResourceCookie> SpillingCookie;
+    std::unique_ptr<TPoolSensors> Sensors;
 };
 
 struct TEvPrivate {
@@ -152,6 +192,7 @@ struct TEvPrivate {
         EvSchedulePublishResources,
         EvTakeResourcesSnapshot,
         EvWarmupDeadline,
+        EvCheckMcStaleness,
     };
 
     struct TEvPublishResources : public TEventLocal<TEvPublishResources, EEv::EvPublishResources> {
@@ -161,6 +202,9 @@ struct TEvPrivate {
     };
 
     struct TEvWarmupDeadline : public TEventLocal<TEvWarmupDeadline, EEv::EvWarmupDeadline> {
+    };
+
+    struct TEvCheckMcStaleness : public TEventLocal<TEvCheckMcStaleness, EEv::EvCheckMcStaleness> {
     };
 };
 
@@ -282,7 +326,12 @@ public:
                 auto [it, success] = MemoryNamedPools.emplace(tx.MakePoolId(), nullptr);
 
                 if (success) {
-                    it->second = MakeIntrusive<TMemoryResource>(TotalMemoryResource->GetLimit(), tx.MemoryPoolPercent, SpillingPercent.load());
+                    NMonitoring::TDynamicCounterPtr sensorGroup;
+                    if (Counters) {
+                        sensorGroup = Counters->GetWorkloadManagerCounters()
+                            ->GetSubgroup("pool", TStringBuilder() << tx.Database << "/" << tx.PoolId);
+                    }
+                    it->second = MakeIntrusive<TMemoryResource>(TotalMemoryResource->GetLimit(), tx.MemoryPoolPercent, SpillingPercent.load(), sensorGroup);
                 } else {
                     it->second->SetNewLimit(TotalMemoryResource->GetLimit(), tx.MemoryPoolPercent, SpillingPercent.load());
                 }
@@ -291,9 +340,15 @@ public:
                 if (!poolMemory->AcquireIfAvailable(resources.Memory)) {
                     hasScanQueryMemory = false;
                     TotalMemoryResource->Release(resources.Memory);
+                    poolMemory->RecordDeniedRequest();
+                    // erase a just-emplaced pool that got no bytes to avoid a permanent zero-row
+                    if (success) {
+                        MemoryNamedPools.erase(it);
+                    }
                 }
 
-                if (!tx.PoolMemoryCookie) {
+                if (!tx.PoolMemoryCookie && hasScanQueryMemory) {
+                    // group kept in registry so derivative DeniedRequests survives pool churn
                     tx.PoolMemoryCookie = poolMemory->GetSpillingCookie();
                 }
             }
@@ -598,6 +653,9 @@ public:
     TActorId ResourceInfoExchanger = TActorId();
 
     absl::flat_hash_map<std::pair<TString, TString>, TIntrusivePtr<TMemoryResource>, THash<std::pair<TString, TString>>> MemoryNamedPools;
+
+    // Set/read only from RM actor thread (HandleWork(TEvConsumerRegistered) and PublishResourceUsage)
+    TIntrusivePtr<NMemory::IMemoryConsumer> MemoryConsumer;
 };
 
 struct TResourceManagers {
@@ -614,6 +672,9 @@ TResourceManagers ResourceManagers;
 
 class TKqpResourceManagerActor : public TActorBootstrapped<TKqpResourceManagerActor> {
     using TBase = TActorBootstrapped<TKqpResourceManagerActor>;
+
+    static constexpr TDuration McStalenessCheckPeriod = TDuration::Seconds(1);
+    static constexpr TDuration McLimitStalenessTimeout = TDuration::Seconds(10);
 
 public:
     static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
@@ -667,6 +728,12 @@ public:
         ToBroker(new TEvResourceBroker::TEvResourceBrokerRequest);
         ToBroker(new TEvResourceBroker::TEvConfigRequest(NLocalDb::KqpResourceManagerQueue, /*subscribe=*/ true));
 
+        EnableMemoryControllerBudget = Config.GetEnableMemoryControllerBudget(); // read-once
+        if (EnableMemoryControllerBudget) {
+            Send(NMemory::MakeMemoryControllerId(),
+                 new NMemory::TEvConsumerRegister(NMemory::EMemoryConsumerKind::QueryExecution));
+        }
+
         if (auto* mon = AppData()->Mon) {
             NMonitoring::TIndexMonPage* actorsMonPage = mon->RegisterIndexPage("actors", "Actors");
             mon->RegisterActorPage(actorsMonPage, "kqp_resource_manager", "KQP Resource Manager", false,
@@ -682,6 +749,16 @@ public:
         }
 
         Become(&TKqpResourceManagerActor::WorkState);
+
+        // KQP/RM/MemoryLimitSourceIsMemoryController (0=RB, 1=MC) and KQP/RM/MemoryLimitBytes sensors
+        if (auto c = ResourceManager->GetCounters()) {
+            auto rmGroup = c->GetKqpCounters()->GetSubgroup("subsystem", "RM");
+            SensorMemoryLimitSourceIsMemoryController = rmGroup->GetCounter("MemoryLimitSourceIsMemoryController", false);
+            SensorMemoryLimitBytes = rmGroup->GetCounter("MemoryLimitBytes", false);
+            SensorMemoryLimitSourceIsMemoryController->Set(0); // 0 = RB-driven
+            // initialize to the current (RB-config) limit rather than 0
+            SensorMemoryLimitBytes->Set(Config.GetQueryMemoryLimit());
+        }
 
         AskSelfNodeInfo();
         SendWhiteboardRequest();
@@ -734,6 +811,9 @@ private:
             hFunc(TEvents::TEvUndelivered, HandleWork);
             hFunc(TEvents::TEvPoison, HandleWork);
             hFunc(NMon::TEvHttpInfo, HandleWork);
+            hFunc(NMemory::TEvConsumerRegistered, HandleWork);
+            hFunc(NMemory::TEvConsumerLimit, HandleWork);
+            hFunc(TEvPrivate::TEvCheckMcStaleness, HandleWork);
             default: {
                 Y_ABORT("Unexpected event 0x%x at TKqpResourceManagerActor::WorkState", ev->GetTypeRewrite());
             }
@@ -761,7 +841,26 @@ private:
         PublishResourceUsage("kqp_proxy");
     }
 
+    // Arm the MC staleness watchdog; idempotent against duplicate calls
+    void ArmWatchdog() {
+        if (!WatchdogArmed) {
+            WatchdogArmed = true;
+            Schedule(McStalenessCheckPeriod, new TEvPrivate::TEvCheckMcStaleness);
+        }
+    }
+
     void HandleWork(TEvResourceBroker::TEvConfigResponse::TPtr& ev) {
+        // Cache RB limit for staleness revert, even if MC-driven (revert needs the last known RB value)
+        if (ev->Get()->QueueConfig) {
+            ui64 rbLimit = ev->Get()->QueueConfig->GetLimit().GetMemory();
+            if (rbLimit > 0) {
+                LastRbLimitBytes = rbLimit;
+            }
+        }
+        if (McLimitActive) {
+            YDB_LOG_INFO("ResourceBroker config received while MC-driven; caching for revert, not applying");
+            return;
+        }
         if (!ev->Get()->QueueConfig) {
             YDB_LOG_ERROR("Resource broker queue is not configured",
                 {"queueName", NLocalDb::KqpResourceManagerQueue});
@@ -773,9 +872,99 @@ private:
             with_lock (ResourceManager->Lock) {
                 ResourceManager->TotalMemoryResource->SetNewLimit(queueConfig.GetLimit().GetMemory(), (double)100, ResourceManager->SpillingPercent.load());
             }
+            // F6: update sensor on every RB path transition (not MC-driven)
+            if (SensorMemoryLimitBytes) {
+                SensorMemoryLimitBytes->Set(queueConfig.GetLimit().GetMemory());
+                SensorMemoryLimitSourceIsMemoryController->Set(0);
+            }
             YDB_LOG_INFO("Total node memory for scan bytes",
                 {"queries", queueConfig.GetLimit().GetMemory()});
         }
+    }
+
+    void HandleWork(NMemory::TEvConsumerRegistered::TPtr& ev) {
+        ResourceManager->MemoryConsumer = std::move(ev->Get()->Consumer);
+        YDB_LOG_INFO("KQP RM registered as QueryExecution MC consumer");
+        // Start staleness watchdog once per actor lifetime; TEvConsumerLimit re-arms after a revert
+        ArmWatchdog();
+    }
+
+    void HandleWork(NMemory::TEvConsumerLimit::TPtr& ev) {
+        if (!EnableMemoryControllerBudget) {
+            YDB_LOG_WARN("TEvConsumerLimit received but EnableMemoryControllerBudget=false, ignoring");
+            return;
+        }
+        // MC is always a local service registered at MakeMemoryControllerId(); its SelfId() IS that service ID
+        if (ev->Sender != NMemory::MakeMemoryControllerId()) {
+            YDB_LOG_WARN("TEvConsumerLimit from unexpected sender, ignoring",
+                {"sender", ev->Sender},
+                {"expected", NMemory::MakeMemoryControllerId()});
+            return;
+        }
+        ui64 limitBytes = ev->Get()->LimitBytes;
+        if (limitBytes == 0) {
+            // MC upstream has CanZeroLimit=false for QE; zero signals a bug upstream, not a valid budget
+            YDB_LOG_WARN("TEvConsumerLimit with zero limit, ignoring");
+            return;
+        }
+        // Defensive floor: Bootstrap snapshot so runtime flag-off is not a kill switch
+        limitBytes = Max(limitBytes, (ui64)Config.GetMkqlHeavyProgramMemoryLimit());
+
+        McLimitActive = true;
+        LastMcLimitAt = TActivationContext::Now();
+
+        // Re-arm watchdog on return to MC-driven mode (after a staleness revert it is disarmed)
+        ArmWatchdog();
+
+        if (limitBytes != LastMcLimitBytes) { // log only on value change
+            YDB_LOG_INFO("MC-driven query memory limit applied",
+                {"limitBytes", limitBytes});
+            LastMcLimitBytes = limitBytes;
+        }
+        if (SensorMemoryLimitBytes) {
+            SensorMemoryLimitBytes->Set(limitBytes); // always update sensor on every limit event
+            SensorMemoryLimitSourceIsMemoryController->Set(1);
+        }
+
+        // Report fresh consumption on every MC tick (~1s) so MC sees up-to-date QE usage
+        if (ResourceManager->MemoryConsumer) {
+            ResourceManager->MemoryConsumer->SetConsumption(TAlignedPagePool::GetGlobalPagePoolSize());
+        }
+
+        with_lock (ResourceManager->Lock) {
+            ResourceManager->TotalMemoryResource->SetNewLimit(
+                limitBytes, (double)100, ResourceManager->SpillingPercent.load());
+        }
+    }
+
+    void HandleWork(TEvPrivate::TEvCheckMcStaleness::TPtr&) {
+        WatchdogArmed = false; // this event consumed; re-arm only if continuing
+        if (!McLimitActive) {
+            // Not yet MC-driven or already reverted; watchdog stays disarmed until TEvConsumerLimit re-arms it
+            return;
+        }
+        auto now = TActivationContext::Now();
+        if (now - LastMcLimitAt > McLimitStalenessTimeout) {
+            YDB_LOG_WARN("No TEvConsumerLimit for ~10s, reverting to ResourceBroker-driven limit");
+            McLimitActive = false;
+            if (LastRbLimitBytes > 0) {
+                with_lock (ResourceManager->Lock) {
+                    ResourceManager->TotalMemoryResource->SetNewLimit(
+                        LastRbLimitBytes, (double)100, ResourceManager->SpillingPercent.load());
+                }
+                if (SensorMemoryLimitBytes) {
+                    SensorMemoryLimitBytes->Set(LastRbLimitBytes);
+                }
+            } else {
+                // Flag-on from boot, RB was silent: re-request so we get a cached limit
+                ToBroker(new TEvResourceBroker::TEvConfigRequest(NLocalDb::KqpResourceManagerQueue, /*subscribe=*/ false));
+            }
+            if (SensorMemoryLimitSourceIsMemoryController) {
+                SensorMemoryLimitSourceIsMemoryController->Set(0);
+            }
+            return; // watchdog stays disarmed; TEvConsumerLimit will re-arm it
+        }
+        ArmWatchdog();
     }
 
     void HandleWork(TEvResourceBroker::TEvResourceBrokerResponse::TPtr& ev) {
@@ -898,6 +1087,11 @@ private:
                     str << "External DataQuery memory: " << ResourceManager->ExternalDataQueryMemory.load() << Endl;
                     str << "ExecutionUnits resource: " << ResourceManager->ExecutionUnitsResource.load() << Endl;
                 }
+                str << "Memory limit source: " << (McLimitActive ? "MemoryController" : "ResourceBroker");
+                if (McLimitActive) {
+                    str << ", last MC limit at " << LastMcLimitAt;
+                }
+                str << Endl;
                 str << "Last resource broker task id: " << ResourceManager->LastResourceBrokerTaskId.load() << Endl;
                 if (WbState.LastPublishTime) {
                     str << "Last publish time: " << *WbState.LastPublishTime << Endl;
@@ -990,6 +1184,10 @@ private:
         // saying resource manager that we are ready for the next publishing.
         ResourceManager->PublishScheduled.clear();
 
+        if (ResourceManager->MemoryConsumer) {
+            ResourceManager->MemoryConsumer->SetConsumption(TAlignedPagePool::GetGlobalPagePoolSize());
+        }
+
         NKikimrKqp::TKqpNodeResources payload;
         payload.SetNodeId(SelfId().NodeId());
         payload.SetTimestamp(now.Seconds());
@@ -1067,6 +1265,15 @@ private:
 
     bool WarmupInProgress = false;
     TDuration WarmupDeadline;
+
+    bool EnableMemoryControllerBudget = false;
+    bool McLimitActive = false;       // true while MC-driven; false on revert or before first limit
+    bool WatchdogArmed = false;       // true while a pending TEvCheckMcStaleness is in flight
+    TInstant LastMcLimitAt;
+    ui64 LastMcLimitBytes = 0;        // last limit received from MC (log dedup)
+    ui64 LastRbLimitBytes = 0;        // last limit received from RB (for staleness revert)
+    NMonitoring::TDynamicCounters::TCounterPtr SensorMemoryLimitSourceIsMemoryController;
+    NMonitoring::TDynamicCounters::TCounterPtr SensorMemoryLimitBytes;
 };
 
 } // namespace NRm

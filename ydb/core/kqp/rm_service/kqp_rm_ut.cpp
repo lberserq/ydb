@@ -1,5 +1,6 @@
 #include <ydb/core/kqp/rm_service/kqp_rm_service.h>
 #include <ydb/core/tablet/resource_broker_impl.h>
+#include <ydb/core/base/memory_controller_iface.h>
 
 #include <ydb/core/testlib/actor_helpers.h>
 #include <ydb/core/testlib/tablet_helpers.h>
@@ -12,6 +13,7 @@
 
 #include <library/cpp/testing/unittest/registar.h>
 #include <library/cpp/threading/local_executor/local_executor.h>
+#include <util/generic/size_literals.h>
 
 #ifndef NDEBUG
 const bool DETAILED_LOG = false;
@@ -111,6 +113,13 @@ NKikimrConfig::TTableServiceConfig::TResourceManager MakeKqpResourceManagerConfi
     return config;
 }
 
+NKikimrConfig::TTableServiceConfig::TResourceManager MakeKqpResourceManagerConfigWithMC() {
+    auto config = MakeKqpResourceManagerConfig();
+    config.SetEnableMemoryControllerBudget(true);
+    config.SetMkqlHeavyProgramMemoryLimit(1); // floor=1 so test limits are not raised
+    return config;
+}
+
 }
 
 class KqpRm : public TTestBase {
@@ -197,6 +206,10 @@ public:
         return MakeIntrusive<NRm::TTxState>(rm, txId, TInstant::Now(), "", (double)100, "", false);
     }
 
+    TIntrusivePtr<NRm::TTxState> MakePoolTx(ui64 txId, std::shared_ptr<NRm::IKqpResourceManager> rm, double memoryPoolPercent) {
+        return MakeIntrusive<NRm::TTxState>(rm, txId, TInstant::Now(), "pool", memoryPoolPercent, "db", false);
+    }
+
     void AssertResourceManagerStats(
             std::shared_ptr<NRm::IKqpResourceManager> rm, ui64 scanQueryMemory, ui32 executionUnits) {
         Y_UNUSED(executionUnits);
@@ -279,9 +292,25 @@ public:
         UNIT_TEST(Reduce);
         UNIT_TEST(ConcurrentTasks);
         UNIT_TEST(ConcurrentChannels);
+        UNIT_TEST(MemoryAvailability);
+        UNIT_TEST(PoolMemoryAvailability);
+        UNIT_TEST(TaskQuotaManagerOptional);
         UNIT_TEST(SnapshotSharingByExchanger);
         UNIT_TEST(NodesMembershipByExchanger);
         UNIT_TEST(DisonnectNodes);
+        UNIT_TEST(MemoryControllerBudget_Registers);
+        UNIT_TEST(MemoryControllerBudget_FlagOff);
+        UNIT_TEST(MemoryControllerBudget_DynamicLimit);
+        UNIT_TEST(MemoryControllerBudget_RbConfigLogOnly);
+        UNIT_TEST(MemoryControllerBudget_RbConfigIgnoredEvenWhenValuesAgree);
+        UNIT_TEST(MemoryControllerBudget_StalenessRevert);
+        UNIT_TEST(MemoryControllerBudget_RecoveryAfterRevert);
+        UNIT_TEST(PoolSensors_LimitAndAllocatedTrackAllocation);
+        UNIT_TEST(PoolSensors_DeniedRequestsCountRefusals);
+        UNIT_TEST(PoolSensors_GaugesZeroedOnPoolErase);
+        UNIT_TEST(OptionalQuota_YellowZoneDeniedThenGrantedAfterRecovery);
+        UNIT_TEST(OptionalQuota_PoolHeadroomDenies);
+        UNIT_TEST(MemoryControllerBudget_LimitShrinkDeniesRegrowGrants);
     UNIT_TEST_SUITE_END();
 
     void SingleTask();
@@ -294,11 +323,33 @@ public:
     void Reduce();
     void ConcurrentTasks();
     void ConcurrentChannels();
+    void MemoryAvailability();
+    void PoolMemoryAvailability();
+    void TaskQuotaManagerOptional();
     void SnapshotSharing();
     void SnapshotSharingByExchanger();
     void NodesMembership();
     void NodesMembershipByExchanger();
     void DisonnectNodes();
+    void MemoryControllerBudget_Registers();
+    void MemoryControllerBudget_FlagOff();
+    void MemoryControllerBudget_DynamicLimit();
+    void MemoryControllerBudget_RbConfigLogOnly();
+    void MemoryControllerBudget_RbConfigIgnoredEvenWhenValuesAgree();
+    void MemoryControllerBudget_StalenessRevert();
+    void MemoryControllerBudget_RecoveryAfterRevert();
+    void PoolSensors_LimitAndAllocatedTrackAllocation();
+    void PoolSensors_DeniedRequestsCountRefusals();
+    void PoolSensors_GaugesZeroedOnPoolErase();
+    void OptionalQuota_YellowZoneDeniedThenGrantedAfterRecovery();
+    void OptionalQuota_PoolHeadroomDenies();
+    void MemoryControllerBudget_LimitShrinkDeniesRegrowGrants();
+
+    NMonitoring::TDynamicCounterPtr GetPoolSensorGroup(const TString& db, const TString& pool) {
+        auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+        return rm->GetCounters()->GetWorkloadManagerCounters()
+            ->GetSubgroup("pool", TStringBuilder() << db << "/" << pool);
+    }
 
 private:
     THolder<TTestBasicRuntime> Runtime;
@@ -547,7 +598,7 @@ void KqpRm::ConcurrentChannels() {
                 auto count = 0u;
                 for (auto n = 0u; n < 20u; n++) {
                     for (auto j = 0u; j < 20u; j++) {
-                        if (!qm->AllocateQuota(j * 10u)) {
+                        if (!qm->AllocateQuota(j * 10u, /* isOptional = */ false)) {
                             failedAllocations++;
                             Sleep(TDuration::MilliSeconds(j * 10));
                             break;
@@ -567,16 +618,22 @@ void KqpRm::ConcurrentChannels() {
 
             UNIT_ASSERT_GT(failedAllocations.load(), 0);
 
-            // the channel quota manager exposes the node level memory pressure signal of its tx,
-            // DQ channels 2.0 propagate it to the senders as back pressure. The load above drives
-            // allocations to failure, so the cookie may well be set already - toggle it explicitly.
+            // the channel quota manager exposes the node level memory availability of its tx,
+            // DQ channels 2.0 propagate a negative value to the senders as back pressure. The load above
+            // drives allocations to failure, so the cookie may well be negative already - set it explicitly.
             UNIT_ASSERT(tx->TotalMemoryCookie);
-            const bool reached = tx->TotalMemoryCookie->SpillingPercentReached.load();
-            tx->TotalMemoryCookie->SpillingPercentReached.store(true);
-            UNIT_ASSERT(qm->IsReasonableToUseSpilling());
-            tx->TotalMemoryCookie->SpillingPercentReached.store(false);
-            UNIT_ASSERT_VALUES_EQUAL(qm->IsReasonableToUseSpilling(), tx->IsReasonableToStartSpilling());
-            tx->TotalMemoryCookie->SpillingPercentReached.store(reached);
+            const i64 saved = tx->TotalMemoryCookie->MemoryAvailability.load();
+            tx->TotalMemoryCookie->MemoryAvailability.store(0);
+            const i64 base = qm->GetMemoryAvailability(); // the locally prepaid channel quota
+            tx->TotalMemoryCookie->MemoryAvailability.store(500);
+            UNIT_ASSERT_VALUES_EQUAL(qm->GetMemoryAvailability(), base + 500);
+            UNIT_ASSERT(!tx->IsReasonableToStartSpilling());
+            // a negative node value dominates: prepaid quota must not mask node level memory pressure
+            tx->TotalMemoryCookie->MemoryAvailability.store(-1000000);
+            UNIT_ASSERT_VALUES_EQUAL(qm->GetMemoryAvailability(), -1000000);
+            UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), -1000000);
+            UNIT_ASSERT(tx->IsReasonableToStartSpilling());
+            tx->TotalMemoryCookie->MemoryAvailability.store(saved);
         }
 
         AssertResourceManagerStats(rm, 1000, 100);
@@ -584,6 +641,122 @@ void KqpRm::ConcurrentChannels() {
     }
 
     AssertResourceBrokerSensors(0, 0, 0, std::nullopt, 0);
+}
+
+// QueryMemoryLimit = 1000 with the default SpillingPercent = 80: the spilling threshold is at 800 used,
+// the availability is 800 - used and turns negative past it (the old SpillingPercentReached signal)
+void KqpRm::MemoryAvailability() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    {
+        auto tx = MakeTx(1, rm);
+        // nothing allocated yet: no cookie, nothing is known about the node
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), std::numeric_limits<i64>::max());
+        UNIT_ASSERT(!tx->IsReasonableToStartSpilling());
+
+        UNIT_ASSERT(rm->AllocateResources(*tx, 1, NRm::TKqpResourcesRequest{.Memory = 100}));
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 700);
+        UNIT_ASSERT(!tx->IsReasonableToStartSpilling());
+
+        UNIT_ASSERT(rm->AllocateResources(*tx, 1, NRm::TKqpResourcesRequest{.Memory = 700}));
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 0); // at the threshold: not pressure yet
+        UNIT_ASSERT(!tx->IsReasonableToStartSpilling());
+
+        UNIT_ASSERT(rm->AllocateResources(*tx, 1, NRm::TKqpResourcesRequest{.Memory = 1}));
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), -1);
+        UNIT_ASSERT(tx->IsReasonableToStartSpilling());
+
+        rm->FreeResources(*tx, 1, NRm::TKqpResourcesRequest{.Memory = 801});
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 800);
+        UNIT_ASSERT(!tx->IsReasonableToStartSpilling());
+    }
+
+    AssertResourceManagerStats(rm, 1000, 100);
+}
+
+// A tx with a resource pool sees the minimum over the node total and its pool: the pool limit is
+// MemoryPoolPercent of the node limit, the spilling threshold applies to each of them
+void KqpRm::PoolMemoryAvailability() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    {
+        auto tx = MakePoolTx(1, rm, /* memoryPoolPercent = */ 50);
+        // pool limit 500, pool threshold at 400 used; node threshold at 800 used
+        UNIT_ASSERT(rm->AllocateResources(*tx, 1, NRm::TKqpResourcesRequest{.Memory = 100}));
+        UNIT_ASSERT(tx->PoolMemoryCookie);
+        UNIT_ASSERT_VALUES_EQUAL(tx->TotalMemoryCookie->MemoryAvailability.load(), 700);
+        UNIT_ASSERT_VALUES_EQUAL(tx->PoolMemoryCookie->MemoryAvailability.load(), 300);
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 300);
+
+        UNIT_ASSERT(rm->AllocateResources(*tx, 1, NRm::TKqpResourcesRequest{.Memory = 350}));
+        UNIT_ASSERT_VALUES_EQUAL(tx->TotalMemoryCookie->MemoryAvailability.load(), 350);
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), -50); // the pool is over its threshold
+        UNIT_ASSERT(tx->IsReasonableToStartSpilling());
+
+        rm->FreeResources(*tx, 1, NRm::TKqpResourcesRequest{.Memory = 350});
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 300);
+        UNIT_ASSERT(!tx->IsReasonableToStartSpilling());
+    }
+
+    AssertResourceManagerStats(rm, 1000, 100);
+}
+
+// The quota managers refuse optional requests in advance when the tx availability cannot cover the aligned
+// step (no resource manager round trip), their availability follows the sign of the tx value, and an optional
+// request that fits the availability goes to the resource manager as usual
+void KqpRm::TaskQuotaManagerOptional() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    {
+        auto tx = MakeTx(1, rm);
+        const ui64 taskId = 1;
+        const ui64 initialLimit = 100;
+        // the node service prepays the initial limit as external memory before the task starts
+        UNIT_ASSERT(rm->AllocateResources(*tx, taskId, NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .ExternalMemory = initialLimit}));
+        UNIT_ASSERT(rm->AllocateResources(*tx, taskId, NRm::TKqpResourcesRequest{.Memory = 100}));
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 700);
+        const auto statsBefore = rm->GetLocalResources();
+
+        // task level manager: 1 MB allocation step, the test resource broker cannot grant that much
+        auto qm = CreateTaskQuotaManager(rm, tx, taskId, initialLimit);
+        UNIT_ASSERT(qm->AllocateQuota(50, /* isOptional = */ true)); // fits in the prepaid limit
+        UNIT_ASSERT_VALUES_EQUAL(qm->GetMemoryAvailability(), 700 + 50); // tx value plus the local leftover
+        UNIT_ASSERT(!qm->AllocateQuota(1500, /* isOptional = */ true)); // refused in advance
+        UNIT_ASSERT_VALUES_EQUAL(rm->GetLocalResources().Memory, statsBefore.Memory); // no round trip
+        // a negative tx value dominates the local leftover
+        tx->TotalMemoryCookie->MemoryAvailability.store(-7);
+        UNIT_ASSERT_VALUES_EQUAL(qm->GetMemoryAvailability(), -7);
+        tx->TotalMemoryCookie->MemoryAvailability.store(700);
+        qm->FreeQuota(50);
+        qm.reset();
+
+        // channel level manager: 16 byte allocation step, the granted path is observable
+        auto cm = CreateChannelQuotaManager(rm, tx, 0, 16);
+        tx->TotalMemoryCookie->MemoryAvailability.store(500);
+        UNIT_ASSERT(!cm->AllocateQuota(1500, /* isOptional = */ true)); // 1504 > 500: refused in advance
+        UNIT_ASSERT_VALUES_EQUAL(rm->GetLocalResources().Memory, statsBefore.Memory);
+        UNIT_ASSERT_VALUES_EQUAL(cm->GetMemoryAvailability(), 500); // nothing prepaid here
+        tx->TotalMemoryCookie->MemoryAvailability.store(700);
+        UNIT_ASSERT(cm->AllocateQuota(200, /* isOptional = */ true)); // 208 <= 700: granted by the resource manager
+        UNIT_ASSERT_VALUES_EQUAL(rm->GetLocalResources().Memory, statsBefore.Memory - 208);
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 700 - 208); // the cookie follows the allocation
+        cm->FreeQuota(200);
+        cm.reset();
+        UNIT_ASSERT_VALUES_EQUAL(rm->GetLocalResources().Memory, statsBefore.Memory);
+
+        rm->FreeResources(*tx, taskId, NRm::TKqpResourcesRequest{.Memory = 100});
+    }
+
+    AssertResourceManagerStats(rm, 1000, 100);
 }
 
 void KqpRm::SnapshotSharing() {
@@ -714,6 +887,472 @@ void KqpRm::DisonnectNodes() {
     Runtime->DispatchEvents(TDispatchOptions(), TDuration::Seconds(1));
 
     CheckSnapshot(0, {{1000, 100}}, rm_first);
+}
+
+void KqpRm::MemoryControllerBudget_Registers() {
+    // flag-on: Bootstrap must send TEvConsumerRegister(QueryExecution) to MC
+    // Register an edge actor at the MC service ID so the Send is actually delivered
+    const TActorId fakemc0 = Runtime->AllocateEdgeActor(0);
+    Runtime->RegisterService(NMemory::MakeMemoryControllerId(), fakemc0, 0);
+
+    StartRms({MakeKqpResourceManagerConfigWithMC(), MakeKqpResourceManagerConfig()});
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+
+    TAutoPtr<IEventHandle> handle;
+    auto* regEv = Runtime->GrabEdgeEventRethrow<NMemory::TEvConsumerRegister>(handle, TDuration::Seconds(1));
+    UNIT_ASSERT(regEv);
+    UNIT_ASSERT_VALUES_EQUAL((int)regEv->Kind, (int)NMemory::EMemoryConsumerKind::QueryExecution);
+
+    // flag-off: no TEvConsumerRegister sent
+    TearDown();
+    SetUp();
+    const TActorId fakemc1 = Runtime->AllocateEdgeActor(0);
+    Runtime->RegisterService(NMemory::MakeMemoryControllerId(), fakemc1, 0);
+
+    StartRms({MakeKqpResourceManagerConfig(), MakeKqpResourceManagerConfig()});
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+    // No TEvConsumerRegister expected; grab with short timeout and assert null
+    TAutoPtr<IEventHandle> handle2;
+    auto* regEv2 = Runtime->GrabEdgeEventRethrow<NMemory::TEvConsumerRegister>(handle2, TDuration::MilliSeconds(50));
+    UNIT_ASSERT(!regEv2);
+}
+
+void KqpRm::MemoryControllerBudget_FlagOff() {
+    // flag=false (default): TEvConsumerLimit must be ignored, limit stays at initial QueryMemoryLimit=1000
+    StartRms({MakeKqpResourceManagerConfig(), MakeKqpResourceManagerConfig()});
+    NKikimr::TActorSystemStub stub;
+
+    auto rm = GetKqpResourceManager(ResourceManagers[0].NodeId());
+    auto stats = rm->GetLocalResources();
+    UNIT_ASSERT_VALUES_EQUAL(1000, stats.Memory);
+
+    const TActorId sender = Runtime->AllocateEdgeActor(0);
+    Runtime->Send(new IEventHandle(ResourceManagers[0], sender,
+        new NMemory::TEvConsumerLimit(500)), 0, true);
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+
+    // limit unchanged: flag-off path ignores TEvConsumerLimit
+    stats = rm->GetLocalResources();
+    UNIT_ASSERT_VALUES_EQUAL(1000, stats.Memory);
+}
+
+void KqpRm::MemoryControllerBudget_DynamicLimit() {
+    // flag-on: TEvConsumerLimit(500) must lower TotalMemoryResource limit to 500
+    // Inject MC limit via a fake MC actor at the service id so sender check passes
+    const TActorId fakemc = Runtime->AllocateEdgeActor(0);
+    Runtime->RegisterService(NMemory::MakeMemoryControllerId(), fakemc, 0);
+
+    StartRms({MakeKqpResourceManagerConfigWithMC(), MakeKqpResourceManagerConfig()});
+    NKikimr::TActorSystemStub stub;
+
+    auto rm = GetKqpResourceManager(ResourceManagers[0].NodeId());
+    // Grab TEvConsumerRegister, reply with TEvConsumerRegistered so RM records McActorId = fakemc
+    TAutoPtr<IEventHandle> regHandle;
+    Runtime->GrabEdgeEventRethrow<NMemory::TEvConsumerRegister>(regHandle, TDuration::Seconds(1));
+    Runtime->Send(new IEventHandle(ResourceManagers[0], fakemc,
+        new NMemory::TEvConsumerRegistered(nullptr)), 0, true);
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+
+    // Inject MC limit 500 — sender must be the MC service ID so the D4 guard passes
+    Runtime->Send(new IEventHandle(ResourceManagers[0], NMemory::MakeMemoryControllerId(),
+        new NMemory::TEvConsumerLimit(500)), 0, true);
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+
+    // Available = limit(500) - used(0) = 500; allocate 400 must succeed, 401 must fail
+    auto tx400 = MakeTx(1, rm);
+    UNIT_ASSERT(rm->AllocateResources(*tx400, 1, NRm::TKqpResourcesRequest{.Memory = 400}));
+
+    auto tx401 = MakeTx(2, rm);
+    UNIT_ASSERT(!rm->AllocateResources(*tx401, 2, NRm::TKqpResourcesRequest{.Memory = 401}));
+
+    rm->FreeResources(*tx400, 1, NRm::TKqpResourcesRequest{.Memory = 400});
+}
+
+void KqpRm::MemoryControllerBudget_RbConfigLogOnly() {
+    // flag-on: after TEvConsumerLimit received, TEvConfigResponse from RB must be log-only (not change limit)
+    const TActorId fakemc = Runtime->AllocateEdgeActor(0);
+    Runtime->RegisterService(NMemory::MakeMemoryControllerId(), fakemc, 0);
+
+    StartRms({MakeKqpResourceManagerConfigWithMC(), MakeKqpResourceManagerConfig()});
+    NKikimr::TActorSystemStub stub;
+
+    auto rm = GetKqpResourceManager(ResourceManagers[0].NodeId());
+    TAutoPtr<IEventHandle> regHandle;
+    Runtime->GrabEdgeEventRethrow<NMemory::TEvConsumerRegister>(regHandle, TDuration::Seconds(1));
+    Runtime->Send(new IEventHandle(ResourceManagers[0], fakemc,
+        new NMemory::TEvConsumerRegistered(nullptr)), 0, true);
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+
+    Runtime->Send(new IEventHandle(ResourceManagers[0], NMemory::MakeMemoryControllerId(),
+        new NMemory::TEvConsumerLimit(500)), 0, true);
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+
+    auto stats = rm->GetLocalResources();
+    UNIT_ASSERT_VALUES_EQUAL(500, stats.Memory);
+
+    // Inject a simulated TEvConfigResponse with memory=900 — RM must ignore it (MC-driven)
+    {
+        auto* rbResp = new TEvResourceBroker::TEvConfigResponse;
+        TQueueConfig qc;
+        qc.SetName(NLocalDb::KqpResourceManagerQueue);
+        qc.MutableLimit()->SetMemory(900);
+        rbResp->QueueConfig = qc;
+        const TActorId rbSender = Runtime->AllocateEdgeActor(0);
+        Runtime->Send(new IEventHandle(ResourceManagers[0], rbSender, rbResp), 0, true);
+    }
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+
+    // limit must still be 500 (RB config ignored once MC-driven)
+    stats = rm->GetLocalResources();
+    UNIT_ASSERT_VALUES_EQUAL(500, stats.Memory);
+}
+
+void KqpRm::MemoryControllerBudget_RbConfigIgnoredEvenWhenValuesAgree() {
+    // Once MC-driven, TEvConfigResponse from RB must be ignored even when its value matches the MC limit.
+    // Registers a fake MC at service ID so the sender check passes.
+    const TActorId fakemc = Runtime->AllocateEdgeActor(0);
+    Runtime->RegisterService(NMemory::MakeMemoryControllerId(), fakemc, 0);
+
+    StartRms({MakeKqpResourceManagerConfigWithMC(), MakeKqpResourceManagerConfig()});
+    NKikimr::TActorSystemStub stub;
+
+    auto rm = GetKqpResourceManager(ResourceManagers[0].NodeId());
+    TAutoPtr<IEventHandle> regHandle;
+    Runtime->GrabEdgeEventRethrow<NMemory::TEvConsumerRegister>(regHandle, TDuration::Seconds(1));
+    Runtime->Send(new IEventHandle(ResourceManagers[0], fakemc,
+        new NMemory::TEvConsumerRegistered(nullptr)), 0, true);
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+
+    constexpr ui64 McLimit = 500;
+
+    // MC delivers a limit; RM becomes MC-driven
+    Runtime->Send(new IEventHandle(ResourceManagers[0], NMemory::MakeMemoryControllerId(),
+        new NMemory::TEvConsumerLimit(McLimit)), 0, true);
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+
+    auto stats = rm->GetLocalResources();
+    UNIT_ASSERT_VALUES_EQUAL_C(McLimit, stats.Memory,
+        "TotalMemoryResource must equal consumer limit after TEvConsumerLimit");
+
+    // RB config arrives with the same value — RM must ignore it (MC-driven)
+    {
+        auto* rbResp = new TEvResourceBroker::TEvConfigResponse;
+        TQueueConfig qc;
+        qc.SetName(NLocalDb::KqpResourceManagerQueue);
+        qc.MutableLimit()->SetMemory(McLimit);
+        rbResp->QueueConfig = qc;
+        const TActorId sender = Runtime->AllocateEdgeActor(0);
+        Runtime->Send(new IEventHandle(ResourceManagers[0], sender, rbResp), 0, true);
+    }
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+
+    stats = rm->GetLocalResources();
+    UNIT_ASSERT_VALUES_EQUAL_C(McLimit, stats.Memory,
+        "TotalMemoryResource must remain at McLimit after RB config with same value (MC-driven)");
+}
+
+void KqpRm::MemoryControllerBudget_StalenessRevert() {
+    // After McLimitStalenessTimeout without TEvConsumerLimit, RM must revert to RB-driven.
+    // After revert, a subsequent TEvConfigResponse must take effect.
+    const TActorId fakemc = Runtime->AllocateEdgeActor(0);
+    Runtime->RegisterService(NMemory::MakeMemoryControllerId(), fakemc, 0);
+
+    StartRms({MakeKqpResourceManagerConfigWithMC(), MakeKqpResourceManagerConfig()});
+    NKikimr::TActorSystemStub stub;
+
+    auto rm = GetKqpResourceManager(ResourceManagers[0].NodeId());
+    TAutoPtr<IEventHandle> regHandle;
+    Runtime->GrabEdgeEventRethrow<NMemory::TEvConsumerRegister>(regHandle, TDuration::Seconds(1));
+    Runtime->Send(new IEventHandle(ResourceManagers[0], fakemc,
+        new NMemory::TEvConsumerRegistered(nullptr)), 0, true);
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+
+    // Deliver an RB config so LastRbLimitBytes is cached
+    {
+        auto* rbResp = new TEvResourceBroker::TEvConfigResponse;
+        TQueueConfig qc;
+        qc.SetName(NLocalDb::KqpResourceManagerQueue);
+        qc.MutableLimit()->SetMemory(700);
+        rbResp->QueueConfig = qc;
+        const TActorId sender = Runtime->AllocateEdgeActor(0);
+        Runtime->Send(new IEventHandle(ResourceManagers[0], sender, rbResp), 0, true);
+    }
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+
+    // MC delivers a limit; RM becomes MC-driven
+    Runtime->Send(new IEventHandle(ResourceManagers[0], NMemory::MakeMemoryControllerId(),
+        new NMemory::TEvConsumerLimit(500)), 0, true);
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+
+    UNIT_ASSERT_VALUES_EQUAL(500, rm->GetLocalResources().Memory);
+
+    // Advance past McLimitStalenessTimeout (10s) without sending another TEvConsumerLimit
+    Runtime->AdvanceCurrentTime(TDuration::Seconds(11));
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(200));
+
+    // After revert, RM applies the last cached RB limit (700)
+    UNIT_ASSERT_VALUES_EQUAL(700, rm->GetLocalResources().Memory);
+
+    // A fresh TEvConfigResponse now takes effect (no longer MC-driven)
+    {
+        auto* rbResp = new TEvResourceBroker::TEvConfigResponse;
+        TQueueConfig qc;
+        qc.SetName(NLocalDb::KqpResourceManagerQueue);
+        qc.MutableLimit()->SetMemory(800);
+        rbResp->QueueConfig = qc;
+        const TActorId sender = Runtime->AllocateEdgeActor(0);
+        Runtime->Send(new IEventHandle(ResourceManagers[0], sender, rbResp), 0, true);
+    }
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+
+    UNIT_ASSERT_VALUES_EQUAL(800, rm->GetLocalResources().Memory);
+}
+
+void KqpRm::MemoryControllerBudget_RecoveryAfterRevert() {
+    // After a staleness revert, a new TEvConsumerLimit re-enters MC-driven mode and arms the watchdog.
+    // A second staleness revert must also work.
+    const TActorId fakemc = Runtime->AllocateEdgeActor(0);
+    Runtime->RegisterService(NMemory::MakeMemoryControllerId(), fakemc, 0);
+
+    StartRms({MakeKqpResourceManagerConfigWithMC(), MakeKqpResourceManagerConfig()});
+    NKikimr::TActorSystemStub stub;
+
+    auto rm = GetKqpResourceManager(ResourceManagers[0].NodeId());
+    TAutoPtr<IEventHandle> regHandle;
+    Runtime->GrabEdgeEventRethrow<NMemory::TEvConsumerRegister>(regHandle, TDuration::Seconds(1));
+    Runtime->Send(new IEventHandle(ResourceManagers[0], fakemc,
+        new NMemory::TEvConsumerRegistered(nullptr)), 0, true);
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+
+    // Deliver RB limit so LastRbLimitBytes is cached
+    {
+        auto* rbResp = new TEvResourceBroker::TEvConfigResponse;
+        TQueueConfig qc;
+        qc.SetName(NLocalDb::KqpResourceManagerQueue);
+        qc.MutableLimit()->SetMemory(700);
+        rbResp->QueueConfig = qc;
+        const TActorId sender = Runtime->AllocateEdgeActor(0);
+        Runtime->Send(new IEventHandle(ResourceManagers[0], sender, rbResp), 0, true);
+    }
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+
+    // First MC limit: MC-driven
+    Runtime->Send(new IEventHandle(ResourceManagers[0], NMemory::MakeMemoryControllerId(),
+        new NMemory::TEvConsumerLimit(500)), 0, true);
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+    UNIT_ASSERT_VALUES_EQUAL(500, rm->GetLocalResources().Memory);
+
+    // First revert
+    Runtime->AdvanceCurrentTime(TDuration::Seconds(11));
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(200));
+    UNIT_ASSERT_VALUES_EQUAL(700, rm->GetLocalResources().Memory);
+
+    // Re-enter MC-driven mode with a new TEvConsumerLimit
+    Runtime->Send(new IEventHandle(ResourceManagers[0], NMemory::MakeMemoryControllerId(),
+        new NMemory::TEvConsumerLimit(600)), 0, true);
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+    UNIT_ASSERT_VALUES_EQUAL(600, rm->GetLocalResources().Memory);
+
+    // Second revert: watchdog must have been re-armed after recovery
+    Runtime->AdvanceCurrentTime(TDuration::Seconds(11));
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(200));
+    UNIT_ASSERT_VALUES_EQUAL(700, rm->GetLocalResources().Memory);
+}
+
+// MemoryLimit follows the pool limit; MemoryAllocated tracks acquire/release eagerly;
+// a granted allocation does NOT move MemoryDeniedRequests
+void KqpRm::PoolSensors_LimitAndAllocatedTrackAllocation() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+    auto tx = MakePoolTx(1, rm, /* memoryPoolPercent = */ 50);
+    // pool limit = 50% * 1000 = 500
+
+    // First allocation creates the pool and wires the sensorGroup
+    UNIT_ASSERT(rm->AllocateResources(*tx, 1, NRm::TKqpResourcesRequest{.Memory = 100}));
+    auto sensors = GetPoolSensorGroup("db", "pool");
+    UNIT_ASSERT_VALUES_EQUAL(sensors->GetCounter("MemoryLimit")->Val(), 500);
+    UNIT_ASSERT_VALUES_EQUAL(sensors->GetCounter("MemoryAllocated")->Val(), 100);
+    UNIT_ASSERT_VALUES_EQUAL(sensors->GetCounter("MemoryDeniedRequests")->Val(), 0);
+
+    // Second task: Allocated grows
+    UNIT_ASSERT(rm->AllocateResources(*tx, 2, NRm::TKqpResourcesRequest{.Memory = 100}));
+    UNIT_ASSERT_VALUES_EQUAL(sensors->GetCounter("MemoryAllocated")->Val(), 200);
+    UNIT_ASSERT_VALUES_EQUAL(sensors->GetCounter("MemoryDeniedRequests")->Val(), 0); // grants never move it
+
+    // Release task 2: Allocated shrinks
+    rm->FreeResources(*tx, 2, NRm::TKqpResourcesRequest{.Memory = 100});
+    UNIT_ASSERT_VALUES_EQUAL(sensors->GetCounter("MemoryAllocated")->Val(), 100);
+
+    rm->FreeResources(*tx, 1, NRm::TKqpResourcesRequest{.Memory = 100});
+    AssertResourceManagerStats(rm, 1000, 100);
+}
+
+// MemoryDeniedRequests counts pool-limit acquire refusals; succeeding allocations do not move it
+void KqpRm::PoolSensors_DeniedRequestsCountRefusals() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+    auto tx = MakePoolTx(1, rm, /* memoryPoolPercent = */ 50);
+    // pool limit 500; allocate 100 so the pool exists
+    UNIT_ASSERT(rm->AllocateResources(*tx, 1, NRm::TKqpResourcesRequest{.Memory = 100}));
+    auto sensors = GetPoolSensorGroup("db", "pool");
+
+    // 450 would bring total to 550 > 500: denied → DeniedRequests=1
+    UNIT_ASSERT(!rm->AllocateResources(*tx, 3, NRm::TKqpResourcesRequest{.Memory = 450}));
+    UNIT_ASSERT_VALUES_EQUAL(sensors->GetCounter("MemoryDeniedRequests")->Val(), 1);
+    UNIT_ASSERT_VALUES_EQUAL(sensors->GetCounter("MemoryAllocated")->Val(), 100); // unchanged
+
+    // Second refusal: DeniedRequests=2
+    UNIT_ASSERT(!rm->AllocateResources(*tx, 3, NRm::TKqpResourcesRequest{.Memory = 450}));
+    UNIT_ASSERT_VALUES_EQUAL(sensors->GetCounter("MemoryDeniedRequests")->Val(), 2);
+
+    rm->FreeResources(*tx, 1, NRm::TKqpResourcesRequest{.Memory = 100});
+    AssertResourceManagerStats(rm, 1000, 100);
+}
+
+// Dtor zeros MemoryLimit and MemoryAllocated; DeniedRequests survives (registry-owned derivative)
+void KqpRm::PoolSensors_GaugesZeroedOnPoolErase() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+    auto tx = MakePoolTx(1, rm, /* memoryPoolPercent = */ 50);
+    UNIT_ASSERT(rm->AllocateResources(*tx, 1, NRm::TKqpResourcesRequest{.Memory = 100}));
+    auto sensors = GetPoolSensorGroup("db", "pool");
+    UNIT_ASSERT(!rm->AllocateResources(*tx, 2, NRm::TKqpResourcesRequest{.Memory = 450}));
+    UNIT_ASSERT_VALUES_EQUAL(sensors->GetCounter("MemoryDeniedRequests")->Val(), 1);
+
+    // Free all: pool erased, dtor zeros gauges
+    rm->FreeResources(*tx, 1, NRm::TKqpResourcesRequest{.Memory = 100});
+    UNIT_ASSERT_VALUES_EQUAL(sensors->GetCounter("MemoryLimit")->Val(), 0);
+    UNIT_ASSERT_VALUES_EQUAL(sensors->GetCounter("MemoryAllocated")->Val(), 0);
+    UNIT_ASSERT_VALUES_EQUAL(sensors->GetCounter("MemoryDeniedRequests")->Val(), 1); // registry-owned, preserved
+    AssertResourceManagerStats(rm, 1000, 100);
+}
+
+// 801 bytes (= 1000−200+1) crosses the spilling threshold → availability = 1000−801−200 = −1;
+// optional refused in advance (no RM round trip, RmNotEnoughMemory unchanged);
+// mandatory grants from the remaining 1000−801 = 199 bytes; after recovery optional grant
+// leaves counters unchanged and GetCurrentQuota 0→100→0 tracks exactly
+void KqpRm::OptionalQuota_YellowZoneDeniedThenGrantedAfterRecovery() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+    auto tx = MakeTx(1, rm);
+    auto qm = CreateChannelQuotaManager(rm, tx, 0, /* step */ 16);
+
+    // 1000−801−200 = −1
+    UNIT_ASSERT(rm->AllocateResources(*tx, 1, NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .Memory = 801}));
+    UNIT_ASSERT_VALUES_EQUAL(qm->GetMemoryAvailability(), -1);
+    UNIT_ASSERT_VALUES_EQUAL(rm->GetLocalResources().Memory, 1000 - 801); // 199 remaining
+
+    auto counters = rm->GetCounters();
+    const i64 noMemBefore = counters->RmNotEnoughMemory->Val();
+
+    // Optional refused; RmNotEnoughMemory unchanged (no RM round trip)
+    UNIT_ASSERT(!qm->AllocateQuota(10, /* isOptional */ true));
+    UNIT_ASSERT_VALUES_EQUAL(counters->RmOptionalQuotaDenied->Val(), 1);
+    UNIT_ASSERT_VALUES_EQUAL(counters->RmOptionalQuotaDeniedBytes->Val(), 10);
+    UNIT_ASSERT_VALUES_EQUAL(counters->RmNotEnoughMemory->Val(), noMemBefore);
+
+    // Mandatory ignores yellow zone; RM aligns 10→ceil(10/16)*16=16 bytes, granted from 199 free
+    UNIT_ASSERT(qm->AllocateQuota(10, /* isOptional */ false));
+    UNIT_ASSERT_VALUES_EQUAL(rm->GetLocalResources().Memory, 199 - 16); // 183 remaining
+    qm->FreeQuota(10);
+    // dtor returns the 16-byte RM grant (Limit=16, DataMemoryLimit=0)
+    qm.reset();
+
+    rm->FreeResources(*tx, 1, NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .Memory = 801});
+
+    // After recovery: optional grant must not move counters; GetCurrentQuota 0→100→0
+    auto qm2 = CreateChannelQuotaManager(rm, tx, 0, /* step */ 256);
+    UNIT_ASSERT(qm2->AllocateQuota(100, /* isOptional */ true));
+    UNIT_ASSERT_VALUES_EQUAL(counters->RmOptionalQuotaDenied->Val(), 1);   // unchanged by grant
+    UNIT_ASSERT_VALUES_EQUAL(counters->RmOptionalQuotaDeniedBytes->Val(), 10);
+    UNIT_ASSERT_VALUES_EQUAL(qm2->GetCurrentQuota(), 100u);
+    qm2->FreeQuota(100);
+    UNIT_ASSERT_VALUES_EQUAL(qm2->GetCurrentQuota(), 0u);
+    qm2.reset(); // dtor: Limit=256, DataMemoryLimit=0 → returns 256 bytes to RM
+
+    AssertResourceManagerStats(rm, 1000, 100);
+}
+
+// Pool limit=10%*1000=100, OverLimit=20; 60 bytes allocated → pool availability=100−20−60=20;
+// aligned ceil(50/16)*16=64 > 20 → advance refusal with counter delta +1/+50
+void KqpRm::OptionalQuota_PoolHeadroomDenies() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+    auto tx = MakePoolTx(1, rm, /* memoryPoolPercent */ 10);
+    UNIT_ASSERT(rm->AllocateResources(*tx, 1, NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .Memory = 60}));
+
+    auto qm = CreateChannelQuotaManager(rm, tx, 0, /* step */ 16);
+    // 100 − 20 − 60 = 20
+    UNIT_ASSERT_VALUES_EQUAL(qm->GetMemoryAvailability(), 20);
+
+    // ceil(50/16)*16 = 64 > 20 → advance refusal
+    UNIT_ASSERT(!qm->AllocateQuota(50, /* isOptional */ true));
+    auto counters = rm->GetCounters();
+    UNIT_ASSERT_VALUES_EQUAL(counters->RmOptionalQuotaDenied->Val(), 1);
+    UNIT_ASSERT_VALUES_EQUAL(counters->RmOptionalQuotaDeniedBytes->Val(), 50);
+
+    rm->FreeResources(*tx, 1, NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .Memory = 60});
+    qm.reset(); // dtor: all-zero FreeResources — nothing was granted via the channel manager
+    AssertResourceManagerStats(rm, 1000, 100);
+}
+
+// MC limit shrink causes optional refusal; regrow restores optional grant;
+// RmNotEnoughMemory stays at its baseline throughout (advance path, no RM round trip)
+void KqpRm::MemoryControllerBudget_LimitShrinkDeniesRegrowGrants() {
+    const TActorId fakemc = Runtime->AllocateEdgeActor(0);
+    Runtime->RegisterService(NMemory::MakeMemoryControllerId(), fakemc, 0);
+    StartRms({MakeKqpResourceManagerConfigWithMC(), MakeKqpResourceManagerConfig()});
+    NKikimr::TActorSystemStub stub;
+
+    auto rm = GetKqpResourceManager(ResourceManagers[0].NodeId());
+    TAutoPtr<IEventHandle> regHandle;
+    Runtime->GrabEdgeEventRethrow<NMemory::TEvConsumerRegister>(regHandle, TDuration::Seconds(1));
+    Runtime->Send(new IEventHandle(ResourceManagers[0], fakemc,
+        new NMemory::TEvConsumerRegistered(nullptr)), 0, true);
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+
+    auto tx = MakeTx(1, rm);
+    UNIT_ASSERT(rm->AllocateResources(*tx, 1, NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .Memory = 100}));
+    auto qm = CreateChannelQuotaManager(rm, tx, 0, /* step */ 16);
+
+    // Shrink to 250: OverLimit=250*0.20=50; availability=250−100−50=100; ceil(200/16)*16=208>100 → refused
+    Runtime->Send(new IEventHandle(ResourceManagers[0], NMemory::MakeMemoryControllerId(),
+        new NMemory::TEvConsumerLimit(250)), 0, true);
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+    UNIT_ASSERT_VALUES_EQUAL(rm->GetLocalResources().Memory, 250 - 100); // limit applied
+    UNIT_ASSERT_VALUES_EQUAL(qm->GetMemoryAvailability(), 250 - 100 - 50); // =100
+
+    auto counters = rm->GetCounters();
+    const i64 noMemBefore = counters->RmNotEnoughMemory->Val();
+
+    UNIT_ASSERT(!qm->AllocateQuota(200, /* isOptional */ true));
+    UNIT_ASSERT_VALUES_EQUAL(counters->RmOptionalQuotaDenied->Val(), 1);
+    UNIT_ASSERT_VALUES_EQUAL(counters->RmOptionalQuotaDeniedBytes->Val(), 200);
+    UNIT_ASSERT_VALUES_EQUAL(counters->RmNotEnoughMemory->Val(), noMemBefore); // advance path: no RM round trip
+
+    // Regrow to 1000: OverLimit=200; availability=1000−100−200=700; ceil(200/16)*16=208≤700 → granted
+    Runtime->Send(new IEventHandle(ResourceManagers[0], NMemory::MakeMemoryControllerId(),
+        new NMemory::TEvConsumerLimit(1000)), 0, true);
+    Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+    UNIT_ASSERT_VALUES_EQUAL(rm->GetLocalResources().Memory, 1000 - 100); // limit applied
+    UNIT_ASSERT_VALUES_EQUAL(qm->GetMemoryAvailability(), 1000 - 100 - 200); // =700
+
+    UNIT_ASSERT(qm->AllocateQuota(200, /* isOptional */ true));
+    qm->FreeQuota(200);
+    qm.reset(); // dtor returns the 208-byte RM grant
+
+    rm->FreeResources(*tx, 1, NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .Memory = 100});
+    AssertResourceManagerStats(rm, 1000, 100);
 }
 
 } // namespace NKqp

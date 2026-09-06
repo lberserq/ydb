@@ -806,6 +806,8 @@ TKqpCounters::TKqpCounters(const ::NMonitoring::TDynamicCounterPtr& counters, co
     RmMemory = KqpGroup->GetCounter("RM/Memory", false);
     RmExternalMemory = KqpGroup->GetCounter("RM/ExternalMemory", false);
     RmNotEnoughMemory = KqpGroup->GetCounter("RM/NotEnoughMemory", true);
+    RmOptionalQuotaDenied = KqpGroup->GetCounter("RM/OptionalQuotaDenied", true);
+    RmOptionalQuotaDeniedBytes = KqpGroup->GetCounter("RM/OptionalQuotaDeniedBytes", true);
     RmNotEnoughComputeActors = KqpGroup->GetCounter("RM/NotEnoughComputeActors", true);
     RmOnStartAllocs = KqpGroup->GetCounter("Rm/OnStartAllocs", true);
     RmExtraMemAllocs = KqpGroup->GetCounter("RM/ExtraMemAllocs", true);
