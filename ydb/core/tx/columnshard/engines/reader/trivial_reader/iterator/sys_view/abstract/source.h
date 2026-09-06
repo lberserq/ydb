@@ -13,9 +13,7 @@ private:
     YDB_READONLY(ui64, TabletId, 0);
     const NCommon::TReplaceKeyAdapter Start;
     const NCommon::TReplaceKeyAdapter Finish;
-    // the sys view's own schema: the shape/PK of the rows this source emits, matching Start/Finish
-    // (the introspected table's schema stays private to the concrete source) YDBBUGS-770
-    const std::shared_ptr<ISnapshotSchema> SysViewSchema;
+    const std::shared_ptr<ISnapshotSchema> SourceSchema;
 
     virtual TConclusion<bool> DoStartFetchImpl(const NArrow::NSSA::TProcessorContext& /*context*/,
         const std::vector<std::shared_ptr<NReader::NCommon::IKernelFetchLogic>>& /*fetchersExt*/) override {
@@ -65,11 +63,11 @@ private:
     }
 
     virtual const std::shared_ptr<ISnapshotSchema>& GetSourceSchema() const override {
-        return SysViewSchema;
+        return SourceSchema;
     }
 
     virtual const std::shared_ptr<ISnapshotSchema>& GetSourceSchemaOptional() const override {
-        return SysViewSchema;
+        return SourceSchema;
     }
 
     // Start/Finish already follow scan direction (the constructor swaps them for DESC)
@@ -182,7 +180,7 @@ public:
         , TabletId(tabletId)
         , Start(std::move(start), context->GetReadMetadata()->IsDescSorted())
         , Finish(std::move(finish), context->GetReadMetadata()->IsDescSorted())
-        , SysViewSchema(context->GetReadMetadata()->GetResultSchema())
+        , SourceSchema(context->GetReadMetadata()->GetResultSchema())
     {
     }
 };

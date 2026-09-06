@@ -13,15 +13,15 @@ class TSourceData: public NAbstract::TPathSourceData {
 private:
     using TBase = NAbstract::TPathSourceData;
     YDB_READONLY_DEF(TPortionInfo::TConstPtr, Portion);
-    ISnapshotSchema::TPtr Schema;
+    ISnapshotSchema::TPtr PortionSchema;
     std::shared_ptr<NArrow::NAccessor::TAccessorsCollection> OriginalData;
 
     virtual TString GetColumnStorageId(const ui32 columnId) const override {
-        return GetPortionAccessor().GetPortionInfo().GetColumnStorageId(columnId, Schema->GetIndexInfo());
+        return GetPortionAccessor().GetPortionInfo().GetColumnStorageId(columnId, PortionSchema->GetIndexInfo());
     }
 
     virtual TString GetEntityStorageId(const ui32 entityId) const override {
-        return GetPortionAccessor().GetPortionInfo().GetEntityStorageId(entityId, Schema->GetIndexInfo());
+        return GetPortionAccessor().GetPortionInfo().GetEntityStorageId(entityId, PortionSchema->GetIndexInfo());
     }
 
     virtual ui64 GetColumnRawBytes(const std::set<ui32>& /*columnsIds*/) const override {
@@ -45,9 +45,6 @@ private:
 
     const NCommon::TPKSortPermutation& GetChunksPKOrder() const;
 
-    // sorted scans require rows ordered by the sys view PK (InternalEntityId, ChunkIdx) while
-    // column records are emitted before index records and their entity ids interleave; iterating
-    // through the order builds every column sorted without copying arrays
     template <class TOnRecord, class TOnIndex>
     void ForEachChunkInPKOrder(TOnRecord&& onRecord, TOnIndex&& onIndex) const {
         const auto& records = GetPortionAccessor().GetRecordsVerified();
@@ -102,7 +99,7 @@ public:
         : TBase(sourceIdx, pathId, tabletId, std::move(start), std::move(finish), std::nullopt, portion->RecordSnapshotMin(),
               portion->RecordSnapshotMin(), context)
         , Portion(std::move(portion))
-        , Schema(std::move(schema))
+        , PortionSchema(std::move(schema))
     {
     }
 };

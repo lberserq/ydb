@@ -32,8 +32,6 @@ public:
         , OptimizerTasks(std::move(tasks))
         , ExternalPathId(externalPathId)
     {
-        // TaskId order differs from the sys view PK; the sort is only consumed by the flag-on limit-pushdown
-        // path. A flag-off sorted scan re-sorts in KQP, so skip the work there.
         if (context->GetReadMetadata()->IsSorted() && HasAppData() && AppDataVerified().FeatureFlags.GetEnableSysViewOrderByLimitPushdown()) {
             std::sort(OptimizerTasks.begin(), OptimizerTasks.end());
         }
