@@ -11,6 +11,11 @@ class TCallable;
 struct TComputationNodeFactoryContext;
 
 struct TDqHashCombineTestState {
+    // Set by the operator to its own sizeof, checked by the test against the size it was compiled with.
+    // A mismatch means the operator and the test disagree about this struct, i.e. mixed build artifacts,
+    // and every other field below is then meaningless.
+    size_t StructSize = 0;
+    size_t ProcessFetchedRows = 0; // calls that reached ProcessFetchedRow; must equal InputRows
     bool BypassActivated = false;
     size_t DrainsStarted = 0;
     size_t SpillsStarted = 0;

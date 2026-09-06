@@ -145,6 +145,8 @@ struct TOperatorEndState
     size_t DrainsStarted = 0;
     size_t SpillsStarted = 0;
     size_t ShrinksRequested = 0;
+    size_t StructSize = 0;
+    size_t ProcessFetchedRows = 0;
     bool SpillingEnabled = false;
     bool QuotaBound = false;
     i64 LastAvailability = 0;
@@ -159,7 +161,9 @@ struct TOperatorEndState
     // what the operator saw, for a test that expected a spill or a drain and did not get one
     TString DebugString() const {
         return TStringBuilder()
-            << "spillingEnabled=" << SpillingEnabled
+            << "structSize=" << StructSize << "/" << sizeof(TDqHashCombineTestState)
+            << " processFetchedRows=" << ProcessFetchedRows
+            << " spillingEnabled=" << SpillingEnabled
             << " quotaBound=" << QuotaBound
             << " lastAvailability=" << LastAvailability
             << " inputRows=" << InputRows
@@ -177,6 +181,8 @@ struct TOperatorEndState
 
 void SetTestEndStateUpdater(THolder<IComputationGraph>& graph, TOperatorEndState& endState) {
     SetTestStateCallback(graph, [&endState](const TDqHashCombineTestState& state) {
+        endState.StructSize = state.StructSize;
+        endState.ProcessFetchedRows = std::max(endState.ProcessFetchedRows, state.ProcessFetchedRows);
         endState.WasBypassActive = endState.WasBypassActive || state.BypassActivated;
         endState.DrainsStarted = std::max(endState.DrainsStarted, state.DrainsStarted);
         endState.SpillsStarted = std::max(endState.SpillsStarted, state.SpillsStarted);
@@ -1356,10 +1362,14 @@ Y_UNIT_TEST_SUITE(TDqHashCombineTest) {
     constexpr size_t SpillTriggerRow = SpillTriggerKeys / 2;
 
     // What the test side saw around the trigger, to pair with the operator's own view in TOperatorEndState.
+    // Everything here is measured in the test, so it stands even if the two disagree about the shared struct.
     struct TSpillTriggerState {
         size_t TriggerRow = 0;
         size_t ReadsAtTrigger = 0;   // availability polls the operator had made when the trigger fired
         i64 AvailabilityAfterWrite = 0; // read back through the interface right after writing it
+        // polls seen at a few points of the input: the operator must keep polling as rows go by
+        static constexpr size_t SampleRows[] = {1000, 20000, 60000};
+        size_t ReadsAtSample[3] = {};
 
         void Record(const size_t rowNum, const TScriptedMemoryQuota& quota) {
             TriggerRow = rowNum;
@@ -1367,13 +1377,25 @@ Y_UNIT_TEST_SUITE(TDqHashCombineTest) {
             ReadsAtTrigger = quota.AvailabilityReads; // after the probe above, so it is not counted as a poll
         }
 
+        void Sample(const size_t rowNum, const TScriptedMemoryQuota& quota) {
+            for (size_t i = 0; i < Y_ARRAY_SIZE(SampleRows); ++i) {
+                if (rowNum == SampleRows[i]) {
+                    ReadsAtSample[i] = quota.AvailabilityReads;
+                }
+            }
+        }
+
         TString DebugString(const TScriptedMemoryQuota& quota) const {
-            return TStringBuilder()
-                << "triggerRow=" << TriggerRow
+            TStringBuilder result;
+            result << "triggerRow=" << TriggerRow
                 << " readsAtTrigger=" << ReadsAtTrigger
                 << " availabilityAfterWrite=" << AvailabilityAfterWrite
                 << " availabilityAtEnd=" << quota.Availability
                 << " reads=" << quota.AvailabilityReads;
+            for (size_t i = 0; i < Y_ARRAY_SIZE(SampleRows); ++i) {
+                result << " readsAtRow" << SampleRows[i] << "=" << ReadsAtSample[i];
+            }
+            return result;
         }
     };
 
@@ -1383,6 +1405,7 @@ Y_UNIT_TEST_SUITE(TDqHashCombineTest) {
         TSpillTriggerState trigger;
         auto endState = RunDqAggregateWideTest(setup, UseFlow, [&](TComputationContext& ctx, std::vector<TType*>& columnTypes, ui32 keyWidth, auto& refMap) {
             return new TWideKVStream(ctx, SpillTriggerKeys, SpillTriggerRepeats, columnTypes, keyWidth, refMap, [&](const size_t rowNum, [[maybe_unused]] bool& yield) {
+                trigger.Sample(rowNum, quota);
                 if (rowNum == SpillTriggerRow) {
                     quota.Availability = -1; // the node is over target: the operator must give memory back
                     trigger.Record(rowNum, quota);
@@ -1391,6 +1414,10 @@ Y_UNIT_TEST_SUITE(TDqHashCombineTest) {
         }, 2, false, false, &quota);
         // report which link of trigger -> poll -> spill broke, the spill is not reproducible everywhere
         const TString state = TStringBuilder() << endState.DebugString() << " " << trigger.DebugString(quota);
+        UNIT_ASSERT_VALUES_EQUAL_C(endState.StructSize, sizeof(TDqHashCombineTestState),
+            "the operator and the test disagree about TDqHashCombineTestState: " << state);
+        UNIT_ASSERT_VALUES_EQUAL_C(endState.ProcessFetchedRows, endState.InputRows,
+            "rows were counted without reaching ProcessFetchedRow: " << state);
         UNIT_ASSERT_VALUES_EQUAL_C(trigger.TriggerRow, SpillTriggerRow, "the input never reached the trigger row");
         UNIT_ASSERT_GT_C(quota.AvailabilityReads, trigger.ReadsAtTrigger,
             "the operator did not poll the quota after the trigger: " << state);
@@ -1499,6 +1526,7 @@ Y_UNIT_TEST_SUITE(TDqHashCombineTest) {
         TSpillTriggerState trigger;
         auto endState = RunDqAggregateWideTest(setup, UseFlow, [&](TComputationContext& ctx, std::vector<TType*>& columnTypes, ui32 keyWidth, auto& refMap) {
             return new TWideKVStream(ctx, SpillTriggerKeys, SpillTriggerRepeats, columnTypes, keyWidth, refMap, [&](const size_t rowNum, [[maybe_unused]] bool& yield) {
+                trigger.Sample(rowNum, quota);
                 if (rowNum == SpillTriggerRow) {
                     quota.Availability = -1;
                     trigger.Record(rowNum, quota);
@@ -1512,6 +1540,10 @@ Y_UNIT_TEST_SUITE(TDqHashCombineTest) {
             }
         }
         const TString state = TStringBuilder() << endState.DebugString() << " " << trigger.DebugString(quota);
+        UNIT_ASSERT_VALUES_EQUAL_C(endState.StructSize, sizeof(TDqHashCombineTestState),
+            "the operator and the test disagree about TDqHashCombineTestState: " << state);
+        UNIT_ASSERT_VALUES_EQUAL_C(endState.ProcessFetchedRows, endState.InputRows,
+            "rows were counted without reaching ProcessFetchedRow: " << state);
         UNIT_ASSERT_VALUES_EQUAL_C(trigger.TriggerRow, SpillTriggerRow, "the input never reached the trigger row");
         UNIT_ASSERT_GT_C(quota.AvailabilityReads, trigger.ReadsAtTrigger,
             "the operator did not poll the quota after the trigger: " << state);

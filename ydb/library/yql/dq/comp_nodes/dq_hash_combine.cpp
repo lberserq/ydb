@@ -1072,6 +1072,7 @@ protected:
     }
 
     EFillState ProcessFetchedRow(TUnboxedValue* const* input) {
+        ++ProcessFetchedRows; // test diagnostics only
         MaybeRefreshPressure();
         TArrayRef<TUnboxedValuePod> keyBuf(TempKeyBuffer);
 
@@ -1339,6 +1340,8 @@ protected:
             return;
         }
         TestParams.StateCallback({
+            .StructSize = sizeof(TDqHashCombineTestState),
+            .ProcessFetchedRows = ProcessFetchedRows,
             .BypassActivated = BypassActivated,
             .DrainsStarted = DrainsStarted,
             .SpillsStarted = SpillsStarted,
@@ -1679,6 +1682,7 @@ protected:
     size_t ShrinksRequested = 0;
     bool QuotaWasBound = false; // test diagnostics, reported through TDqHashCombineTestState
     i64 LastAvailability = 0;
+    size_t ProcessFetchedRows = 0;
     size_t PressureChecks = 0;
     size_t BoundRefreshes = 0;
     size_t UnboundRefreshes = 0;
