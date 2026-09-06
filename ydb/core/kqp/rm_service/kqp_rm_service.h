@@ -26,6 +26,8 @@ namespace NRm {
 
 using TOnResourcesSnapshotCallback = std::function<void(TVector<NKikimrKqp::TKqpNodeResources>&&)>;
 
+inline constexpr size_t MAX_POOL_SENSOR_ENTRIES = 1000;
+
 /// resources request
 struct TKqpResourcesRequest {
     ui64 ExecutionUnits = 0;

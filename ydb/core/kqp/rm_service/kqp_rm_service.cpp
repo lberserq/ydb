@@ -219,6 +219,7 @@ public:
         if (!Counters) {
             Counters = MakeIntrusive<TKqpCounters>(AppData(ActorSystem)->Counters);
         }
+        PoolSensorsCapped = Counters->GetKqpCounters()->GetCounter("RM/PoolSensorsCapped", true);
         UpdatePatternCache(config.GetKqpPatternCacheCapacityBytes(),
             config.GetKqpPatternCacheCompiledCapacityBytes(),
             config.GetKqpPatternCachePatternAccessTimesBeforeTryToCompile());
@@ -319,15 +320,7 @@ public:
                     TPoolSensors* sensors = nullptr;
                     if (Counters && ActorSystem &&
                             AppData(ActorSystem)->FeatureFlags.GetEnableResourcePoolsCounters()) {
-                        auto& registered = PoolSensorRegistry[std::make_pair(tx.Database, tx.PoolId)];
-                        if (!registered.Limit) {
-                            auto sg = Counters->GetWorkloadManagerCounters()
-                                ->GetSubgroup("pool", TStringBuilder() << tx.Database << "/" << tx.PoolId);
-                            registered.Limit = sg->GetCounter("MemoryLimit", false);
-                            registered.Allocated = sg->GetCounter("MemoryAllocated", false);
-                            registered.DeniedRequests = sg->GetCounter("MemoryDeniedRequests", true);
-                        }
-                        sensors = &registered;
+                        sensors = AcquirePoolSensors(tx.Database, tx.PoolId);
                     }
                     it->second = MakeIntrusive<TMemoryResource>(TotalMemoryResource->GetLimit(), tx.MemoryPoolPercent, SpillingPercent.load(), sensors);
                 } else {
@@ -606,6 +599,26 @@ public:
         }
     }
 
+    TPoolSensors* AcquirePoolSensors(const TString& database, const TString& poolId) {
+        auto key = std::make_pair(database, poolId);
+        if (auto it = PoolSensorRegistry.find(key); it != PoolSensorRegistry.end()) {
+            return &it->second;
+        }
+
+        if (PoolSensorRegistry.size() >= MAX_POOL_SENSOR_ENTRIES) {
+            PoolSensorsCapped->Inc();
+            return nullptr;
+        }
+
+        auto sg = Counters->GetWorkloadManagerCounters()
+            ->GetSubgroup("pool", TStringBuilder() << database << "/" << poolId);
+        TPoolSensors sensors;
+        sensors.Limit = sg->GetCounter("MemoryLimit", false);
+        sensors.Allocated = sg->GetCounter("MemoryAllocated", false);
+        sensors.DeniedRequests = sg->GetCounter("MemoryDeniedRequests", true);
+        return &PoolSensorRegistry.emplace(std::move(key), std::move(sensors)).first->second;
+    }
+
     TActorId SelfId;
 
     std::atomic<ui64> QueryMemoryLimit;
@@ -646,8 +659,9 @@ public:
     TActorId ResourceInfoExchanger = TActorId();
 
     absl::flat_hash_map<std::pair<TString, TString>, TIntrusivePtr<TMemoryResource>, THash<std::pair<TString, TString>>> MemoryNamedPools;
-    // Persistent sensor registry; entries are created once and never deleted; guarded by Lock
+    // Survives pool idleness, capped at MAX_POOL_SENSOR_ENTRIES, guarded by Lock
     std::unordered_map<std::pair<TString, TString>, TPoolSensors, THash<std::pair<TString, TString>>> PoolSensorRegistry;
+    NMonitoring::TDynamicCounters::TCounterPtr PoolSensorsCapped;
 };
 
 struct TResourceManagers {

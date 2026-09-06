@@ -342,6 +342,7 @@ public:
         UNIT_TEST(P14PoolSensorsPersistAcrossIdle);
         UNIT_TEST(P15PoolSensorsAppearAfterFlagEnabled);
         UNIT_TEST(P16MonPageListsIdlePool);
+        UNIT_TEST(P17PoolSensorRegistryCapped);
     UNIT_TEST_SUITE_END();
 
     void SingleTask();
@@ -364,6 +365,7 @@ public:
     void P14PoolSensorsPersistAcrossIdle();
     void P15PoolSensorsAppearAfterFlagEnabled();
     void P16MonPageListsIdlePool();
+    void P17PoolSensorRegistryCapped();
 
 private:
     THolder<TTestBasicRuntime> Runtime;
@@ -916,7 +918,6 @@ void KqpRm::P16MonPageListsIdlePool() {
     NKikimr::TActorSystemStub stub;
     auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
 
-    // Pool = 10% of 1000 = 100; chunk = 40
     constexpr double poolPercent = 10;
     constexpr ui64 chunk = 40;
     NRm::TKqpResourcesRequest req{.Memory = chunk};
@@ -924,7 +925,7 @@ void KqpRm::P16MonPageListsIdlePool() {
     {
         auto tx = MakePoolTx(1, rm, "pool_idle", poolPercent);
         UNIT_ASSERT(rm->AllocateResources(*tx, 1, req));
-        rm->FreeResources(*tx, 1, req); // pool record erased (used==0)
+        rm->FreeResources(*tx, 1, req);
     }
 
     auto liveTx = MakePoolTx(2, rm, "pool_live", poolPercent);
@@ -936,6 +937,35 @@ void KqpRm::P16MonPageListsIdlePool() {
 
     const size_t live = page.find("<td>pool_live</td>");
     UNIT_ASSERT_VALUES_EQUAL(page.find("<td>pool_live</td>", live + 1), TString::npos);
+}
+
+void KqpRm::P17PoolSensorRegistryCapped() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    constexpr double poolPercent = 10;
+    NRm::TKqpResourcesRequest req{.Memory = 1};
+
+    for (size_t i = 0; i < NRm::MAX_POOL_SENSOR_ENTRIES; ++i) {
+        auto tx = MakePoolTx(i + 1, rm, TStringBuilder() << "pool_" << i, poolPercent);
+        UNIT_ASSERT(rm->AllocateResources(*tx, 1, req));
+        rm->FreeResources(*tx, 1, req);
+    }
+
+    auto capped = GetServiceCounters(Counters, "kqp")->GetCounter("RM/PoolSensorsCapped", true);
+    UNIT_ASSERT_VALUES_EQUAL(capped->Val(), 0);
+
+    auto overflowTx = MakePoolTx(1'000'001, rm, "pool_over_cap", poolPercent);
+    UNIT_ASSERT(rm->AllocateResources(*overflowTx, 1, req));
+    UNIT_ASSERT(!FindPoolSensorGroup("db1", "pool_over_cap"));
+    UNIT_ASSERT_VALUES_EQUAL(capped->Val(), 1);
+
+    auto knownTx = MakePoolTx(1'000'002, rm, "pool_0", poolPercent);
+    UNIT_ASSERT(rm->AllocateResources(*knownTx, 1, req));
+    UNIT_ASSERT_VALUES_EQUAL(GetPoolSensorGroup("db1", "pool_0")->GetCounter("MemoryAllocated", false)->Val(), 1);
+
+    UNIT_ASSERT_STRING_CONTAINS(RenderRmMonPage(), "<td>db1</td><td>pool_over_cap</td><td>100</td><td>1</td><td>0</td>");
 }
 
 } // namespace NKqp
