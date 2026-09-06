@@ -32,10 +32,11 @@ bool TSyncPointLimitControl::DrainToLimit() {
         nextInHeap = TSourceIterator(Collection->GetNextSource());
     }
 
-    while (FilledIterators.size() &&
-           (!nextInHeap || FilledIterators.front().ComparePrefix(*nextInHeap, *PKPrefixSize) == std::partial_ordering::less) &&
-           (!UnfilledIterators.size() ||
-               FilledIterators.front().ComparePrefix(UnfilledIterators.front(), *PKPrefixSize) == std::partial_ordering::less)) {
+    const auto notGreater = [](const std::partial_ordering cmp) {
+        return cmp == std::partial_ordering::less || cmp == std::partial_ordering::equivalent;
+    };
+    while (FilledIterators.size() && (!nextInHeap || notGreater(FilledIterators.front().ComparePrefix(*nextInHeap, *PKPrefixSize))) &&
+           (!UnfilledIterators.size() || notGreater(FilledIterators.front().ComparePrefix(UnfilledIterators.front(), *PKPrefixSize)))) {
         std::pop_heap(FilledIterators.begin(), FilledIterators.end());
 
         if (!FilledIterators.back().Next()) {
