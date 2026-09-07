@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ydb/core/protos/table_service_config.pb.h>
+#include <ydb/core/resource_pools/resource_pool_settings.h>
 #include <ydb/core/kqp/common/simple/kqp_event_ids.h>
 #include <ydb/core/kqp/counters/kqp_counters.h>
 #include <yql/essentials/minikql/computation/mkql_computation_pattern_cache.h>
@@ -88,6 +89,11 @@ public:
         return std::make_pair(Database, PoolId);
     }
 
+    bool HasMemoryPoolLimit() const {
+        return !PoolId.empty() && PoolId != NResourcePool::DEFAULT_POOL_ID
+            && MemoryPoolPercent > 0 && MemoryPoolPercent < 100;
+    }
+
     // Node level memory availability of this tx: the minimum over the node total and the pool resource,
     // see TMemoryResourceCookie. Unlimited until the first successful allocation assigns the cookies.
     i64 GetMemoryAvailability() const {
@@ -122,7 +128,7 @@ public:
 
         if (!PoolId.empty()) {
             res << ", PoolId: " << PoolId
-                << ", MemoryPoolPercent: " << Sprintf("%.2f", MemoryPoolPercent > 0 ? MemoryPoolPercent : 100);
+                << ", MemoryPoolPercent: " << Sprintf("%.2f", MemoryPoolPercent);
         }
 
         if (CollectBacktrace) {
