@@ -72,6 +72,9 @@ message TTableServiceConfig {
         // Off: the operators use the allocator heuristics only. Takes effect once the operators consult the
         // bound quota (the operator side of the RFC); until then the flag only binds the quota.
         optional bool EnableOperatorMemoryQuota = 34 [default = false];
+
+        // Give a query that only prepays ExternalMemory its memory availability cookies (35 is reserved elsewhere)
+        optional bool EnablePoolMemoryQuota = 36 [default = false];
     }
 
     message TSpillingServiceConfig {
