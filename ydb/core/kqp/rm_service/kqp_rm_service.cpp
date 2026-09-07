@@ -928,7 +928,7 @@ private:
 
         // Report fresh consumption on every MC tick (~1s) so MC sees up-to-date QE usage
         if (ResourceManager->MemoryConsumer) {
-            ResourceManager->MemoryConsumer->SetConsumption(TAlignedPagePool::GetGlobalPagePoolSize());
+            ResourceManager->MemoryConsumer->SetConsumption(Max<i64>(0, GetTotalMmapedBytes()));
         }
 
         with_lock (ResourceManager->Lock) {
@@ -1185,7 +1185,7 @@ private:
         ResourceManager->PublishScheduled.clear();
 
         if (ResourceManager->MemoryConsumer) {
-            ResourceManager->MemoryConsumer->SetConsumption(TAlignedPagePool::GetGlobalPagePoolSize());
+            ResourceManager->MemoryConsumer->SetConsumption(Max<i64>(0, GetTotalMmapedBytes()));
         }
 
         NKikimrKqp::TKqpNodeResources payload;
