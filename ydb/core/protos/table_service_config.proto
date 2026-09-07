@@ -68,6 +68,9 @@ message TTableServiceConfig {
         // (RFC dq_memory_quota_20): optional memory requests before growth, numeric memory availability
         // instead of the allocator yellow zone, explicit give-back. Off: allocator heuristics only.
         optional bool EnableOperatorMemoryQuota = 34 [default = false];
+
+        // Give a query that only prepays ExternalMemory its memory availability cookies (35 is reserved elsewhere)
+        optional bool EnablePoolMemoryQuota = 36 [default = false];
     }
 
     message TSpillingServiceConfig {
