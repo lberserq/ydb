@@ -288,6 +288,9 @@ public:
 
     TMemoryResourceCookies GetMemoryResourceCookies(const TString& database, const TString& poolId, double memoryPoolPercent) override {
         TMemoryResourceCookies cookies;
+        if (!EnablePoolMemoryQuota.load()) {
+            return cookies;
+        }
         with_lock (Lock) {
             cookies.Total = TotalMemoryResource->GetSpillingCookie();
             if (IsMemoryPoolLimited(poolId, memoryPoolPercent)) {
@@ -308,6 +311,7 @@ public:
         }
         return it->second;
     }
+
 
     TKqpRMAllocateResult AllocateResources(TTxState& tx, ui64 taskId, const TKqpResourcesRequest& resources) override
     {
@@ -453,6 +457,7 @@ public:
         if (resources.Memory > 0) {
             with_lock (Lock) {
                 TotalMemoryResource->Release(resources.Memory);
+
                 if (tx.HasMemoryPoolLimit()) {
                     auto it = MemoryNamedPools.find(tx.MakePoolId());
                     if (it != MemoryNamedPools.end()) {
@@ -587,6 +592,7 @@ public:
         for (auto& [poolKey, poolMemory] : MemoryNamedPools) {
             poolMemory->SetOverPercent(TotalMemoryResource->GetOverPercent());
         }
+        EnablePoolMemoryQuota.store(config.GetEnablePoolMemoryQuota());
         MaxNonParallelTopStageExecutionLimit.store(config.GetMaxNonParallelTopStageExecutionLimit());
         MaxNonParallelTasksExecutionLimit.store(config.GetMaxNonParallelTasksExecutionLimit());
         PreferLocalDatacenterExecution.store(config.GetPreferLocalDatacenterExecution());
@@ -656,6 +662,7 @@ public:
     // limits (guarded by Lock)
     std::atomic<i32> ExecutionUnitsResource;
     std::atomic<i32> ExecutionUnitsLimit;
+    std::atomic<bool> EnablePoolMemoryQuota = false;
     TIntrusivePtr<TMemoryResource> TotalMemoryResource;
     std::atomic<ui64> ExternalDataQueryMemory = 0;
     std::atomic<ui64> MaxNonParallelTopStageExecutionLimit = 1;
