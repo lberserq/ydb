@@ -12,14 +12,25 @@
 
 namespace NKikimr::NKqp {
 
+namespace {
+
+// bytes = requested bytes (memorySize), not the aligned shortfall
+void RecordOptionalQuotaDenied(const TIntrusivePtr<TKqpCounters>& counters, ui64 bytes) {
+    if (!counters) return;
+    counters->RmOptionalQuotaDenied->Inc();
+    *counters->RmOptionalQuotaDeniedBytes += bytes;
+}
+
+} // namespace
+
 // for CA/task, is NOT thread safe
 
 struct TMemoryQuotaManager : public NYql::NDq::TGuaranteeQuotaManager {
 
-    TMemoryQuotaManager(std::shared_ptr<NRm::IKqpResourceManager> resourceManager
-        , TIntrusivePtr<NRm::TTxState> tx
-        , ui64 taskId
-        , ui64 limit)
+    TMemoryQuotaManager(std::shared_ptr<NRm::IKqpResourceManager> resourceManager,
+            TIntrusivePtr<NRm::TTxState> tx,
+            ui64 taskId,
+            ui64 limit)
     : NYql::NDq::TGuaranteeQuotaManager(limit, limit)
     , ResourceManager(std::move(resourceManager))
     , Tx(std::move(tx))
@@ -32,6 +43,16 @@ struct TMemoryQuotaManager : public NYql::NDq::TGuaranteeQuotaManager {
             .Memory = Limit - Guarantee,
             .ExternalMemory = Guarantee,
         });
+    }
+
+    bool AllocateQuota(ui64 memorySize, bool isOptional) override {
+        bool ok = TGuaranteeQuotaManager::AllocateQuota(memorySize, isOptional);
+        // an RM/pool refusal also bumps the pool's MemoryDeniedRequests — do not sum the two;
+        // advance refusals (TChannelQuotaManager) bump only RM/OptionalQuotaDenied
+        if (!ok && isOptional) {
+            RecordOptionalQuotaDenied(ResourceManager->GetCounters(), memorySize);
+        }
+        return ok;
     }
 
     bool AllocateExtraQuota(ui64 extraSize) override {
@@ -55,8 +76,8 @@ struct TMemoryQuotaManager : public NYql::NDq::TGuaranteeQuotaManager {
         ResourceManager->FreeResources(*Tx, TaskId, NRm::TKqpResourcesRequest{.Memory = extraSize});
     }
 
-    bool IsReasonableToUseSpilling() const override {
-        return Tx->IsReasonableToStartSpilling();
+    i64 GetExtraMemoryAvailability() const override {
+        return Tx->GetMemoryAvailability();
     }
 
     TString MemoryConsumptionDetails() const override {
@@ -77,9 +98,9 @@ NYql::NDq::IMemoryQuotaManager::TPtr CreateTaskQuotaManager(std::shared_ptr<NRm:
 
 struct TChannelQuotaManager : public NYql::NDq::IMemoryQuotaManager {
 
-    TChannelQuotaManager(std::shared_ptr<NRm::IKqpResourceManager> resourceManager
-        , TIntrusivePtr<NRm::TTxState> tx
-        , ui64 limit, ui64 step = 1_MB)
+    TChannelQuotaManager(std::shared_ptr<NRm::IKqpResourceManager> resourceManager,
+            TIntrusivePtr<NRm::TTxState> tx,
+            ui64 limit, ui64 step = 1_MB)
     : ResourceManager(std::move(resourceManager))
     , Tx(std::move(tx))
     , AvailableQuota(limit)
@@ -95,13 +116,20 @@ struct TChannelQuotaManager : public NYql::NDq::IMemoryQuotaManager {
         });
     }
 
-    bool AllocateQuota(ui64 memorySize) override {
+    bool AllocateQuota(ui64 memorySize, bool isOptional) override {
         i64 quota = AvailableQuota.fetch_sub(memorySize);
 
         if (static_cast<i64>(memorySize) > quota) {
             ui64 memoryRequired = memorySize - quota;
             memoryRequired += AllocationStep - 1;
             memoryRequired &= ~(AllocationStep - 1);
+
+            if (isOptional && Tx->GetMemoryAvailability() < static_cast<i64>(memoryRequired)) {
+                // refuse optional requests in advance, no resource manager round trip
+                AvailableQuota.fetch_add(memorySize);
+                RecordOptionalQuotaDenied(ResourceManager->GetCounters(), memorySize); // requested bytes
+                return false;
+            }
 
             auto result = ResourceManager->AllocateResources(*Tx, 0, NRm::TKqpResourcesRequest{.Memory = memoryRequired});
             if (result) {
@@ -115,6 +143,9 @@ struct TChannelQuotaManager : public NYql::NDq::IMemoryQuotaManager {
                     {"memory", memoryRequired});
                 if (memoryRequired >= AllocationStep * 10) {
                     AvailableQuota.fetch_add(memorySize);
+                    if (isOptional) {
+                        RecordOptionalQuotaDenied(ResourceManager->GetCounters(), memorySize); // requested bytes
+                    }
                     return false;
                 }
             }
@@ -124,10 +155,12 @@ struct TChannelQuotaManager : public NYql::NDq::IMemoryQuotaManager {
         return true;
     }
 
-    // Node level memory pressure signal, see NRm::TTxState::IsReasonableToStartSpilling.
-    // Channels do not spill on it, but propagate it as back pressure, see TInputDescriptor::MemoryPressure
-    bool IsReasonableToUseSpilling() const override {
-        return Tx->IsReasonableToStartSpilling();
+    // Node level memory availability of the tx (see NRm::TTxState::GetMemoryAvailability) plus the locally
+    // prepaid quota. Channels do not spill on a negative value, but propagate it as back pressure,
+    // see TInputDescriptor::MemoryPressure. A negative node value is never masked by the prepaid quota.
+    i64 GetMemoryAvailability() const override {
+        const i64 tx = Tx->GetMemoryAvailability();
+        return tx < 0 ? tx : NYql::NDq::AddMemoryAvailability(AvailableQuota.load(), tx);
     }
 
     void FreeQuota(ui64 memorySize) override {
