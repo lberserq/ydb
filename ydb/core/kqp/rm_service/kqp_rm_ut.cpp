@@ -181,16 +181,25 @@ public:
         WaitForBootstrap();
     }
 
-    void SetSpillingPercent(double spillingPercent) {
-        auto config = MakeKqpResourceManagerConfig();
-        config.SetSpillingPercent(spillingPercent);
-
+    void ApplyResourceManagerConfig(const NKikimrConfig::TTableServiceConfig::TResourceManager& config) {
         auto request = MakeHolder<NConsole::TEvConsole::TEvConfigNotificationRequest>();
         request->Record.MutableConfig()->MutableTableServiceConfig()->MutableResourceManager()->CopyFrom(config);
 
         auto edge = Runtime->AllocateEdgeActor();
         Runtime->Send(new IEventHandle(ResourceManagers.front(), edge, request.Release()), 0, true);
         Runtime->GrabEdgeEvent<NConsole::TEvConsole::TEvConfigNotificationResponse>(edge);
+    }
+
+    void SetSpillingPercent(double spillingPercent) {
+        auto config = MakeKqpResourceManagerConfig();
+        config.SetSpillingPercent(spillingPercent);
+        ApplyResourceManagerConfig(config);
+    }
+
+    void SetEnablePoolMemoryQuota(bool enable) {
+        auto config = MakeKqpResourceManagerConfig();
+        config.SetEnablePoolMemoryQuota(enable);
+        ApplyResourceManagerConfig(config);
     }
 
     void AssertResourceBrokerSensors(i64 cpu, i64 mem, i64 enqueued, std::optional<i64> finished, i64 infly) {
@@ -322,6 +331,8 @@ public:
         UNIT_TEST(PoolLimitIgnoredForSenselessPercents);
         UNIT_TEST(PoolLimitAppliedJustBelowHundredPercent);
         UNIT_TEST(SpillingPercentAppliedWithoutPoolLimit);
+        UNIT_TEST(MemoryCookiesAssignedWithoutExtraAllocation);
+        UNIT_TEST(PoolMemoryCookieSurvivesUnrelatedFree);
     UNIT_TEST_SUITE_END();
 
     void SingleTask();
@@ -354,6 +365,8 @@ public:
     void PoolLimitIgnoredForSenselessPercents();
     void PoolLimitAppliedJustBelowHundredPercent();
     void SpillingPercentAppliedWithoutPoolLimit();
+    void MemoryCookiesAssignedWithoutExtraAllocation();
+    void PoolMemoryCookieSurvivesUnrelatedFree();
 
 private:
     THolder<TTestBasicRuntime> Runtime;
@@ -586,6 +599,7 @@ void KqpRm::ConcurrentTasks() {
 void KqpRm::ConcurrentChannels() {
     StartRms();
     NKikimr::TActorSystemStub stub;
+    SetEnablePoolMemoryQuota(true);
 
     auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
 
@@ -651,6 +665,7 @@ void KqpRm::ConcurrentChannels() {
 void KqpRm::MemoryAvailability() {
     StartRms();
     NKikimr::TActorSystemStub stub;
+    SetEnablePoolMemoryQuota(true);
 
     auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
 
@@ -682,6 +697,7 @@ void KqpRm::MemoryAvailability() {
 void KqpRm::PoolMemoryAvailability() {
     StartRms();
     NKikimr::TActorSystemStub stub;
+    SetEnablePoolMemoryQuota(true);
 
     auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
 
@@ -713,6 +729,7 @@ void KqpRm::PoolMemoryAvailability() {
 void KqpRm::PoolMemoryAvailabilityAfterRelease() {
     StartRms();
     NKikimr::TActorSystemStub stub;
+    SetEnablePoolMemoryQuota(true);
 
     auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
 
@@ -749,6 +766,7 @@ void KqpRm::PoolMemoryAvailabilityAfterRelease() {
 void KqpRm::PoolLimitFollowsAllocatingTx() {
     StartRms();
     NKikimr::TActorSystemStub stub;
+    SetEnablePoolMemoryQuota(true);
 
     auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
 
@@ -778,6 +796,7 @@ void KqpRm::PoolLimitFollowsAllocatingTx() {
 void KqpRm::PoolReleaseMirrorsAcquire() {
     StartRms();
     NKikimr::TActorSystemStub stub;
+    SetEnablePoolMemoryQuota(true);
 
     auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
 
@@ -809,6 +828,7 @@ void KqpRm::PoolReleaseMirrorsAcquire() {
 void KqpRm::SpillingPercentReconfigure() {
     StartRms();
     NKikimr::TActorSystemStub stub;
+    SetEnablePoolMemoryQuota(true);
 
     auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
 
@@ -856,6 +876,7 @@ void KqpRm::SpillingPercentReconfigure() {
 void KqpRm::TotalLimitReconfigure() {
     StartRms();
     NKikimr::TActorSystemStub stub;
+    SetEnablePoolMemoryQuota(true);
 
     auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
 
@@ -897,6 +918,7 @@ void KqpRm::TotalLimitReconfigure() {
 void KqpRm::TaskQuotaManagerOptional() {
     StartRms();
     NKikimr::TActorSystemStub stub;
+    SetEnablePoolMemoryQuota(true);
 
     auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
 
@@ -1250,6 +1272,7 @@ void KqpRm::PoolLimitAppliedJustBelowHundredPercent() {
 void KqpRm::SpillingPercentAppliedWithoutPoolLimit() {
     StartRms();
     NKikimr::TActorSystemStub stub;
+    SetEnablePoolMemoryQuota(true);
 
     auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
 
@@ -1270,5 +1293,85 @@ void KqpRm::SpillingPercentAppliedWithoutPoolLimit() {
     AssertResourceManagerStats(rm, 1000, 100);
 }
 
+// A query that only prepays ExternalMemory sees an unlimited availability until EnablePoolMemoryQuota
+void KqpRm::MemoryCookiesAssignedWithoutExtraAllocation() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    {
+        auto tx = MakePoolTx(1, rm, /* memoryPoolPercent = */ 50);
+        UNIT_ASSERT(rm->AllocateResources(*tx, 0,
+            NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .ExternalMemory = 100}));
+
+        UNIT_ASSERT(!tx->TotalMemoryCookie);
+        UNIT_ASSERT(!tx->PoolMemoryCookie);
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), std::numeric_limits<i64>::max());
+        UNIT_ASSERT(!(tx->GetMemoryAvailability() < 0));
+    }
+
+    SetEnablePoolMemoryQuota(true);
+
+    {
+        auto tx = MakePoolTx(2, rm, /* memoryPoolPercent = */ 50);
+        UNIT_ASSERT(rm->AllocateResources(*tx, 0,
+            NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .ExternalMemory = 100}));
+
+        UNIT_ASSERT(tx->TotalMemoryCookie);
+        UNIT_ASSERT(tx->PoolMemoryCookie);
+        // node threshold at 800 used, pool limit 500 with its own threshold at 400 used
+        UNIT_ASSERT_VALUES_EQUAL(tx->TotalMemoryCookie->MemoryAvailability.load(), 800);
+        UNIT_ASSERT_VALUES_EQUAL(tx->PoolMemoryCookie->MemoryAvailability.load(), 400);
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 400);
+        UNIT_ASSERT(!(tx->GetMemoryAvailability() < 0));
+
+        auto other = MakeTx(3, rm);
+        UNIT_ASSERT(rm->AllocateResources(*other, 3, NRm::TKqpResourcesRequest{.Memory = 750}));
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 50); // the node is binding now
+
+        UNIT_ASSERT(rm->AllocateResources(*other, 3, NRm::TKqpResourcesRequest{.Memory = 100}));
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), -50);
+        UNIT_ASSERT(tx->GetMemoryAvailability() < 0);
+
+        rm->FreeResources(*other, 3, NRm::TKqpResourcesRequest{.Memory = 850});
+    }
+
+    AssertResourceManagerStats(rm, 1000, 100);
+}
+
+// Another query draining the pool to zero must not cost a holder its live pool signal
+void KqpRm::PoolMemoryCookieSurvivesUnrelatedFree() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+    SetEnablePoolMemoryQuota(true);
+
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    {
+        auto prepaid = MakePoolTx(1, rm, /* memoryPoolPercent = */ 50);
+        UNIT_ASSERT(rm->AllocateResources(*prepaid, 0,
+            NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .ExternalMemory = 100}));
+        UNIT_ASSERT(prepaid->PoolMemoryCookie);
+
+        auto other = MakePoolTx(2, rm, /* memoryPoolPercent = */ 50);
+        UNIT_ASSERT(rm->AllocateResources(*other, 2, NRm::TKqpResourcesRequest{.Memory = 100}));
+        rm->FreeResources(*other, 2, NRm::TKqpResourcesRequest{.Memory = 100});
+
+        // pool limit 500 with its threshold at 400 used, and the pool is empty again
+        UNIT_ASSERT_VALUES_EQUAL(prepaid->PoolMemoryCookie->MemoryAvailability.load(), 400);
+        UNIT_ASSERT_VALUES_EQUAL(prepaid->GetMemoryAvailability(), 400);
+
+        UNIT_ASSERT(rm->AllocateResources(*prepaid, 0, NRm::TKqpResourcesRequest{.Memory = 450}));
+        UNIT_ASSERT_VALUES_EQUAL(prepaid->GetMemoryAvailability(), -50);
+        UNIT_ASSERT(prepaid->GetMemoryAvailability() < 0);
+
+        rm->FreeResources(*prepaid, 0, NRm::TKqpResourcesRequest{.Memory = 450});
+    }
+
+    AssertResourceManagerStats(rm, 1000, 100);
+}
+
+// Once no transaction holds its cookie the record goes, so the next one is built from the current config
 } // namespace NKqp
 } // namespace NKikimr
