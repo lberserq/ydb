@@ -112,7 +112,7 @@ def _init_stress_utils():
         'IncrementalBackup': {
             'args': [
                 "--endpoint", "grpc://{node_host}:2135",
-                "--backup-interval", "20"
+                "--backup-interval", "200"
             ],
             'local_path': 'ydb/tests/stress/backup/backup_stress'
         },

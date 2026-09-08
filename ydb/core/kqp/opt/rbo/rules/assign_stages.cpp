@@ -14,8 +14,9 @@ using namespace NKikimr::NKqp;
 
 void FinalizeJoinPhysicalProps(TOpJoin& join, const TRBOContext& rboCtx) {
     auto& props = join.Props;
+    const auto& config = *rboCtx.KqpCtx.Config;
     if (!props.JoinAlgo.has_value()) {
-        const auto joinMode = rboCtx.KqpCtx.Config->GetHashJoinMode();
+        const auto joinMode = config.GetHashJoinMode();
         switch (joinMode) {
             case NYql::NDq::EHashJoinMode::Map: {
                 props.JoinAlgo = EJoinAlgoType::MapJoin;
@@ -29,8 +30,16 @@ void FinalizeJoinPhysicalProps(TOpJoin& join, const TRBOContext& rboCtx) {
     }
 
     const auto joinKind = GetValidJoinKind(join.JoinKind);
+    if (joinKind == "Cross") {
+        props.UseBlockHashJoin = config.GetUseBlockHashJoin() && config.GetUseBlockHashJoinForCross();
+        if (props.UseBlockHashJoin) {
+            props.JoinAlgo = EJoinAlgoType::GraceJoin;
+        }
+        return;
+    }
+
     const auto joinAlgo = *props.JoinAlgo;
-    props.UseBlockHashJoin = rboCtx.KqpCtx.Config->GetUseBlockHashJoin()
+    props.UseBlockHashJoin = config.GetUseBlockHashJoin()
         && (joinAlgo == EJoinAlgoType::GraceJoin || joinAlgo == EJoinAlgoType::ReverseBlockJoin)
         && (joinKind == "Inner" || joinKind == "Left" || joinKind == "LeftSemi" || joinKind == "LeftOnly");
 }
@@ -206,10 +215,10 @@ bool TAssignStagesRule::MatchAndApply(TIntrusivePtr<IOperator>& input, TRBOConte
 
         const auto newStageId = props.StageGraph.AddStage();
         aggregate->Props.StageId = newStageId;
-        if (!aggregate->KeyColumns.empty()) {
-            auto connection = MakeIntrusive<TShuffleConnection>(aggregate->KeyColumns, outputIndex);
-
-            props.StageGraph.Connect(inputStageId, newStageId, std::move(connection));
+        if (CanEliminateAggregateShuffle(*aggregate, ctx)) {
+            props.StageGraph.Connect(inputStageId, newStageId, MakeIntrusive<TMapConnection>(outputIndex));
+        } else if (!aggregate->KeyColumns.empty()) {
+            props.StageGraph.Connect(inputStageId, newStageId, MakeIntrusive<TShuffleConnection>(aggregate->KeyColumns, outputIndex));
         } else {
             props.StageGraph.Connect(inputStageId, newStageId, MakeIntrusive<TUnionAllConnection>(outputIndex));
         }
@@ -262,8 +271,20 @@ bool TAssignStagesRule::MatchAndApply(TIntrusivePtr<IOperator>& input, TRBOConte
         Y_ENSURE(lookup->IsSingleConsumer(), "A table lookup in join mode must feed only its lookup join");
         input->Props.StageId = *lookup->Props.StageId;
         YQL_CLOG(TRACE, CoreDq) << "Assign stages index lookup join";
-    } else {
-        Y_ENSURE(false, "Unknown operator encountered");
+    } else if (input->Kind == EOperator::TableEffect) {
+        auto tableEffect = CastOperator<TOpTableEffect>(input);
+
+        const auto newStageId = props.StageGraph.AddSinkStage(tableEffect->BuildSettings(ctx.ExprCtx));
+        const auto inputStageId = *(tableEffect->GetInput()->Props.StageId);
+        const auto outputIndex = props.StageGraph.GetOutputIndex(inputStageId);
+
+        input->Props.StageId = newStageId;
+        props.StageGraph.Connect(inputStageId, newStageId,
+                                 MakeIntrusive<TUnionAllConnection>(outputIndex));
+        YQL_CLOG(TRACE, CoreDq) << "Assign stages table effects";
+    }
+    else {
+        Y_ENSURE(false, TStringBuilder() << "Unknown operator encountered: " << input->GetExplainName());
     }
 
     return true;
