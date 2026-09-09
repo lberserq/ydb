@@ -60,6 +60,7 @@ public:
     const TString PoolId;
     const double MemoryPoolPercent;
     const TString Database;
+    const bool MemoryPoolLimited;
     const bool CollectBacktrace;
     TIntrusivePtr<TMemoryResourceCookie> TotalMemoryCookie;
     TIntrusivePtr<TMemoryResourceCookie> PoolMemoryCookie;
@@ -90,8 +91,7 @@ public:
     }
 
     bool HasMemoryPoolLimit() const {
-        return !PoolId.empty() && PoolId != NResourcePool::DEFAULT_POOL_ID
-            && MemoryPoolPercent > 0 && MemoryPoolPercent < 100;
+        return MemoryPoolLimited;
     }
 
     // Node level memory availability of this tx: the minimum over the node total and the pool resource,

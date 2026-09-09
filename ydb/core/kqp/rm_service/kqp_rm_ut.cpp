@@ -310,6 +310,7 @@ public:
         UNIT_TEST(PoolLimitNotReleasedByUnchargedQueryOnRollback);
         UNIT_TEST(PoolLimitNotChargedByHundredPercentQuery);
         UNIT_TEST(PoolLimitNotChargedForDefaultPool);
+        UNIT_TEST(PoolLimitIgnoredForSenselessPercents);
         UNIT_TEST(PoolLimitAppliedJustBelowHundredPercent);
         UNIT_TEST(SpillingPercentAppliedWithoutPoolLimit);
     UNIT_TEST_SUITE_END();
@@ -336,6 +337,7 @@ public:
     void PoolLimitNotReleasedByUnchargedQueryOnRollback();
     void PoolLimitNotChargedByHundredPercentQuery();
     void PoolLimitNotChargedForDefaultPool();
+    void PoolLimitIgnoredForSenselessPercents();
     void PoolLimitAppliedJustBelowHundredPercent();
     void SpillingPercentAppliedWithoutPoolLimit();
 
@@ -973,6 +975,30 @@ void KqpRm::PoolLimitNotChargedForDefaultPool() {
             NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .Memory = 400}));
         UNIT_ASSERT(!rm->AllocateResources(*overflowingTx, 3,
             NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .Memory = 1}));
+
+        AssertResourceManagerStats(rm, 0, 98);
+    }
+
+    AssertResourceManagerStats(rm, 1000, 100);
+}
+
+void KqpRm::PoolLimitIgnoredForSenselessPercents() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    {
+        auto nanTx = MakeTx(1, rm, "p", std::numeric_limits<double>::quiet_NaN());
+        auto overTx = MakeTx(2, rm, "p", 150);
+
+        UNIT_ASSERT(!nanTx->HasMemoryPoolLimit());
+        UNIT_ASSERT(!overTx->HasMemoryPoolLimit());
+
+        UNIT_ASSERT(rm->AllocateResources(*nanTx, 1,
+            NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .Memory = 600}));
+        UNIT_ASSERT(rm->AllocateResources(*overTx, 2,
+            NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .Memory = 400}));
 
         AssertResourceManagerStats(rm, 0, 98);
     }
