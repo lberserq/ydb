@@ -344,9 +344,6 @@ public:
                         auto it = MemoryNamedPools.find(tx.MakePoolId());
                         if (it != MemoryNamedPools.end()) {
                             it->second->Release(resources.Memory);
-                            if (it->second->GetUsed() == 0) {
-                                MemoryNamedPools.erase(it);
-                            }
                         }
                     }
                 }
@@ -413,9 +410,6 @@ public:
                     auto it = MemoryNamedPools.find(tx.MakePoolId());
                     if (it != MemoryNamedPools.end()) {
                         it->second->Release(resources.Memory);
-                        if (it->second->GetUsed() == 0) {
-                            MemoryNamedPools.erase(it);
-                        }
                     }
                 }
             }
