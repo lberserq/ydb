@@ -88,6 +88,11 @@ public:
         return Limit > Used ? Limit - Used : 0;
     }
 
+    // bytes left before the spilling threshold, negative when the threshold is exceeded
+    i64 GetMemoryAvailability() const {
+        return static_cast<i64>(Limit) - static_cast<i64>(Used) - static_cast<i64>(OverLimit);
+    }
+
     bool Has(ui64 amount) const {
         return Available() >= amount;
     }
@@ -106,7 +111,7 @@ public:
     }
 
     void UpdateCookie() {
-        SpillingCookie->SpillingPercentReached.store(Available() < OverLimit);
+        SpillingCookie->MemoryAvailability.store(GetMemoryAvailability());
     }
 
     ui64 GetUsed() const {
@@ -162,6 +167,9 @@ private:
 
     TIntrusivePtr<TMemoryResourceCookie> SpillingCookie;
 };
+
+using TMemoryNamedPools = absl::flat_hash_map<std::pair<TString, TString>, TIntrusivePtr<TMemoryResource>,
+    THash<std::pair<TString, TString>>>;
 
 struct TEvPrivate {
     enum EEv {
@@ -244,6 +252,30 @@ public:
         }
     }
 
+    // Lock must be held
+    TIntrusivePtr<TMemoryResource>& GetOrCreatePoolResource(const TTxState& tx) {
+        auto [it, success] = MemoryNamedPools.emplace(tx.MakePoolId(), nullptr);
+
+        if (success) {
+            it->second = MakeIntrusive<TMemoryResource>(TotalMemoryResource->GetLimit(), tx.MemoryPoolPercent, SpillingPercent.load());
+        } else {
+            it->second->SetNewLimit(TotalMemoryResource->GetLimit(), tx.MemoryPoolPercent, SpillingPercent.load());
+        }
+
+        return it->second;
+    }
+
+    // Lock must be held
+    void AssignMemoryCookies(TTxState& tx) {
+        if (!tx.TotalMemoryCookie) {
+            tx.TotalMemoryCookie = TotalMemoryResource->GetSpillingCookie();
+        }
+
+        if (tx.HasMemoryPoolLimit() && !tx.PoolMemoryCookie) {
+            tx.PoolMemoryCookie = GetOrCreatePoolResource(tx)->GetSpillingCookie();
+        }
+    }
+
     TKqpRMAllocateResult AllocateResources(TTxState& tx, ui64 taskId, const TKqpResourcesRequest& resources) override
     {
         const ui64 txId = tx.TxId;
@@ -263,6 +295,11 @@ public:
         }
 
         if (Y_UNLIKELY(resources.Memory == 0)) {
+            if (EnablePoolMemoryQuota.load()) {
+                with_lock (Lock) {
+                    AssignMemoryCookies(tx);
+                }
+            }
             tx.Allocated(resources);
             return result;
         }
@@ -296,15 +333,7 @@ public:
             }
 
             if (hasScanQueryMemory && tx.HasMemoryPoolLimit()) {
-                auto [it, success] = MemoryNamedPools.emplace(tx.MakePoolId(), nullptr);
-
-                if (success) {
-                    it->second = MakeIntrusive<TMemoryResource>(TotalMemoryResource->GetLimit(), tx.MemoryPoolPercent, SpillingPercent.load());
-                } else {
-                    it->second->SetNewLimit(TotalMemoryResource->GetLimit(), tx.MemoryPoolPercent, SpillingPercent.load());
-                }
-
-                auto& poolMemory = it->second;
+                auto& poolMemory = GetOrCreatePoolResource(tx);
                 if (!poolMemory->AcquireIfAvailable(resources.Memory)) {
                     hasScanQueryMemory = false;
                     TotalMemoryResource->Release(resources.Memory);
@@ -401,6 +430,7 @@ public:
         if (resources.Memory > 0) {
             with_lock (Lock) {
                 TotalMemoryResource->Release(resources.Memory);
+
                 if (tx.HasMemoryPoolLimit()) {
                     auto it = MemoryNamedPools.find(tx.MakePoolId());
                     if (it != MemoryNamedPools.end()) {
@@ -519,6 +549,7 @@ public:
         QueryMemoryLimit.store(config.GetQueryMemoryLimit());
         SpillingPercent.store(config.GetSpillingPercent());
         TotalMemoryResource->SetOverPercent(config.GetSpillingPercent());
+        EnablePoolMemoryQuota.store(config.GetEnablePoolMemoryQuota());
         MaxNonParallelTopStageExecutionLimit.store(config.GetMaxNonParallelTopStageExecutionLimit());
         MaxNonParallelTasksExecutionLimit.store(config.GetMaxNonParallelTasksExecutionLimit());
         PreferLocalDatacenterExecution.store(config.GetPreferLocalDatacenterExecution());
@@ -589,6 +620,7 @@ public:
     std::atomic<i32> ExecutionUnitsResource;
     std::atomic<i32> ExecutionUnitsLimit;
     std::atomic<double> SpillingPercent;
+    std::atomic<bool> EnablePoolMemoryQuota = false;
     TIntrusivePtr<TMemoryResource> TotalMemoryResource;
     std::atomic<ui64> ExternalDataQueryMemory = 0;
     std::atomic<ui64> MaxNonParallelTopStageExecutionLimit = 1;
@@ -608,7 +640,7 @@ public:
     std::shared_ptr<TResourceSnapshotState> ResourceSnapshotState;
     TActorId ResourceInfoExchanger = TActorId();
 
-    absl::flat_hash_map<std::pair<TString, TString>, TIntrusivePtr<TMemoryResource>, THash<std::pair<TString, TString>>> MemoryNamedPools;
+    TMemoryNamedPools MemoryNamedPools;
 };
 
 struct TResourceManagers {
