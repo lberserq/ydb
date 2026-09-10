@@ -1342,6 +1342,11 @@ void KqpRm::PoolLimitClearedOnRemoval() {
         UNIT_ASSERT_VALUES_EQUAL(tx->PoolMemoryCookie->MemoryAvailability.load(), std::numeric_limits<i64>::max());
         UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 800);
 
+        SendQueueConfig(2000);
+        UNIT_ASSERT_VALUES_EQUAL(tx->PoolMemoryCookie->MemoryAvailability.load(), std::numeric_limits<i64>::max());
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 1600);
+
+        SendQueueConfig(1000);
         SendToRm(new NRm::TEvPoolMemoryLimit("db-id", "pool", 30), NRm::TEvPoolMemoryLimit::EventType);
         UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 240);
     }
