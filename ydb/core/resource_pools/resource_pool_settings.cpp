@@ -5,6 +5,14 @@
 
 namespace NKikimr::NResourcePool {
 
+namespace {
+    constexpr double PERCENT_EPS = 1e-9;
+}
+
+ui64 PercentToBytes(TPercent percent, ui64 budget) {
+    return static_cast<double>(budget) / 100 * percent + PERCENT_EPS;
+}
+
 //// TPoolSettings::TParser
 
 void TPoolSettings::TParser::operator()(i32* setting) const {
