@@ -138,6 +138,14 @@ public:
         SetActualLimits();
     }
 
+    void SetNewBaseLimit(ui64 baseLimit) {
+        if (baseLimit == BaseLimit) {
+            return;
+        }
+        BaseLimit = baseLimit;
+        SetActualLimits();
+    }
+
     void SetOverPercent(double overPercent) {
         OverPercent = overPercent;
         SetActualLimits();
@@ -198,6 +206,7 @@ public:
         , ExecutionUnitsLimit(config.GetComputeActorsCount())
         , SpillingPercent(config.GetSpillingPercent())
         , TotalMemoryResource(MakeIntrusive<TMemoryResource>(config.GetQueryMemoryLimit(), (double)100, config.GetSpillingPercent()))
+        , NodeMemoryBaseLimit(config.GetQueryMemoryLimit())
         , ResourceSnapshotState(std::make_shared<TResourceSnapshotState>())
     {
         PublishAfterBootstrap.clear();
@@ -263,6 +272,26 @@ public:
         }
 
         return it->second;
+    }
+
+    // Lock must be held
+    void RecomputeAllPoolLimits() {
+        for (auto& [id, pool] : MemoryNamedPools) {
+            pool->SetNewBaseLimit(TotalMemoryResource->GetLimit());
+        }
+    }
+
+    void SetNodeMemoryLimit(ui64 bytes) {
+        if (NodeMemoryBaseLimit.load() == bytes) {
+            return;
+        }
+        with_lock (Lock) {
+            NodeMemoryBaseLimit.store(bytes);
+            TotalMemoryResource->SetNewLimit(bytes, (double)100, SpillingPercent.load());
+            if (EnablePoolMemoryQuota.load()) {
+                RecomputeAllPoolLimits();
+            }
+        }
     }
 
     // Lock must be held
@@ -622,6 +651,7 @@ public:
     std::atomic<double> SpillingPercent;
     std::atomic<bool> EnablePoolMemoryQuota = false;
     TIntrusivePtr<TMemoryResource> TotalMemoryResource;
+    std::atomic<ui64> NodeMemoryBaseLimit;
     std::atomic<ui64> ExternalDataQueryMemory = 0;
     std::atomic<ui64> MaxNonParallelTopStageExecutionLimit = 1;
     std::atomic<ui64> MaxNonParallelTasksExecutionLimit = 8;
@@ -813,9 +843,7 @@ private:
         auto& queueConfig = *ev->Get()->QueueConfig;
 
         if (queueConfig.GetLimit().GetMemory() > 0) {
-            with_lock (ResourceManager->Lock) {
-                ResourceManager->TotalMemoryResource->SetNewLimit(queueConfig.GetLimit().GetMemory(), (double)100, ResourceManager->SpillingPercent.load());
-            }
+            ResourceManager->SetNodeMemoryLimit(queueConfig.GetLimit().GetMemory());
             YDB_LOG_INFO("Total node memory for scan bytes",
                 {"queries", queueConfig.GetLimit().GetMemory()});
         }
