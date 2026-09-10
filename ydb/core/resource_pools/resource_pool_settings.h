@@ -13,6 +13,27 @@ inline constexpr char DEFAULT_POOL_ID[] = "default";
 
 inline constexpr i64 POOL_MAX_CONCURRENT_QUERY_LIMIT = 1000;
 
+using TPercent = double;
+
+// -1 (any negative, and NaN after normalization): no limit configured for this resource.
+inline bool IsPercentDisabled(TPercent percent) {
+    return !(percent >= 0);
+}
+
+// 0: a real limit of zero — the pool may hold nothing. Deliberately not the same as disabled.
+inline bool IsPercentHardZero(TPercent percent) {
+    return percent == 0;
+}
+
+// Bytes this percent grants out of budget. Precondition: !IsPercentDisabled(percent); 100 yields the whole budget.
+ui64 PercentToBytes(TPercent percent, ui64 budget);
+
+using TPoolKey = std::pair<TString, TString>;
+
+inline TPoolKey MakePoolKey(const TString& databaseId, const TString& poolId) {
+    return {databaseId, poolId};
+}
+
 struct TPoolSettings : public TSettingsBase {
     typedef double TPercent;
 
