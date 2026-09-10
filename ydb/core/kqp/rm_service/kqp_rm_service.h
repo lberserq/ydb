@@ -69,6 +69,7 @@ public:
     const TString PoolId;
     const double MemoryPoolPercent;
     const TString Database;
+    const TString DatabaseId;
     const bool MemoryPoolLimited;
     const bool CollectBacktrace;
     // Attached at construction and never written again, so that GetMemoryAvailability() can be read from any
@@ -94,12 +95,12 @@ public:
 
 public:
     TTxState(std::shared_ptr<IKqpResourceManager>& resourceManager, ui64 txId, TInstant now, const TString& poolId, const double memoryPoolPercent,
-        const TString& database, bool collectBacktrace);
+        const TString& database, const TString& databaseId, bool collectBacktrace);
     ~TTxState();
 
 private:
     TTxState(std::shared_ptr<IKqpResourceManager>& resourceManager, ui64 txId, TInstant now, const TString& poolId, const double memoryPoolPercent,
-        const TString& database, bool collectBacktrace, TMemoryResourceCookies cookies);
+        const TString& database, const TString& databaseId, bool collectBacktrace, TMemoryResourceCookies cookies);
 
 public:
     // The key of a resource pool in the resource manager, the one rule for the tx and for the cookie hand-out
@@ -109,7 +110,7 @@ public:
     }
 
     std::pair<TString, TString> MakePoolId() const {
-        return MakePoolId(Database, PoolId);
+        return std::make_pair(DatabaseId, PoolId);
     }
 
     bool HasMemoryPoolLimit() const {
@@ -311,7 +312,7 @@ public:
 
     // The spilling cookies for a new tx: the node total and, with a resource pool, the pool resource (created on
     // its first use). Called by the TTxState constructor, the cookies then stay with the tx for its whole life.
-    virtual TMemoryResourceCookies GetMemoryResourceCookies(const TString& database, const TString& poolId, double memoryPoolPercent) = 0;
+    virtual TMemoryResourceCookies GetMemoryResourceCookies(const TString& databaseId, const TString& poolId, double memoryPoolPercent) = 0;
 
     virtual TKqpRMAllocateResult AllocateResources(TTxState& tx, ui64 taskId, const TKqpResourcesRequest& resources) = 0;
 
