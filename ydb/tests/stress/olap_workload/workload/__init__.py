@@ -10,6 +10,7 @@ from ydb.tests.stress.olap_workload.workload.type.rename_tables import WorkloadR
 from ydb.tests.stress.olap_workload.workload.type.encodings import WorkloadEncodings
 from ydb.tests.stress.olap_workload.workload.type.cut_history import WorkloadCutHistory
 from ydb.tests.stress.olap_workload.workload.type.move_data import WorkloadMoveData
+from ydb.tests.stress.olap_workload.workload.type.decommission_ledger import WorkloadDecommissionLedger
 
 
 class WorkloadRunner:
@@ -71,3 +72,26 @@ class WorkloadRunner:
         for w in workloads:
             w.join()
         print("Waiting for stop... stopped")
+
+    def run_ledger(self, report_period=60):
+        """Run only the append-only ledger, report each period, then verify every acknowledged row."""
+        stop = threading.Event()
+        ledger = WorkloadDecommissionLedger(self.client, self.name, stop)
+        ledger.start()
+        started_at = time.time()
+        prev = ledger.snapshot()
+        while time.time() - started_at < self.duration:
+            time.sleep(report_period)
+            cur = ledger.snapshot()
+            m = ledger.phase_metrics(prev, cur)
+            stamp = time.strftime("%H:%M:%S", time.gmtime(cur[0]))
+            print(f"ledger {stamp} rows={m['rows']} rows_per_s={m['rows_per_s']:.1f} "
+                  f"p99_ms={m['p99_s'] * 1000:.0f} total={sum(cur[1])}", flush=True)
+            prev = cur
+        stop.set()
+        ledger.join()
+        errors = ledger.verify()
+        print(f"ledger rows verified: {sum(ledger.snapshot()[1])}, integrity errors: {len(errors)}", flush=True)
+        for e in errors[:20]:
+            print(f"\t{e}", flush=True)
+        return not errors
