@@ -209,6 +209,16 @@ public:
         Runtime->DispatchEvents(options);
     }
 
+    void SendQueueConfig(ui64 memory) {
+        auto ev = MakeHolder<TEvResourceBroker::TEvConfigResponse>();
+        ev->QueueConfig.ConstructInPlace();
+        ev->QueueConfig->MutableLimit()->SetMemory(memory);
+        Runtime->Send(new IEventHandle(ResourceManagers.front(), TActorId(), ev.Release()), 0, true);
+        TDispatchOptions options;
+        options.FinalEvents.emplace_back(TEvResourceBroker::EvConfigResponse, 1);
+        Runtime->DispatchEvents(options);
+    }
+
     void AssertResourceBrokerSensors(i64 cpu, i64 mem, i64 enqueued, std::optional<i64> finished, i64 infly) {
         auto q = Counters->GetSubgroup("queue", "queue_kqp_resource_manager");
         UNIT_ASSERT_VALUES_EQUAL(q->GetCounter("CPUConsumption")->Val(), cpu);
@@ -347,6 +357,8 @@ public:
         UNIT_TEST(PoolLimitClearedOnRemoval);
         UNIT_TEST(PoolLimitPushIgnoredWhenFlagOff);
         UNIT_TEST(PoolLimitClearedByOutOfRangePush);
+        UNIT_TEST(PoolLimitsFollowNodeTotal);
+        UNIT_TEST(PoolLimitsStayOnNodeTotalChangeWhenFlagOff);
     UNIT_TEST_SUITE_END();
 
     void SingleTask();
@@ -388,6 +400,8 @@ public:
     void PoolLimitClearedOnRemoval();
     void PoolLimitPushIgnoredWhenFlagOff();
     void PoolLimitClearedByOutOfRangePush();
+    void PoolLimitsFollowNodeTotal();
+    void PoolLimitsStayOnNodeTotalChangeWhenFlagOff();
 
 private:
     THolder<TTestBasicRuntime> Runtime;
@@ -1585,5 +1599,55 @@ void KqpRm::PoolLimitClearedByOutOfRangePush() {
     AssertResourceManagerStats(rm, 1000, 100);
 }
 
+void KqpRm::PoolLimitsFollowNodeTotal() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+    SetEnablePoolMemoryQuota(true);
+
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+    auto tx = MakePoolTx(1, rm, /* memoryPoolPercent = */ 50);
+    UNIT_ASSERT(rm->AllocateResources(*tx, 0,
+        NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .ExternalMemory = 100}));
+    UNIT_ASSERT_VALUES_EQUAL(tx->TotalMemoryCookie->MemoryAvailability.load(), 800);
+    UNIT_ASSERT_VALUES_EQUAL(tx->PoolMemoryCookie->MemoryAvailability.load(), 400);
+    UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 400);
+
+    SendQueueConfig(2000);
+    UNIT_ASSERT_VALUES_EQUAL(tx->TotalMemoryCookie->MemoryAvailability.load(), 1600);
+    UNIT_ASSERT_VALUES_EQUAL(tx->PoolMemoryCookie->MemoryAvailability.load(), 800);
+    UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 800);
+
+    SendQueueConfig(500);
+    UNIT_ASSERT_VALUES_EQUAL(tx->TotalMemoryCookie->MemoryAvailability.load(), 400);
+    UNIT_ASSERT_VALUES_EQUAL(tx->PoolMemoryCookie->MemoryAvailability.load(), 200);
+    UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 200);
+
+    SendQueueConfig(500);
+    UNIT_ASSERT_VALUES_EQUAL(tx->TotalMemoryCookie->MemoryAvailability.load(), 400);
+    UNIT_ASSERT_VALUES_EQUAL(tx->PoolMemoryCookie->MemoryAvailability.load(), 200);
+    UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 200);
+
+    UNIT_ASSERT(rm->AllocateResources(*tx, 0, NRm::TKqpResourcesRequest{.Memory = 100}));
+    UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 100);
+}
+
+void KqpRm::PoolLimitsStayOnNodeTotalChangeWhenFlagOff() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+    SetEnablePoolMemoryQuota(true);
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+    auto tx = MakePoolTx(1, rm, /* memoryPoolPercent = */ 50);
+    UNIT_ASSERT(rm->AllocateResources(*tx, 1,
+        NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .Memory = 100}));
+    UNIT_ASSERT_VALUES_EQUAL(tx->PoolMemoryCookie->MemoryAvailability.load(), 300);
+    UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 300);
+    SetEnablePoolMemoryQuota(false);
+    SendQueueConfig(2000);
+    UNIT_ASSERT_VALUES_EQUAL(tx->TotalMemoryCookie->MemoryAvailability.load(), 1500);
+    UNIT_ASSERT_VALUES_EQUAL(tx->PoolMemoryCookie->MemoryAvailability.load(), 300);
+    UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 300);
+}
+
+// Once no transaction holds its cookie the record goes, so the next one is built from the current config
 } // namespace NKqp
 } // namespace NKikimr
