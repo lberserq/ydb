@@ -44,19 +44,19 @@ static double NormalizePoolPercent(double percent) {
 
 // The rule of TTxState::MemoryPoolLimited, also needed before a TTxState exists (the cookie hand-out).
 // The percent must already be normalized.
-static bool IsMemoryPoolLimited(const TString& poolId, double memoryPoolPercent) {
-    return !poolId.empty() && poolId != NResourcePool::DEFAULT_POOL_ID
+static bool IsMemoryPoolLimited(const TString& databaseId, const TString& poolId, double memoryPoolPercent) {
+    return !databaseId.empty() && !poolId.empty() && poolId != NResourcePool::DEFAULT_POOL_ID
         && memoryPoolPercent > 0 && memoryPoolPercent < 100;
 }
 
 TTxState::TTxState(std::shared_ptr<IKqpResourceManager>& resourceManager, ui64 txId, TInstant now, const TString& poolId, const double memoryPoolPercent,
-    const TString& database, bool collectBacktrace)
-    : TTxState(resourceManager, txId, now, poolId, memoryPoolPercent, database, collectBacktrace,
-        resourceManager->GetMemoryResourceCookies(database, poolId, NormalizePoolPercent(memoryPoolPercent)))
+    const TString& database, const TString& databaseId, bool collectBacktrace)
+    : TTxState(resourceManager, txId, now, poolId, memoryPoolPercent, database, databaseId, collectBacktrace,
+        resourceManager->GetMemoryResourceCookies(databaseId, poolId, NormalizePoolPercent(memoryPoolPercent)))
 {}
 
 TTxState::TTxState(std::shared_ptr<IKqpResourceManager>& resourceManager, ui64 txId, TInstant now, const TString& poolId, const double memoryPoolPercent,
-    const TString& database, bool collectBacktrace, TMemoryResourceCookies cookies)
+    const TString& database, const TString& databaseId, bool collectBacktrace, TMemoryResourceCookies cookies)
     : ResourceManager(resourceManager)
     , Counters(resourceManager->GetCounters())
     , TxId(txId)
@@ -64,7 +64,9 @@ TTxState::TTxState(std::shared_ptr<IKqpResourceManager>& resourceManager, ui64 t
     , PoolId(poolId)
     , MemoryPoolPercent(NormalizePoolPercent(memoryPoolPercent))
     , Database(database)
-    , MemoryPoolLimited(IsMemoryPoolLimited(PoolId, MemoryPoolPercent))
+    , DatabaseId(databaseId)
+    , MemoryPoolLimited(!DatabaseId.empty() && !PoolId.empty() && PoolId != NResourcePool::DEFAULT_POOL_ID
+        && MemoryPoolPercent > 0 && MemoryPoolPercent < 100)
     , CollectBacktrace(collectBacktrace)
     , TotalMemoryCookie(std::move(cookies.Total))
     , PoolMemoryCookie(std::move(cookies.Pool))
@@ -286,15 +288,15 @@ public:
         }
     }
 
-    TMemoryResourceCookies GetMemoryResourceCookies(const TString& database, const TString& poolId, double memoryPoolPercent) override {
+    TMemoryResourceCookies GetMemoryResourceCookies(const TString& databaseId, const TString& poolId, double memoryPoolPercent) override {
         TMemoryResourceCookies cookies;
         if (!EnablePoolMemoryQuota.load()) {
             return cookies;
         }
         with_lock (Lock) {
             cookies.Total = TotalMemoryResource->GetSpillingCookie();
-            if (IsMemoryPoolLimited(poolId, memoryPoolPercent)) {
-                cookies.Pool = GetOrCreatePoolMemoryResource(TTxState::MakePoolId(database, poolId), memoryPoolPercent)->GetSpillingCookie();
+            if (IsMemoryPoolLimited(databaseId, poolId, memoryPoolPercent)) {
+                cookies.Pool = GetOrCreatePoolMemoryResource(TTxState::MakePoolId(databaseId, poolId), memoryPoolPercent)->GetSpillingCookie();
             }
         }
         return cookies;

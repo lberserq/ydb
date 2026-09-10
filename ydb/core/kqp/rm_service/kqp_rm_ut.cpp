@@ -223,12 +223,12 @@ public:
     }
 
     TIntrusivePtr<NRm::TTxState> MakeTx(ui64 txId, std::shared_ptr<NRm::IKqpResourceManager> rm,
-            const TString& poolId = "", double memoryPoolPercent = 100) {
-        return MakeIntrusive<NRm::TTxState>(rm, txId, TInstant::Now(), poolId, memoryPoolPercent, "", false);
+            const TString& poolId = "", double memoryPoolPercent = 100, const TString& databaseId = "db-id") {
+        return MakeIntrusive<NRm::TTxState>(rm, txId, TInstant::Now(), poolId, memoryPoolPercent, "", databaseId, false);
     }
 
     TIntrusivePtr<NRm::TTxState> MakePoolTx(ui64 txId, std::shared_ptr<NRm::IKqpResourceManager> rm, double memoryPoolPercent) {
-        return MakeIntrusive<NRm::TTxState>(rm, txId, TInstant::Now(), "pool", memoryPoolPercent, "db", false);
+        return MakeIntrusive<NRm::TTxState>(rm, txId, TInstant::Now(), "pool", memoryPoolPercent, "db", "db-id", false);
     }
 
     void AssertResourceManagerStats(
@@ -320,6 +320,8 @@ public:
         UNIT_TEST(PoolReleaseMirrorsAcquire);
         UNIT_TEST(SpillingPercentReconfigure);
         UNIT_TEST(TotalLimitReconfigure);
+        UNIT_TEST(PoolKeyedByDatabaseId);
+        UNIT_TEST(PoolNotLimitedWithoutDatabaseId);
         UNIT_TEST(TaskQuotaManagerOptional);
         UNIT_TEST(SnapshotSharingByExchanger);
         UNIT_TEST(NodesMembershipByExchanger);
@@ -352,6 +354,8 @@ public:
     void PoolReleaseMirrorsAcquire();
     void SpillingPercentReconfigure();
     void TotalLimitReconfigure();
+    void PoolKeyedByDatabaseId();
+    void PoolNotLimitedWithoutDatabaseId();
     void TaskQuotaManagerOptional();
     void SnapshotSharing();
     void SnapshotSharingByExchanger();
@@ -907,6 +911,56 @@ void KqpRm::TotalLimitReconfigure() {
         rm->FreeResources(*poolTx, 1, NRm::TKqpResourcesRequest{.Memory = 450});
     }
 
+    AssertResourceManagerStats(rm, 1000, 100);
+}
+
+void KqpRm::PoolKeyedByDatabaseId() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+
+    SetEnablePoolMemoryQuota(true);
+
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    auto txA = MakeIntrusive<NRm::TTxState>(
+        rm, ui64{1}, TInstant::Now(), "p", 50.0, "db", "id-a", false);
+    auto txB = MakeIntrusive<NRm::TTxState>(
+        rm, ui64{2}, TInstant::Now(), "p", 50.0, "db", "id-b", false);
+    const NRm::TKqpResourcesRequest requestA{.ExecutionUnits = 1, .Memory = 500};
+    const NRm::TKqpResourcesRequest requestB{.ExecutionUnits = 1, .Memory = 300};
+
+    UNIT_ASSERT(rm->AllocateResources(*txA, 1, requestA));
+    UNIT_ASSERT(rm->AllocateResources(*txB, 2, requestB));
+    UNIT_ASSERT(txB->PoolMemoryCookie);
+    UNIT_ASSERT_VALUES_EQUAL(txB->PoolMemoryCookie->MemoryAvailability.load(), 100);
+    UNIT_ASSERT(txB->TotalMemoryCookie);
+    UNIT_ASSERT_VALUES_EQUAL(txB->TotalMemoryCookie->MemoryAvailability.load(), 0);
+    UNIT_ASSERT_VALUES_EQUAL(txB->GetMemoryAvailability(), 0);
+
+    rm->FreeResources(*txA, 1, requestA);
+    rm->FreeResources(*txB, 2, requestB);
+    AssertResourceManagerStats(rm, 1000, 100);
+}
+
+void KqpRm::PoolNotLimitedWithoutDatabaseId() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+
+    SetEnablePoolMemoryQuota(true);
+
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+    auto tx = MakeIntrusive<NRm::TTxState>(
+        rm, ui64{1}, TInstant::Now(), "p", 50.0, "db", "", false);
+    const NRm::TKqpResourcesRequest request{.ExecutionUnits = 1, .Memory = 600};
+
+    UNIT_ASSERT(!tx->HasMemoryPoolLimit());
+    UNIT_ASSERT(rm->AllocateResources(*tx, 1, request));
+    UNIT_ASSERT(!tx->PoolMemoryCookie);
+    UNIT_ASSERT(tx->TotalMemoryCookie);
+    UNIT_ASSERT_VALUES_EQUAL(tx->TotalMemoryCookie->MemoryAvailability.load(), 200);
+    UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 200);
+
+    rm->FreeResources(*tx, 1, request);
     AssertResourceManagerStats(rm, 1000, 100);
 }
 
