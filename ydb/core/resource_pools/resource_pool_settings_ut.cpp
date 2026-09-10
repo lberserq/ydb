@@ -2,6 +2,8 @@
 
 #include <library/cpp/testing/unittest/registar.h>
 
+#include <cmath>
+
 
 namespace NKikimr {
 
@@ -9,6 +11,40 @@ using namespace NResourcePool;
 
 
 Y_UNIT_TEST_SUITE(ResourcePoolTest) {
+    Y_UNIT_TEST(PercentDisabledSemantics) {
+        UNIT_ASSERT(IsPercentDisabled(-1));
+        UNIT_ASSERT(IsPercentDisabled(NAN));
+        UNIT_ASSERT(!IsPercentDisabled(0));
+        UNIT_ASSERT(!IsPercentDisabled(100));
+        UNIT_ASSERT(!IsPercentDisabled(55.5));
+    }
+
+    Y_UNIT_TEST(PercentHardZeroSemantics) {
+        UNIT_ASSERT(IsPercentHardZero(0));
+        UNIT_ASSERT(!IsPercentDisabled(0));
+        UNIT_ASSERT(!IsPercentHardZero(-1));
+        UNIT_ASSERT(!IsPercentHardZero(0.5));
+    }
+
+    Y_UNIT_TEST(PercentToBytesProportional) {
+        UNIT_ASSERT_VALUES_EQUAL(PercentToBytes(100, 1000), 1000);
+        UNIT_ASSERT_VALUES_EQUAL(PercentToBytes(100, 30'000'000'000), 30'000'000'000);
+        UNIT_ASSERT_VALUES_EQUAL(PercentToBytes(50, 1000), 500);
+        UNIT_ASSERT_VALUES_EQUAL(PercentToBytes(0, 1000), 0);
+        UNIT_ASSERT_VALUES_EQUAL(PercentToBytes(55.5, 1000), 555);
+    }
+
+    Y_UNIT_TEST(PercentToBytesKeepsEpsilon) {
+        UNIT_ASSERT_VALUES_EQUAL(PercentToBytes(0.41, 1'000'000'000), 4'100'000);
+    }
+
+    Y_UNIT_TEST(PoolKeyIdentity) {
+        UNIT_ASSERT(MakePoolKey("db", "a") == TPoolKey("db", "a"));
+        UNIT_ASSERT(MakePoolKey("db", "a") != MakePoolKey("db", "b"));
+        UNIT_ASSERT(MakePoolKey("a", "b") == TPoolKey("a", "b"));
+        UNIT_ASSERT(MakePoolKey("a", "b") != MakePoolKey("b", "a"));
+    }
+
     Y_UNIT_TEST(IntSettingsParsing) {
         TPoolSettings settings;
         auto propertiesMap = settings.GetPropertiesMap();
