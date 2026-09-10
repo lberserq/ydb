@@ -44,9 +44,9 @@ static double NormalizePoolPercent(double percent) {
 
 // The rule of TTxState::MemoryPoolLimited, also needed before a TTxState exists (the cookie hand-out).
 // The percent must already be normalized.
-static bool IsMemoryPoolLimited(const TString& databaseId, const TString& poolId, double memoryPoolPercent) {
+static bool IsEnforceablePoolLimit(const TString& databaseId, const TString& poolId, double normalizedPercent) {
     return !databaseId.empty() && !poolId.empty() && poolId != NResourcePool::DEFAULT_POOL_ID
-        && memoryPoolPercent > 0 && memoryPoolPercent < 100;
+        && normalizedPercent > 0 && normalizedPercent < 100;
 }
 
 TTxState::TTxState(std::shared_ptr<IKqpResourceManager>& resourceManager, ui64 txId, TInstant now, const TString& poolId, const double memoryPoolPercent,
@@ -65,8 +65,7 @@ TTxState::TTxState(std::shared_ptr<IKqpResourceManager>& resourceManager, ui64 t
     , MemoryPoolPercent(NormalizePoolPercent(memoryPoolPercent))
     , Database(database)
     , DatabaseId(databaseId)
-    , MemoryPoolLimited(!DatabaseId.empty() && !PoolId.empty() && PoolId != NResourcePool::DEFAULT_POOL_ID
-        && MemoryPoolPercent > 0 && MemoryPoolPercent < 100)
+    , MemoryPoolLimited(IsEnforceablePoolLimit(DatabaseId, PoolId, MemoryPoolPercent))
     , CollectBacktrace(collectBacktrace)
     , TotalMemoryCookie(std::move(cookies.Total))
     , PoolMemoryCookie(std::move(cookies.Pool))
@@ -117,6 +116,9 @@ public:
     // with Used above Limit after the limit was lowered under live usage; the former SpillingPercentReached flag
     // compared the clamped Available() with OverLimit and stayed silent there.
     i64 GetMemoryAvailability() const {
+        if (!Limited) {
+            return std::numeric_limits<i64>::max();
+        }
         return static_cast<i64>(Limit) - static_cast<i64>(Used) - static_cast<i64>(OverLimit);
     }
 
@@ -125,7 +127,7 @@ public:
     }
 
     bool AcquireIfAvailable(ui64 value) {
-        if (Available() >= value) {
+        if (!Limited || Available() >= value) {
             Used += value;
             UpdateCookie();
             return true;
@@ -158,14 +160,20 @@ public:
     void SetNewLimit(ui64 baseLimit, double memoryPoolPercent, double overPercent) {
         // std::fabs, not abs: unqualified abs may resolve to int abs(int) and truncate, and both percents are
         // legitimately fractional (SpillingPercent in particular), so a sub-1.0 change must not compare equal
-        if (baseLimit == BaseLimit && std::fabs(memoryPoolPercent - MemoryPoolPercent) < MYEPS && std::fabs(overPercent - OverPercent) < MYEPS) {
+        if (Limited && baseLimit == BaseLimit && std::fabs(memoryPoolPercent - MemoryPoolPercent) < MYEPS && std::fabs(overPercent - OverPercent) < MYEPS) {
             return;
         }
 
+        Limited = true;
         BaseLimit = baseLimit;
         MemoryPoolPercent = memoryPoolPercent;
         OverPercent = overPercent;
         SetActualLimits();
+    }
+
+    void SetUnlimited() {
+        Limited = false;
+        UpdateCookie();
     }
 
     // A runtime SpillingPercent change: the spilling threshold moves, the limit stays
@@ -204,6 +212,7 @@ private:
     ui64 Used;
     double MemoryPoolPercent;
     double OverPercent;
+    bool Limited = true;
 
     TIntrusivePtr<TMemoryResourceCookie> SpillingCookie;
 };
@@ -295,7 +304,7 @@ public:
         }
         with_lock (Lock) {
             cookies.Total = TotalMemoryResource->GetSpillingCookie();
-            if (IsMemoryPoolLimited(databaseId, poolId, memoryPoolPercent)) {
+            if (IsEnforceablePoolLimit(databaseId, poolId, memoryPoolPercent)) {
                 cookies.Pool = GetOrCreatePoolMemoryResource(TTxState::MakePoolId(databaseId, poolId), memoryPoolPercent)->GetSpillingCookie();
             }
         }
@@ -314,6 +323,35 @@ public:
         return it->second;
     }
 
+    void SetPoolMemoryLimit(const TString& databaseId, const TString& poolId, double memoryPercent) {
+        if (!EnablePoolMemoryQuota.load()) {
+            return;
+        }
+        const double percent = NormalizePoolPercent(memoryPercent);
+        with_lock (Lock) {
+            if (IsEnforceablePoolLimit(databaseId, poolId, percent)) {
+                auto [it, success] = MemoryNamedPools.emplace(std::make_pair(databaseId, poolId), nullptr);
+                if (success) {
+                    it->second = MakeIntrusive<TMemoryResource>(TotalMemoryResource->GetLimit(), percent, TotalMemoryResource->GetOverPercent());
+                } else {
+                    it->second->SetNewLimit(TotalMemoryResource->GetLimit(), percent, TotalMemoryResource->GetOverPercent());
+                }
+            } else if (auto it = MemoryNamedPools.find(std::make_pair(databaseId, poolId)); it != MemoryNamedPools.end()) {
+                it->second->SetUnlimited();
+            }
+        }
+    }
+
+    void RemovePoolMemoryLimit(const TString& databaseId, const TString& poolId) {
+        if (!EnablePoolMemoryQuota.load()) {
+            return;
+        }
+        with_lock (Lock) {
+            if (auto it = MemoryNamedPools.find(std::make_pair(databaseId, poolId)); it != MemoryNamedPools.end()) {
+                it->second->SetUnlimited();
+            }
+        }
+    }
 
     TKqpRMAllocateResult AllocateResources(TTxState& tx, ui64 taskId, const TKqpResourcesRequest& resources) override
     {
@@ -819,6 +857,8 @@ private:
             hFunc(TEvTenantPool::TEvTenantPoolStatus, HandleWork);
             hFunc(NConsole::TEvConfigsDispatcher::TEvSetConfigSubscriptionResponse, HandleWork);
             hFunc(NConsole::TEvConsole::TEvConfigNotificationRequest, HandleWork);
+            hFunc(NRm::TEvPoolMemoryLimit, HandleWork);
+            hFunc(NRm::TEvPoolMemoryLimitRemoved, HandleWork);
             hFunc(TEvKqpWarmupComplete, HandleWarmupComplete);
             cFunc(TEvPrivate::EvWarmupDeadline, HandleWarmupDeadline);
             hFunc(TEvents::TEvUndelivered, HandleWork);
@@ -828,6 +868,14 @@ private:
                 Y_ABORT("Unexpected event 0x%x at TKqpResourceManagerActor::WorkState", ev->GetTypeRewrite());
             }
         }
+    }
+
+    void HandleWork(NRm::TEvPoolMemoryLimit::TPtr& ev) {
+        ResourceManager->SetPoolMemoryLimit(ev->Get()->DatabaseId, ev->Get()->PoolId, ev->Get()->MemoryPercent);
+    }
+
+    void HandleWork(NRm::TEvPoolMemoryLimitRemoved::TPtr& ev) {
+        ResourceManager->RemovePoolMemoryLimit(ev->Get()->DatabaseId, ev->Get()->PoolId);
     }
 
     void HandleWork(TEvPrivate::TEvPublishResources::TPtr&) {

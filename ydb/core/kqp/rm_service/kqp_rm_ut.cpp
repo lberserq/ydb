@@ -202,6 +202,13 @@ public:
         ApplyResourceManagerConfig(config);
     }
 
+    void SendToRm(IEventBase* ev, ui32 evType) {
+        Runtime->Send(new IEventHandle(ResourceManagers.front(), TActorId(), ev), 0, true);
+        TDispatchOptions options;
+        options.FinalEvents.emplace_back(evType, 1);
+        Runtime->DispatchEvents(options);
+    }
+
     void AssertResourceBrokerSensors(i64 cpu, i64 mem, i64 enqueued, std::optional<i64> finished, i64 infly) {
         auto q = Counters->GetSubgroup("queue", "queue_kqp_resource_manager");
         UNIT_ASSERT_VALUES_EQUAL(q->GetCounter("CPUConsumption")->Val(), cpu);
@@ -335,6 +342,11 @@ public:
         UNIT_TEST(SpillingPercentAppliedWithoutPoolLimit);
         UNIT_TEST(MemoryCookiesAssignedWithoutExtraAllocation);
         UNIT_TEST(PoolMemoryCookieSurvivesUnrelatedFree);
+        UNIT_TEST(PoolLimitFromPush);
+        UNIT_TEST(PoolLimitFollowsPushedChange);
+        UNIT_TEST(PoolLimitClearedOnRemoval);
+        UNIT_TEST(PoolLimitPushIgnoredWhenFlagOff);
+        UNIT_TEST(PoolLimitClearedByOutOfRangePush);
     UNIT_TEST_SUITE_END();
 
     void SingleTask();
@@ -371,6 +383,11 @@ public:
     void SpillingPercentAppliedWithoutPoolLimit();
     void MemoryCookiesAssignedWithoutExtraAllocation();
     void PoolMemoryCookieSurvivesUnrelatedFree();
+    void PoolLimitFromPush();
+    void PoolLimitFollowsPushedChange();
+    void PoolLimitClearedOnRemoval();
+    void PoolLimitPushIgnoredWhenFlagOff();
+    void PoolLimitClearedByOutOfRangePush();
 
 private:
     THolder<TTestBasicRuntime> Runtime;
@@ -1426,6 +1443,131 @@ void KqpRm::PoolMemoryCookieSurvivesUnrelatedFree() {
     AssertResourceManagerStats(rm, 1000, 100);
 }
 
-// Once no transaction holds its cookie the record goes, so the next one is built from the current config
+void KqpRm::PoolLimitFromPush() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+    SetEnablePoolMemoryQuota(true);
+
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    {
+        auto tx = MakePoolTx(1, rm, 50);
+        UNIT_ASSERT(rm->AllocateResources(*tx, 0,
+            NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .ExternalMemory = 100}));
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 400);
+
+        SendToRm(new NRm::TEvPoolMemoryLimit("db-id", "pool", 80), NRm::TEvPoolMemoryLimit::EventType);
+
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 640);
+        UNIT_ASSERT_VALUES_EQUAL(tx->PoolMemoryCookie->MemoryAvailability.load(), 640);
+    }
+
+    AssertResourceManagerStats(rm, 1000, 100);
+}
+
+void KqpRm::PoolLimitFollowsPushedChange() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+    SetEnablePoolMemoryQuota(true);
+
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    {
+        auto tx = MakePoolTx(1, rm, 50);
+        UNIT_ASSERT(rm->AllocateResources(*tx, 0,
+            NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .ExternalMemory = 100}));
+        UNIT_ASSERT(rm->AllocateResources(*tx, 1, NRm::TKqpResourcesRequest{.Memory = 100}));
+
+        SendToRm(new NRm::TEvPoolMemoryLimit("db-id", "pool", 80), NRm::TEvPoolMemoryLimit::EventType);
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 540);
+
+        SendToRm(new NRm::TEvPoolMemoryLimit("db-id", "pool", 30), NRm::TEvPoolMemoryLimit::EventType);
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 140);
+
+        rm->FreeResources(*tx, 1, NRm::TKqpResourcesRequest{.Memory = 100});
+    }
+
+    AssertResourceManagerStats(rm, 1000, 100);
+}
+
+void KqpRm::PoolLimitClearedOnRemoval() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+    SetEnablePoolMemoryQuota(true);
+
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    SendToRm(new NRm::TEvPoolMemoryLimitRemoved("nope", "x"), NRm::TEvPoolMemoryLimitRemoved::EventType);
+
+    {
+        auto tx = MakePoolTx(1, rm, 50);
+        UNIT_ASSERT(rm->AllocateResources(*tx, 0,
+            NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .ExternalMemory = 100}));
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 400);
+        UNIT_ASSERT_VALUES_EQUAL(tx->TotalMemoryCookie->MemoryAvailability.load(), 800);
+
+        SendToRm(new NRm::TEvPoolMemoryLimitRemoved("db-id", "pool"), NRm::TEvPoolMemoryLimitRemoved::EventType);
+        UNIT_ASSERT_VALUES_EQUAL(tx->PoolMemoryCookie->MemoryAvailability.load(), std::numeric_limits<i64>::max());
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 800);
+
+        SendToRm(new NRm::TEvPoolMemoryLimit("db-id", "pool", 30), NRm::TEvPoolMemoryLimit::EventType);
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 240);
+    }
+
+    AssertResourceManagerStats(rm, 1000, 100);
+}
+
+void KqpRm::PoolLimitPushIgnoredWhenFlagOff() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+    SetEnablePoolMemoryQuota(true);
+
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    {
+        auto tx = MakePoolTx(1, rm, 50);
+        UNIT_ASSERT(rm->AllocateResources(*tx, 1,
+            NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .Memory = 100}));
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 300);
+
+        SetEnablePoolMemoryQuota(false);
+        SendToRm(new NRm::TEvPoolMemoryLimit("db-id", "pool", 80), NRm::TEvPoolMemoryLimit::EventType);
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 300);
+
+        SendToRm(new NRm::TEvPoolMemoryLimitRemoved("db-id", "pool"), NRm::TEvPoolMemoryLimitRemoved::EventType);
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 300);
+
+        rm->FreeResources(*tx, 1, NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .Memory = 100});
+    }
+
+    AssertResourceManagerStats(rm, 1000, 100);
+}
+
+void KqpRm::PoolLimitClearedByOutOfRangePush() {
+    StartRms();
+    NKikimr::TActorSystemStub stub;
+    SetEnablePoolMemoryQuota(true);
+
+    auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
+
+    {
+        auto tx = MakePoolTx(1, rm, 50);
+        UNIT_ASSERT(rm->AllocateResources(*tx, 0,
+            NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .ExternalMemory = 100}));
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 400);
+
+        SendToRm(new NRm::TEvPoolMemoryLimit("db-id", "pool", -1), NRm::TEvPoolMemoryLimit::EventType);
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 800);
+
+        SendToRm(new NRm::TEvPoolMemoryLimit("db-id", "pool", 50), NRm::TEvPoolMemoryLimit::EventType);
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 400);
+
+        SendToRm(new NRm::TEvPoolMemoryLimit("db-id", "pool", 100), NRm::TEvPoolMemoryLimit::EventType);
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 800);
+    }
+
+    AssertResourceManagerStats(rm, 1000, 100);
+}
+
 } // namespace NKqp
 } // namespace NKikimr
