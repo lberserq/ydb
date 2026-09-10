@@ -350,6 +350,30 @@ struct TResourceSnapshotState {
     TVector<ui32> InitialBoardNodeIds;
 };
 
+struct TEvPoolMemoryLimit : public TEventLocal<TEvPoolMemoryLimit, TKqpResourceManagerEvents::EvPoolMemoryLimit> {
+    const TString DatabaseId;
+    const TString PoolId;
+    const double MemoryPercent;
+
+    TEvPoolMemoryLimit(TString databaseId, TString poolId, double memoryPercent)
+        : DatabaseId(std::move(databaseId))
+        , PoolId(std::move(poolId))
+        , MemoryPercent(memoryPercent)
+    {}
+};
+
+struct TEvPoolMemoryLimitRemoved : public TEventLocal<TEvPoolMemoryLimitRemoved, TKqpResourceManagerEvents::EvPoolMemoryLimitRemoved> {
+    const TString DatabaseId;
+    const TString PoolId;
+
+    TEvPoolMemoryLimitRemoved(TString databaseId, TString poolId)
+        : DatabaseId(std::move(databaseId))
+        , PoolId(std::move(poolId))
+    {}
+};
+
+struct TEvPoolMemoryLimitsRequest : public TEventLocal<TEvPoolMemoryLimitsRequest, TKqpResourceManagerEvents::EvPoolMemoryLimitsRequest> {};
+
 struct TEvKqpResourceInfoExchanger {
     struct TEvPublishResource : public TEventLocal<TEvPublishResource,
         TKqpResourceInfoExchangerEvents::EvPublishResource>
