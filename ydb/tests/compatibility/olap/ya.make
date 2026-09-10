@@ -11,6 +11,7 @@ TEST_SRCS(
     test_cut_history.py
     test_cut_history_boot.py
     test_min_max_index.py
+    test_move_data.py
     test_rename_table.py
     test_compression.py
     test_encoding.py

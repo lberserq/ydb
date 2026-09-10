@@ -9,6 +9,7 @@ from ydb.tests.stress.olap_workload.workload.type.transactions import WorkloadTr
 from ydb.tests.stress.olap_workload.workload.type.rename_tables import WorkloadRenameTables
 from ydb.tests.stress.olap_workload.workload.type.encodings import WorkloadEncodings
 from ydb.tests.stress.olap_workload.workload.type.cut_history import WorkloadCutHistory
+from ydb.tests.stress.olap_workload.workload.type.move_data import WorkloadMoveData
 
 
 class WorkloadRunner:
@@ -30,7 +31,18 @@ class WorkloadRunner:
 
     def _cleanup(self):
         print(f"Cleaning up {self.tables_prefix}...")
-        deleted = self.client.remove_recursively(self.tables_prefix)
+        # Tablet restarts can still land at end of run, and a plain remove dies on Unavailable.
+        deadline = time.time() + 120
+        while True:
+            try:
+                deleted = self.client.remove_recursively(self.tables_prefix)
+                break
+            except (ydb.issues.Unavailable, ydb.issues.BadSession, ydb.issues.ConnectionError) as e:
+                if time.time() >= deadline:
+                    raise
+                # e.__class__: importing workload.type.* shadows the `type` builtin in this package.
+                print(f"Cleaning up {self.tables_prefix}: transient {e.__class__.__name__}, retrying...")
+                time.sleep(3)
         print(f"Cleaning up {self.tables_prefix}... done, {deleted} tables deleted")
 
     def run(self):
@@ -42,9 +54,10 @@ class WorkloadRunner:
             WorkloadRenameTables(self.client, self.name, stop, 10),
             WorkloadEncodings(self.client, self.name, stop),
         ]
-        # Tablet restarts go through the message-bus client, so this needs a caller-supplied endpoint.
+        # Both subworkloads need the console/message-bus endpoint; skip if not supplied.
         if self.endpoint:
             workloads.append(WorkloadCutHistory(self.client, self.name, stop, self.endpoint))
+            workloads.append(WorkloadMoveData(self.client, self.name, stop, self.endpoint, self.client.database))
         for w in workloads:
             w.start()
         started_at = started_at = time.time()

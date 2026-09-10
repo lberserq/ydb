@@ -29,6 +29,8 @@ class TestYdbWorkload(StressFixture):
             column_shard_config={
                 "allow_nullable_columns_in_pk": True,
                 "generate_internal_path_id": True,
+                "cut_history_proof_source": "CUT_HISTORY_PROOF_BS_RANGE",
+                "cut_history_measure_only": False,
             },
             # Hive's gate needs the type off the deny list and on the allow list, or it refuses the cut.
             hive_config={

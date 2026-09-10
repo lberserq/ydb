@@ -110,6 +110,7 @@ RECURSE_FOR_TESTS(
     ut_cut_history
     ut_rw
     ut_schema
+    ut_movedata
     backup
     data_accessor
     export
