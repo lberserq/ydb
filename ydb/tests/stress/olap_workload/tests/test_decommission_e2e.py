@@ -115,7 +115,8 @@ class TestDecommissionE2E(StressFixture):
         with ydb_database_ctx(
             self.cluster, "/Root/decom_e2e", node_count=1, storage_pools={"hdd": 2}
         ) as db_path:
-            client = YdbClient(self.endpoint, db_path)
+            # Column-store DML is only accepted through QueryService.
+            client = YdbClient(self.endpoint, db_path, use_query_service=True)
             client.wait_connection(timeout=30)
             stop = threading.Event()
             ledger = WorkloadDecommissionLedger(client, "e2e", stop)
