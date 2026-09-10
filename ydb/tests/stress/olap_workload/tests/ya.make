@@ -4,6 +4,7 @@ ENV(YDB_ENABLE_COLUMN_TABLES="true")
 ENV(YDB_WORKLOAD_PATH="ydb/tests/stress/olap_workload/olap_workload")
 
 TEST_SRCS(
+    test_decommission_e2e.py
     test_move_data.py
     test_workload.py
 )
@@ -21,6 +22,7 @@ PEERDIR(
     ydb/tests/library/fixtures
     ydb/tests/library/stress
     ydb/tests/stress/common
+    ydb/tests/stress/olap_workload/workload/type
 )
 
 END()

@@ -8,6 +8,7 @@ PY_SRCS(
     encodings.py
     cut_history.py
     move_data.py
+    decommission_ledger.py
 )
 
 PEERDIR(
