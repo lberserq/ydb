@@ -42,7 +42,7 @@ static double NormalizePoolPercent(double percent) {
 }
 
 TTxState::TTxState(std::shared_ptr<IKqpResourceManager>& resourceManager, ui64 txId, TInstant now, const TString& poolId, const double memoryPoolPercent,
-    const TString& database, bool collectBacktrace)
+    const TString& database, const TString& databaseId, bool collectBacktrace)
     : ResourceManager(resourceManager)
     , Counters(resourceManager->GetCounters())
     , TxId(txId)
@@ -50,7 +50,8 @@ TTxState::TTxState(std::shared_ptr<IKqpResourceManager>& resourceManager, ui64 t
     , PoolId(poolId)
     , MemoryPoolPercent(NormalizePoolPercent(memoryPoolPercent))
     , Database(database)
-    , MemoryPoolLimited(!PoolId.empty() && PoolId != NResourcePool::DEFAULT_POOL_ID
+    , DatabaseId(databaseId)
+    , MemoryPoolLimited(!DatabaseId.empty() && !PoolId.empty() && PoolId != NResourcePool::DEFAULT_POOL_ID
         && MemoryPoolPercent > 0 && MemoryPoolPercent < 100)
     , CollectBacktrace(collectBacktrace)
 {}

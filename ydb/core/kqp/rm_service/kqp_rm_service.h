@@ -60,6 +60,7 @@ public:
     const TString PoolId;
     const double MemoryPoolPercent;
     const TString Database;
+    const TString DatabaseId;
     const bool MemoryPoolLimited;
     const bool CollectBacktrace;
     TIntrusivePtr<TMemoryResourceCookie> TotalMemoryCookie;
@@ -83,11 +84,11 @@ public:
 
 public:
     TTxState(std::shared_ptr<IKqpResourceManager>& resourceManager, ui64 txId, TInstant now, const TString& poolId, const double memoryPoolPercent,
-        const TString& database, bool collectBacktrace);
+        const TString& database, const TString& databaseId, bool collectBacktrace);
     ~TTxState();
 
     std::pair<TString, TString> MakePoolId() const {
-        return std::make_pair(Database, PoolId);
+        return std::make_pair(DatabaseId, PoolId);
     }
 
     bool HasMemoryPoolLimit() const {
