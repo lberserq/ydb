@@ -19,6 +19,7 @@ from ydb.tests.stress.olap_workload.workload.type.decommission_ledger import Wor
 _BASELINE_SECS = 30
 _AFTER_SECS = 30
 _DECOM_TIMEOUT_SECS = 120
+_MOVE_QUEUES = ("MoveData/Portions/Pending", "MoveData/Portions/ConfirmedToMove", "MoveData/Portions/InFlight")
 
 
 def _print_phase_table(phases):
@@ -51,11 +52,13 @@ class TestDecommissionE2E(StressFixture):
             },
         )
 
+    _move_names_seen = set()
+
     def _all_nodes(self):
         return list(self.cluster.nodes.values()) + list(self.cluster.slots.values())
 
-    def _cut_history_sensors(self):
-        totals = {}
+    def _tablet_sensors(self):
+        """Yield (labels, bare sensor name, value) from every node's tablet counters."""
         for node in self._all_nodes():
             url = "http://localhost:{}/counters/counters=tablets/json".format(node.mon_port)
             try:
@@ -65,17 +68,32 @@ class TestDecommissionE2E(StressFixture):
                 continue
             for item in payload.get("sensors", []):
                 labels = item.get("labels", {})
-                if labels.get("component") != "CutHistory":
-                    continue
                 name = labels.get("sensor", "")
                 for prefix in ("Deriviative/", "Value/"):
                     if name.startswith(prefix):
                         name = name[len(prefix):]
                         break
                 try:
-                    totals[name] = totals.get(name, 0) + int(item.get("value") or 0)
+                    yield labels, name, int(item.get("value") or 0)
                 except (TypeError, ValueError):
                     continue
+
+    def _cut_history_sensors(self):
+        totals = {}
+        for labels, name, value in self._tablet_sensors():
+            if labels.get("component") == "CutHistory":
+                totals[name] = totals.get(name, 0) + value
+        return totals
+
+    def _move_data_gauges(self):
+        # CS gauges are aggregation clients exported as SUM/, MIN/ and MAX/ series; SUM is the node total.
+        totals = {}
+        for _, name, value in self._tablet_sensors():
+            idx = name.find("SUM/MoveData/")
+            if idx >= 0:
+                key = name[idx + len("SUM/"):]
+                totals[key] = totals.get(key, 0) + value
+                self._move_names_seen.add(name)
         return totals
 
     def _cms_client(self):
@@ -134,6 +152,19 @@ class TestDecommissionE2E(StressFixture):
                 # Full pipeline: BSC decommissions group -> Hive TEvMoveData ->
                 # ColumnShard rewrites blobs -> Hive channel reassignment ->
                 # CutHistory proves range empty -> cuts history entry.
+                # MoveData exports only gauges, so sample them from before the shrink to catch a short move.
+                move_seen = {"active": 0, "queued": 0}
+                sampling_done = threading.Event()
+
+                def sample_move_data():
+                    while not sampling_done.is_set():
+                        gauges = self._move_data_gauges()
+                        move_seen["active"] = max(move_seen["active"], gauges.get("MoveData/Active", 0))
+                        move_seen["queued"] = max(move_seen["queued"], sum(gauges.get(k, 0) for k in _MOVE_QUEUES))
+                        time.sleep(1)
+
+                sampler = threading.Thread(target=sample_move_data, daemon=True)
+                sampler.start()
                 cms = self._cms_client()
                 units = self._storage_units(cms, db_path)
                 assert units is not None, "tenant reports no storage units"
@@ -154,6 +185,8 @@ class TestDecommissionE2E(StressFixture):
                     time.sleep(5)
                 s3 = ledger.snapshot()
                 decom = ledger.phase_metrics(s2, s3)
+                sampling_done.set()
+                sampler.join(timeout=30)
 
                 # Restore pool so cleanup can converge.
                 self._alter_units(cms, db_path, 1, unit_kind)
@@ -171,12 +204,26 @@ class TestDecommissionE2E(StressFixture):
                 _, final_hwm, _ = ledger.snapshot()
 
                 _print_phase_table([("baseline", baseline), ("decommission", decom), ("after", after)])
+                print("MoveData peak: active={active} queued portions={queued}".format(**move_seen))
+                print("rows verified: {} total, {} written before the decommission".format(
+                    sum(final_hwm), sum(s2[1])))
+                print("integrity errors: {}".format(len(errors)))
+                print("MoveData sensors matched: {}".format(sorted(self._move_names_seen)))
+                print("CutHistory: " + ", ".join("{}={}".format(k, sensors.get(k, 0)) for k in (
+                    "BootProbe/Nominated/Count", "RangeProbe/Completed/Count", "Entries/Cut/Count",
+                    "Channels/Poisoned", "Barriers/Failed/Count")))
 
-                assert sum(final_hwm) > 0, "no rows were committed to any shard"
-                assert not errors, "ledger integrity check failed:\n" + "\n".join(errors[:20])
-                assert sensors.get("Nominations/Count", 0) > 0, (
-                    "CutHistory never nominated a history entry: {}".format(sensors)
+                # Each guard proves an event the safety checks below depend on, or they pass vacuously.
+                assert sum(s2[1]) > 0, "no rows were written before the decommission, so none were at risk"
+                assert move_seen["active"] > 0, "MoveData never started: no TEvMoveData reached a shard"
+                assert move_seen["queued"] > 0, "MoveData found nothing in the removed group, so no data was moved"
+                assert sensors.get("BootProbe/Nominated/Count", 0) > 0, (
+                    "the arm C boot proof never nominated an entry: {}".format(sensors)
                 )
+                assert sensors.get("RangeProbe/Completed/Count", 0) > 0, (
+                    "no TEvRange probe completed, so the cut was not proven by arm C: {}".format(sensors)
+                )
+                assert not errors, "ledger integrity check failed:\n" + "\n".join(errors[:20])
                 assert sensors.get("Entries/Cut/Count", 0) > 0, (
                     "CutHistory full pipeline did not complete: {}".format(sensors)
                 )

@@ -91,34 +91,22 @@ class WorkloadDecommissionLedger(WorkloadBase):
         return {"rows": rows, "rows_per_s": rows / elapsed, "p99_s": p99}
 
     def verify(self):
-        """Scan every committed shard and return a list of error strings (empty means OK)."""
+        """Check every acknowledged row of every shard; return error strings (empty means OK)."""
         _, hwm, _ = self.snapshot()
         path = self.table_path()
         errors = []
         for shard_id, max_key in enumerate(hwm):
             if max_key == 0:
                 continue
+            # A value checksum catches a wrong or swapped row that the count alone would miss.
             result = self.client.query(
-                "SELECT COUNT(*) AS cnt FROM `{}` WHERE shard_id = {} AND key <= {}".format(
-                    path, shard_id, max_key
-                ),
+                "SELECT COUNT(*) AS cnt, MIN(key) AS lo, MAX(key) AS hi, SUM(val) AS total FROM `{}` "
+                "WHERE shard_id = {} AND key <= {}".format(path, shard_id, max_key),
                 is_ddl=False,
             )
-            cnt = result[0].rows[0]["cnt"]
-            if cnt != max_key:
-                errors.append("shard={} lost rows: expected {} got {}".format(shard_id, max_key, cnt))
-                continue
-            result = self.client.query(
-                "SELECT val FROM `{}` WHERE shard_id = {} AND key = {}".format(path, shard_id, max_key),
-                is_ddl=False,
-            )
-            rows = result[0].rows
-            if not rows:
-                errors.append("shard={} last key {} vanished on spot-check".format(shard_id, max_key))
-            elif rows[0]["val"] != self._val(shard_id, max_key):
-                errors.append(
-                    "shard={} key={} val={} expected={}".format(
-                        shard_id, max_key, rows[0]["val"], self._val(shard_id, max_key)
-                    )
-                )
+            row = result[0].rows[0]
+            got = (row["cnt"], row["lo"], row["hi"], row["total"])
+            want = (max_key, 1, max_key, sum(self._val(shard_id, k) for k in range(1, max_key + 1)))
+            if got != want:
+                errors.append("shard={} (count, min, max, sum) = {} expected {}".format(shard_id, got, want))
         return errors
