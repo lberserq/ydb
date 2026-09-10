@@ -353,7 +353,7 @@ public:
             }
             TxInfo = MakeIntrusive<NRm::TTxState>(ResourceManager_, txId, TInstant::Now(),
                 poolId, msg.GetMemoryPoolPercent(),
-                msg.GetDatabase(),  CaFactory_->GetVerboseMemoryLimitException());
+                msg.GetDatabase(), databaseId, CaFactory_->GetVerboseMemoryLimitException());
         }
 
         auto rmResult = ResourceManager_->AllocateResources(
