@@ -1605,7 +1605,7 @@ void KqpRm::PoolLimitsFollowNodeTotal() {
     SetEnablePoolMemoryQuota(true);
 
     auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
-    auto tx = MakePoolTx(1, rm, /* memoryPoolPercent = */ 50);
+    auto tx = MakePoolTx(1, rm, 50);
     UNIT_ASSERT(rm->AllocateResources(*tx, 0,
         NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .ExternalMemory = 100}));
     UNIT_ASSERT_VALUES_EQUAL(tx->TotalMemoryCookie->MemoryAvailability.load(), 800);
@@ -1636,7 +1636,7 @@ void KqpRm::PoolLimitsStayOnNodeTotalChangeWhenFlagOff() {
     NKikimr::TActorSystemStub stub;
     SetEnablePoolMemoryQuota(true);
     auto rm = GetKqpResourceManager(ResourceManagers.front().NodeId());
-    auto tx = MakePoolTx(1, rm, /* memoryPoolPercent = */ 50);
+    auto tx = MakePoolTx(1, rm, 50);
     UNIT_ASSERT(rm->AllocateResources(*tx, 1,
         NRm::TKqpResourcesRequest{.ExecutionUnits = 1, .Memory = 100}));
     UNIT_ASSERT_VALUES_EQUAL(tx->PoolMemoryCookie->MemoryAvailability.load(), 300);

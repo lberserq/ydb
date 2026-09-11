@@ -181,8 +181,13 @@ public:
         SetNewLimit(BaseLimit, MemoryPoolPercent, overPercent);
     }
 
-    // A new base (the node total of a pool): the limit follows, the share and the threshold percent stay
+    // A new base (the node total of a pool): the limit follows, the share and the threshold percent stay.
+    // An unlimited pool (SetUnlimited was called) stays unlimited; its base is kept for future limit pushes.
     void SetBaseLimit(ui64 baseLimit) {
+        if (!Limited) {
+            BaseLimit = baseLimit;
+            return;
+        }
         SetNewLimit(baseLimit, MemoryPoolPercent, OverPercent);
     }
 
@@ -354,7 +359,6 @@ public:
         }
     }
 
-    // Lock must be held
     void RecomputeAllPoolLimits() {
         for (auto& [id, pool] : MemoryNamedPools) {
             pool->SetBaseLimit(TotalMemoryResource->GetLimit());
