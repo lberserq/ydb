@@ -1284,8 +1284,6 @@ void KqpRm::PoolLimitClearedOnRemoval() {
     }
 
     {
-        SendToRm(new NRm::TEvPoolMemoryLimit("db-id", "pool", 50), NRm::TEvPoolMemoryLimit::EventType);
-
         auto tx = MakePoolTx(2, rm, 50);
         UNIT_ASSERT(rm->AllocateResources(*tx, 1, NRm::TKqpResourcesRequest{.Memory = 100}));
 
