@@ -319,7 +319,6 @@ public:
         }
     }
 
-    // Lock must be held
     void RecomputeAllPoolLimits() {
         for (auto& [id, pool] : MemoryNamedPools) {
             pool->SetNewBaseLimit(TotalMemoryResource->GetLimit());
