@@ -209,10 +209,7 @@ public:
         auto ev = MakeHolder<TEvResourceBroker::TEvConfigResponse>();
         ev->QueueConfig.ConstructInPlace();
         ev->QueueConfig->MutableLimit()->SetMemory(memory);
-        Runtime->Send(new IEventHandle(ResourceManagers.front(), TActorId(), ev.Release()), 0, true);
-        TDispatchOptions options;
-        options.FinalEvents.emplace_back(TEvResourceBroker::EvConfigResponse, 1);
-        Runtime->DispatchEvents(options);
+        SendToRm(ev.Release(), TEvResourceBroker::EvConfigResponse);
     }
 
     void AssertResourceBrokerSensors(i64 cpu, i64 mem, i64 enqueued, std::optional<i64> finished, i64 infly) {
