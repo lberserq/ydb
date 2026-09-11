@@ -121,19 +121,21 @@ class TestDecommissionE2E(StressFixture):
         return {}
 
     def _group_refs(self):
-        """Map each group to the tablets naming it in any history entry; also return the groups of latest entries."""
+        """Map each group to its (tablet, type, channel, from generation) history entries, plus the latest groups."""
         tablets = self._mon_json("/viewer/json/tabletinfo?enums=true").get("TabletStateInfo", [])
         hives = {t["TabletId"] for t in tablets if t.get("Type") == "Hive" and t.get("TabletId")}
+        types = {t["TabletId"]: t.get("Type") for t in tablets if t.get("TabletId")}
         refs, latest = {}, set()
-        for tablet_id in {t["TabletId"] for t in tablets if t.get("TabletId")}:
+        for tablet_id in types:
             for hive_id in hives:
                 info = self._mon_json("/tablets/app?TabletID={}&page=TabletInfo&tablet={}".format(hive_id, tablet_id))
                 channels = (info.get("TabletStorageInfo") or {}).get("Channels") or []
                 for channel in channels:
-                    groups = [entry["GroupID"] for entry in channel.get("History") or []]
-                    for group in groups:
-                        refs.setdefault(group, set()).add(tablet_id)
-                    latest.update(groups[-1:])
+                    history = channel.get("History") or []
+                    for entry in history:
+                        refs.setdefault(entry["GroupID"], set()).add(
+                            (tablet_id, types[tablet_id], channel.get("Channel"), entry.get("FromGeneration")))
+                    latest.update(entry["GroupID"] for entry in history[-1:])
                 if channels:
                     break
         return refs, latest
@@ -152,7 +154,7 @@ class TestDecommissionE2E(StressFixture):
             move = self._move_data_gauges()
             print("{} allocated={} tablets per group={} cut={} disproved={} move active={} queued={}".format(
                 time.strftime("%H:%M:%S"), units.count if units is not None else "?",
-                {group: len(refs.get(group, ())) for group in sorted(groups)},
+                {group: len({entry[0] for entry in refs.get(group, ())}) for group in sorted(groups)},
                 cut.get("Entries/Cut/Count", 0), cut.get("Entries/Disproved", 0),
                 move.get("MoveData/Active", 0), sum(move.get(k, 0) for k in _MOVE_QUEUES)), flush=True)
             if units is not None and units.count == expected:
@@ -267,10 +269,16 @@ class TestDecommissionE2E(StressFixture):
                 decom = ledger.phase_metrics(s2, s3)
                 sampling_done.set()
                 sampler.join(timeout=30)
-                assert released, "the removed group was never released: CutHistory {}, groups before {}, now {}".format(
-                    sensors, sorted(groups_before), sorted(groups_after))
-                assert removed, "no group left the tablets' histories: before {}, now {}".format(
-                    sorted(groups_before), sorted(groups_after))
+                # A group no channel uses as its latest any more is being removed; list who still names it.
+                draining = groups_before - latest_after
+                assert released, (
+                    "the removed group was never released: CutHistory {}, groups before {}, now {}; "
+                    "entries left: {}").format(
+                    sensors, sorted(groups_before), sorted(groups_after),
+                    {group: sorted(refs_after.get(group, ()), key=str) for group in draining})
+                assert removed, "no group left the tablets' histories: before {}, now {}; still naming {}: {}".format(
+                    sorted(groups_before), sorted(groups_after), sorted(groups_before),
+                    {group: sorted(refs_after.get(group, ()), key=str) for group in groups_before})
                 assert not removed & latest_after, "a removed group is still a current channel group: {}".format(
                     sorted(removed & latest_after))
 
