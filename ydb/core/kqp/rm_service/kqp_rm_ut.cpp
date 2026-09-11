@@ -1283,6 +1283,24 @@ void KqpRm::PoolLimitClearedOnRemoval() {
         UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 240);
     }
 
+    {
+        SendToRm(new NRm::TEvPoolMemoryLimit("db-id", "pool", 50), NRm::TEvPoolMemoryLimit::EventType);
+
+        auto tx = MakePoolTx(2, rm, 50);
+        UNIT_ASSERT(rm->AllocateResources(*tx, 1, NRm::TKqpResourcesRequest{.Memory = 100}));
+
+        SendToRm(new NRm::TEvPoolMemoryLimitRemoved("db-id", "pool"), NRm::TEvPoolMemoryLimitRemoved::EventType);
+        rm->FreeResources(*tx, 1, NRm::TKqpResourcesRequest{.Memory = 40});
+        UNIT_ASSERT_VALUES_EQUAL(tx->PoolMemoryCookie->MemoryAvailability.load(), std::numeric_limits<i64>::max());
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 740);
+
+        SendToRm(new NRm::TEvPoolMemoryLimit("db-id", "pool", 50), NRm::TEvPoolMemoryLimit::EventType);
+        UNIT_ASSERT_VALUES_EQUAL(tx->PoolMemoryCookie->MemoryAvailability.load(), 340);
+        UNIT_ASSERT_VALUES_EQUAL(tx->GetMemoryAvailability(), 340);
+
+        rm->FreeResources(*tx, 1, NRm::TKqpResourcesRequest{.Memory = 60});
+    }
+
     AssertResourceManagerStats(rm, 1000, 100);
 }
 

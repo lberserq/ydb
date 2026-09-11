@@ -333,6 +333,7 @@ struct TResourceSnapshotState {
 struct TEvPoolMemoryLimit : public TEventLocal<TEvPoolMemoryLimit, TKqpResourceManagerEvents::EvPoolMemoryLimit> {
     const TString DatabaseId;
     const TString PoolId;
+    // TotalMemoryLimitPercentPerNode, verbatim; the RM converts to bytes.
     const double MemoryPercent;
 
     TEvPoolMemoryLimit(TString databaseId, TString poolId, double memoryPercent)
