@@ -38,6 +38,10 @@ public:
         return Manager->HasToDelete(blobId, tabletId);
     }
 
+    virtual bool HasBlobsForGroups(const THashSet<ui32>& groups) const override {
+        return Manager->HasBlobsForGroups(groups) || TBase::HasBlobsForGroups(groups);
+    }
+
     virtual TTabletsByBlob GetBlobsToDelete() const override {
         return Manager->GetBlobsToDeleteAll();
     }
@@ -56,6 +60,14 @@ public:
 
     virtual bool IsReady() const override {
         return true;
+    }
+
+    THistoryCutterWrapper* GetHistoryCutter() {
+        return Manager->GetHistoryCutter();
+    }
+
+    void InitHistoryCutter(const TActorId& tabletActorId) {
+        Manager->InitHistoryCutter(Manager, GetSharedBlobs(), tabletActorId);
     }
 };
 

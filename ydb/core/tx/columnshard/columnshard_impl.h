@@ -66,6 +66,10 @@ struct TEvConfigNotificationRequest;
 }
 }   // namespace NKikimr::NConsole
 
+namespace NKikimr::NOlap::NBlobOperations::NBlobStorage {
+class THistoryCutterWrapper;
+}   // namespace NKikimr::NOlap::NBlobOperations::NBlobStorage
+
 namespace NKikimr::NOlap {
 class TCleanupPortionsColumnEngineChanges;
 class TCleanupTablesColumnEngineChanges;
@@ -344,6 +348,10 @@ class TColumnShard: public TActor<TColumnShard>, public NTabletFlatExecutor::TTa
     void Handle(TEvDataShard::TEvCancelBackup::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvCancelRestore::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvCompactTable::TPtr& ev, const TActorContext& ctx);
+    void Handle(TEvTablet::TEvMoveData::TPtr& ev, const TActorContext& ctx);
+    virtual void MoveDataCompleted(const TActorContext& ctx) override;
+    // Split out of MoveDataCompleted so the wakeup can drive it without claiming vacuum finished.
+    void CheckMoveDataGate(const TActorContext& ctx);
 
     void Handle(TEvColumnShard::TEvOverloadUnsubscribe::TPtr& ev, const TActorContext& ctx);
     void Handle(NLongTxService::TEvLongTxService::TEvLockStatus::TPtr& ev, const TActorContext& ctx);
@@ -456,6 +464,8 @@ protected:
 
     STFUNC(StateWork);
 
+    bool HasExternallyWrittenBlobs(ui32 channel) const override;
+
 private:
     std::unique_ptr<TTabletCountersBase> TabletCountersHolder;
     TCountersManager Counters;
@@ -517,6 +527,8 @@ private:
     std::unique_ptr<NTabletPipe::IClientCache> PipeClientCache;
     NOlap::NResourceBroker::NSubscribe::TTaskContext CompactTaskSubscription;
     NOlap::NResourceBroker::NSubscribe::TTaskContext TTLTaskSubscription;
+    // Own type: this string drives both the broker queue and the ResourceType sensor label.
+    NOlap::NResourceBroker::NSubscribe::TTaskContext MoveDataTaskSubscription;
 
     ui64 InProgressTxId = 0;
     bool ProgressTxScheduled = false;
@@ -534,6 +546,31 @@ private:
 
     TActorId StatsReportPipe;
     std::unique_ptr<TEvDataShard::TEvPeriodicTableStats> LastStats;
+
+    // Non-owning; set in SetupCutHistory() once per boot.
+    NOlap::NBlobOperations::NBlobStorage::THistoryCutterWrapper* CutHistoryCutter = nullptr;
+
+    // Stateless v1: no persistence; on restart Hive re-sends TEvMoveData.
+    struct TMoveDataState {
+        TActorId HiveSender;
+        THashSet<ui32> TargetGroups;
+        bool Active = false;
+        // Set by the executor's MoveDataCompleted(): vacuum done, the blob gates still pending.
+        bool VacuumCompleted = false;
+        // Epoch-initialized so the first check fires; the cadence is a lower bound, not a period.
+        TInstant LastGateCheckAt;
+        // The actualizer count is cumulative; track what was reported to keep the sensor a rate.
+        ui64 ReportedRejections = 0;
+        // Newest pending cleanup when the queues last drained; the gate waits for cleanup to pass it.
+        std::optional<TInstant> CleanupWatermark;
+    };
+
+    static constexpr TDuration MoveDataGateCheckCadence = TDuration::Seconds(5);
+
+    TMoveDataState MoveDataState;
+
+    // Number of metadata-accessor requests this tablet has in flight; gates SetupMetadata.
+    std::shared_ptr<TAtomicCounter> MetadataRequestsInFlight = std::make_shared<TAtomicCounter>();
 
     // In-flight forced-compaction requests (ALTER TABLE ... COMPACT). Kept in memory only, mirroring
     // DataShard's CompactionWaiters: on restart/move the SchemeShard's persisted queue re-sends
@@ -598,11 +635,22 @@ private:
         const std::shared_ptr<NPrioritiesQueue::TAllocationGuard>& guard);
 
     void SetupMetadata();
+    // Re-arms only the move's accessor requests, ungated: they must not queue behind tiering's.
+    void SetupMoveDataMetadata();
+    void StartMetadataRequests(
+        std::vector<NOlap::TCSMetadataRequest>&& requests, const NOlap::NResourceBroker::NSubscribe::TTaskContext& taskContext);
     bool SetupTtl();
     void SetupCleanupPortions(const NOlap::ISnapshotHolders& snapshotHolders);
     void SetupCleanupTables(const NOlap::ISnapshotHolders& snapshotHolders);
     void SetupCleanupSchemas();
     void SetupGC();
+    void SetupCutHistory();
+
+    void Handle(TEvPrivate::TEvStartCutHistorySweep::TPtr& ev, const TActorContext& ctx);
+    void Handle(TEvPrivate::TEvCutHistoryBarrierDone::TPtr& ev, const TActorContext& ctx);
+    void Handle(TEvPrivate::TEvCutHistorySweepBatchDone::TPtr& ev, const TActorContext& ctx);
+
+    void Handle(TEvPrivate::TEvCutHistoryRangeProbeDone::TPtr& ev, const TActorContext& ctx);
 
     void UpdateIndexCounters();
     void UpdateResourceMetrics(const TActorContext& ctx, const TUsage& usage);
@@ -622,6 +670,9 @@ private:
     ui64 NormalizeSmallBlobsCount(const ui64 rawCount);
 
 public:
+    void OnPortionAddedToEngine(const NOlap::TPortionDataAccessor& accessor);
+    void OnPortionRemovedFromEngine(ui64 portionId);
+
     ui64 TabletTxCounter = 0;
 
     std::shared_ptr<const TAtomicCounter> GetTabletActivity() const {

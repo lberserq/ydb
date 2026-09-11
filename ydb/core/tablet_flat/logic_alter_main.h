@@ -31,7 +31,7 @@ namespace NTabletFlatExecutor {
             largeGlobId.MaterializeTo(Log), Bytes += largeGlobId.Bytes;
         }
 
-        void SnapToLog(NKikimrExecutorFlat::TLogSnapshot &snap)
+        void SnapToLog(NKikimrExecutorFlat::TLogSnapshot &snap, TLogCommit &commit)
         {
             auto items = snap.MutableSchemeInfoBodies();
             for (const auto &logo : Log)
@@ -41,6 +41,10 @@ namespace NTabletFlatExecutor {
             for (const auto &logo : ObsoleteLog) {
                 LogoBlobIDFromLogoBlobID(logo, deleted->Add());
             }
+
+            // Collected in this generation: listed in every later snapshot, they would pin their history entry after a restart.
+            commit.GcDelta.Deleted.insert(commit.GcDelta.Deleted.end(), ObsoleteLog.begin(), ObsoleteLog.end());
+            ObsoleteLog.clear();
         }
 
         void WriteLog(TLogCommit &commit, TString alter)
