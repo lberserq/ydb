@@ -5,6 +5,7 @@ import time
 import urllib.request
 
 import pytest
+import yatest.common
 from google.protobuf import text_format
 
 import ydb.public.api.protos.ydb_cms_pb2 as cms_tenants_pb
@@ -12,13 +13,14 @@ from ydb.tests.library.clients.kikimr_client import kikimr_client_factory
 from ydb.tests.library.common.protobuf_console import AlterTenantRequest, GetTenantStatusRequest
 from ydb.tests.library.common.types import Erasure
 from ydb.tests.library.fixtures import ydb_database_ctx
+from ydb.tests.library.harness.util import LogLevels
 from ydb.tests.library.stress.fixtures import StressFixture
 from ydb.tests.stress.common.common import YdbClient
 from ydb.tests.stress.olap_workload.workload.type.decommission_ledger import WorkloadDecommissionLedger
 
 _BASELINE_SECS = 30
 _AFTER_SECS = 30
-_DECOM_TIMEOUT_SECS = 120
+_GROUP_GONE_TIMEOUT_SECS = 300
 _MOVE_QUEUES = ("MoveData/Portions/Pending", "MoveData/Portions/ConfirmedToMove", "MoveData/Portions/InFlight")
 
 
@@ -46,9 +48,16 @@ class TestDecommissionE2E(StressFixture):
                 "cut_history_proof_source": "CUT_HISTORY_PROOF_BS_RANGE",
                 "cut_history_measure_only": False,
             },
+            # MoveData, Hive's shrink and the cut path log at INFO; without them a stalled removal cannot be diagnosed.
+            additional_log_configs={
+                "HIVE": LogLevels.INFO,
+                "TX_COLUMNSHARD": LogLevels.INFO,
+                "TX_COLUMNSHARD_BLOBS_BS": LogLevels.INFO,
+            },
             hive_config={
                 "cut_history_deny_list": "KeyValue,PersQueue,BlobDepot",
-                "cut_history_allow_list": "DataShard,ColumnShard",
+                # System tablets hold history on the removed group too, and the group is released only when none does.
+                "cut_history_allow_list": "",
             },
         )
 
@@ -101,12 +110,81 @@ class TestDecommissionE2E(StressFixture):
         host, _, port = address.partition(":")
         return kikimr_client_factory(host, port or "2135")
 
-    def _storage_units(self, cms, database):
+    def _mon_json(self, path):
+        for node in self._all_nodes():
+            url = "http://localhost:{}{}".format(node.mon_port, path)
+            try:
+                with urllib.request.urlopen(url, timeout=30) as resp:
+                    return json.loads(resp.read().decode("utf-8", "replace"))
+            except Exception:
+                continue
+        return {}
+
+    def _group_refs(self):
+        """Map each group to the tablets naming it in any history entry; also return the groups of latest entries."""
+        tablets = self._mon_json("/viewer/json/tabletinfo?enums=true").get("TabletStateInfo", [])
+        hives = {t["TabletId"] for t in tablets if t.get("Type") == "Hive" and t.get("TabletId")}
+        refs, latest = {}, set()
+        for tablet_id in {t["TabletId"] for t in tablets if t.get("TabletId")}:
+            for hive_id in hives:
+                info = self._mon_json("/tablets/app?TabletID={}&page=TabletInfo&tablet={}".format(hive_id, tablet_id))
+                channels = (info.get("TabletStorageInfo") or {}).get("Channels") or []
+                for channel in channels:
+                    groups = [entry["GroupID"] for entry in channel.get("History") or []]
+                    for group in groups:
+                        refs.setdefault(group, set()).add(tablet_id)
+                    latest.update(groups[-1:])
+                if channels:
+                    break
+        return refs, latest
+
+    def _wait_released(self, cms, database, expected, groups, timeout):
+        """Wait for the allocated units to drop, printing where the removal stands every 15 s."""
+        deadline = time.time() + timeout
+        while True:
+            units = None
+            try:
+                units = self._storage_units(cms, database, "allocated_resources")
+            except Exception:
+                pass
+            refs, _ = self._group_refs()
+            cut = self._cut_history_sensors()
+            move = self._move_data_gauges()
+            print("{} allocated={} tablets per group={} cut={} disproved={} move active={} queued={}".format(
+                time.strftime("%H:%M:%S"), units.count if units is not None else "?",
+                {group: len(refs.get(group, ())) for group in sorted(groups)},
+                cut.get("Entries/Cut/Count", 0), cut.get("Entries/Disproved", 0),
+                move.get("MoveData/Active", 0), sum(move.get(k, 0) for k in _MOVE_QUEUES)), flush=True)
+            if units is not None and units.count == expected:
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(15)
+
+    def _ledger_shards(self, db_path, table_path):
+        path = table_path if table_path.startswith("/") else "{}/{}".format(db_path, table_path)
+        described = self._mon_json("/viewer/json/describe?path={}".format(path))
+        return (((described.get("PathDescription") or {}).get("ColumnTableDescription") or {})
+                .get("Sharding") or {}).get("ColumnShards") or []
+
+    @staticmethod
+    def _verify_after_restart(ledger, timeout=120):
+        # Restarted shards answer Unavailable until they boot, which says nothing about the data.
+        deadline = time.time() + timeout
+        while True:
+            try:
+                return ledger.verify()
+            except Exception:
+                if time.time() >= deadline:
+                    raise
+                time.sleep(3)
+
+    def _storage_units(self, cms, database, resources="required_resources"):
         request = GetTenantStatusRequest(database)
         response = cms.console_request(text_format.MessageToString(request.protobuf))
         result = cms_tenants_pb.GetDatabaseStatusResult()
         response.GetTenantStatusResponse.Response.operation.result.Unpack(result)
-        units = result.required_resources.storage_units
+        units = getattr(result, resources).storage_units
         return units[0] if units else None
 
     def _alter_units(self, cms, database, delta, unit_kind):
@@ -117,11 +195,11 @@ class TestDecommissionE2E(StressFixture):
             request.add_storage_groups_to_add(unit_kind, delta)
         cms.console_request(text_format.MessageToString(request.protobuf))
 
-    def _wait_units(self, cms, database, expected, timeout=120):
+    def _wait_units(self, cms, database, expected, timeout=120, resources="required_resources"):
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                units = self._storage_units(cms, database)
+                units = self._storage_units(cms, database, resources)
                 if units is not None and units.count == expected:
                     return True
             except Exception:
@@ -170,25 +248,41 @@ class TestDecommissionE2E(StressFixture):
                 assert units is not None, "tenant reports no storage units"
                 unit_kind = units.unit_kind
                 initial_count = units.count
+                refs_before, _ = self._group_refs()
+                groups_before = set(refs_before)
                 self._alter_units(cms, db_path, -1, unit_kind)
                 assert self._wait_units(cms, db_path, initial_count - 1), (
                     "pool did not shrink to {} units".format(initial_count - 1)
                 )
 
+                # The requested count drops at once; the storage is released only after no history names the group.
                 s2 = ledger.snapshot()
-                sensors = {}
-                deadline = time.time() + _DECOM_TIMEOUT_SECS
-                while time.time() < deadline:
-                    sensors = self._cut_history_sensors()
-                    if sensors.get("Entries/Cut/Count", 0) > 0:
-                        break
-                    time.sleep(5)
+                timeout = int(yatest.common.get_param("decom_group_gone_timeout_secs", _GROUP_GONE_TIMEOUT_SECS))
+                released = self._wait_released(cms, db_path, initial_count - 1, groups_before, timeout)
+                sensors = self._cut_history_sensors()
+                refs_after, latest_after = self._group_refs()
+                groups_after = set(refs_after)
+                removed = groups_before - groups_after
                 s3 = ledger.snapshot()
                 decom = ledger.phase_metrics(s2, s3)
                 sampling_done.set()
                 sampler.join(timeout=30)
+                assert released, "the removed group was never released: CutHistory {}, groups before {}, now {}".format(
+                    sensors, sorted(groups_before), sorted(groups_after))
+                assert removed, "no group left the tablets' histories: before {}, now {}".format(
+                    sorted(groups_before), sorted(groups_after))
+                assert not removed & latest_after, "a removed group is still a current channel group: {}".format(
+                    sorted(removed & latest_after))
 
-                # Restore pool so cleanup can converge.
+                # With the group gone, restart every ledger shard so each reads its data back from the remaining groups.
+                shards = self._ledger_shards(db_path, ledger.table_path())
+                assert shards, "no ColumnShards found behind the ledger table"
+                for shard in shards:
+                    cms.tablet_kill(int(shard))
+                errors_with_group_gone = self._verify_after_restart(ledger)
+                rows_with_group_gone = sum(ledger.snapshot()[1])
+
+                # Grow the pool back only now, so the check above ran with the source storage really gone.
                 self._alter_units(cms, db_path, 1, unit_kind)
                 self._wait_units(cms, db_path, initial_count, timeout=60)
 
@@ -207,7 +301,10 @@ class TestDecommissionE2E(StressFixture):
                 print("MoveData peak: active={active} queued portions={queued}".format(**move_seen))
                 print("rows verified: {} total, {} written before the decommission".format(
                     sum(final_hwm), sum(s2[1])))
-                print("integrity errors: {}".format(len(errors)))
+                print("removed groups: {}; rows verified with them gone and the shards restarted: {}".format(
+                    sorted(removed), rows_with_group_gone))
+                print("integrity errors: {} with the group gone, {} at the end".format(
+                    len(errors_with_group_gone), len(errors)))
                 print("MoveData sensors matched: {}".format(sorted(self._move_names_seen)))
                 print("CutHistory: " + ", ".join("{}={}".format(k, sensors.get(k, 0)) for k in (
                     "BootProbe/Nominated/Count", "RangeProbe/Completed/Count", "Entries/Cut/Count",
@@ -223,6 +320,8 @@ class TestDecommissionE2E(StressFixture):
                 assert sensors.get("RangeProbe/Completed/Count", 0) > 0, (
                     "no TEvRange probe completed, so the cut was not proven by arm C: {}".format(sensors)
                 )
+                assert not errors_with_group_gone, (
+                    "rows lost with the source group gone:\n" + "\n".join(errors_with_group_gone[:20]))
                 assert not errors, "ledger integrity check failed:\n" + "\n".join(errors[:20])
                 assert sensors.get("Entries/Cut/Count", 0) > 0, (
                     "CutHistory full pipeline did not complete: {}".format(sensors)
