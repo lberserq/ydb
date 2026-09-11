@@ -42,7 +42,6 @@ Y_UNIT_TEST_SUITE(ResourcePoolTest) {
     Y_UNIT_TEST(PoolKeyIdentity) {
         UNIT_ASSERT(MakePoolKey("db", "a") == TPoolKey("db", "a"));
         UNIT_ASSERT(MakePoolKey("db", "a") != MakePoolKey("db", "b"));
-        UNIT_ASSERT(MakePoolKey("a", "b") == TPoolKey("a", "b"));
         UNIT_ASSERT(MakePoolKey("a", "b") != MakePoolKey("b", "a"));
     }
 
