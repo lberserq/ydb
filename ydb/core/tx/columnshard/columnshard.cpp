@@ -678,8 +678,8 @@ void TColumnShard::Handle(TEvTablet::TEvMoveData::TPtr& ev, const TActorContext&
             auto& index = MutableIndexAs<NOlap::TColumnEngineForLogs>();
             index.StopMoveData();
             index.StartMoveData(MoveDataState.TargetGroups);
-            // The new groups get the same treatment: their pending-cleanup backlog is unmovable too.
-            MoveDataState.CleanupWatermark = Max(MoveDataState.CleanupWatermark, index.GetMaxCleanupPortionInstant());
+            // The restarted actualizer refills the queues, so the watermark is frozen again once they drain.
+            MoveDataState.CleanupWatermark.reset();
         }
         return;
     }
@@ -698,8 +698,7 @@ void TColumnShard::Handle(TEvTablet::TEvMoveData::TPtr& ev, const TActorContext&
     }
     MoveDataState.Active = true;
     MoveDataState.VacuumCompleted = false;
-    // Actualization skips portions that already carry RemoveSnapshot, so wait out that backlog too.
-    MoveDataState.CleanupWatermark = HasIndex() ? GetIndexAs<NOlap::TColumnEngineForLogs>().GetMaxCleanupPortionInstant() : TInstant::Zero();
+    MoveDataState.CleanupWatermark.reset();
 
     LOG_S_INFO(
         "TColumnShard::Handle TEvMoveData: starting move for " << MoveDataState.TargetGroups.size() << " groups at tablet " << TabletID());
@@ -734,8 +733,16 @@ void TColumnShard::CheckMoveDataGate(const TActorContext& ctx) {
         Counters.GetCSCounters().OnMoveDataPortionsRejected(queues.Rejected - MoveDataState.ReportedRejections);
         MoveDataState.ReportedRejections = queues.Rejected;
     }
-    const bool hasCleanupPortions =
-        HasIndex() && GetIndexAs<NOlap::TColumnEngineForLogs>().HasCleanupPortionsAtOrBefore(MoveDataState.CleanupWatermark);
+    if (queues.GetTotal() != 0) {
+        MoveDataState.CleanupWatermark.reset();
+    } else if (!MoveDataState.CleanupWatermark) {
+        // Whoever retired a target portion, it now waits in CleanupPortions, sits in the running cleanup, or is gone.
+        MoveDataState.CleanupWatermark =
+            HasIndex() ? GetIndexAs<NOlap::TColumnEngineForLogs>().GetMaxCleanupPortionInstant() : TInstant::Zero();
+    }
+    // A running cleanup has taken its portions out of CleanupPortions but not yet queued their blobs for GC.
+    const bool hasCleanupPortions = !MoveDataState.CleanupWatermark || BackgroundController.IsCleanupPortionsActive() ||
+        (HasIndex() && GetIndexAs<NOlap::TColumnEngineForLogs>().HasCleanupPortionsAtOrBefore(*MoveDataState.CleanupWatermark));
     // HasBlobsForGroups scans the GC queues, so short-circuit it behind the cheap gates.
     const bool cheapGatesPass = MoveDataState.VacuumCompleted && queues.GetTotal() == 0 && !hasCleanupPortions;
     switch (NOlap::NActualizer::ClassifyMoveDataGate(MoveDataState.VacuumCompleted, queues, hasCleanupPortions,
@@ -768,15 +775,6 @@ void TColumnShard::CheckMoveDataGate(const TActorContext& ctx) {
 
     Counters.GetCSCounters().OnMoveDataFinished();
     MoveDataState = TMoveDataState{};
-}
-
-void TColumnShard::OnMoveDataRewriteComplete(TInstant planInstant) {
-    if (!MoveDataState.Active) {
-        return;
-    }
-    if (planInstant > MoveDataState.CleanupWatermark) {
-        MoveDataState.CleanupWatermark = planInstant;
-    }
 }
 
 }   // namespace NKikimr::NColumnShard
