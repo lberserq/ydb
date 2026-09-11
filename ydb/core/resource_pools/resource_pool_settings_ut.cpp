@@ -13,6 +13,7 @@ using namespace NResourcePool;
 Y_UNIT_TEST_SUITE(ResourcePoolTest) {
     Y_UNIT_TEST(PercentDisabledSemantics) {
         UNIT_ASSERT(IsPercentDisabled(-1));
+        UNIT_ASSERT(IsPercentDisabled(-0.5));
         UNIT_ASSERT(IsPercentDisabled(NAN));
         UNIT_ASSERT(!IsPercentDisabled(0));
         UNIT_ASSERT(!IsPercentDisabled(100));
