@@ -740,8 +740,10 @@ void TColumnShard::CheckMoveDataGate(const TActorContext& ctx) {
         MoveDataState.CleanupWatermark =
             HasIndex() ? GetIndexAs<NOlap::TColumnEngineForLogs>().GetMaxCleanupPortionInstant() : TInstant::Zero();
     }
-    // A running cleanup has taken its portions out of CleanupPortions but not yet queued their blobs for GC.
-    const bool hasCleanupPortions = !MoveDataState.CleanupWatermark || BackgroundController.IsCleanupPortionsActive() ||
+    // A running cleanup holds its portions outside CleanupPortions, but only one reaching back to the watermark can hold target data.
+    const auto runningCleanupOldest = BackgroundController.GetActiveCleanupOldestRemove();
+    const bool hasCleanupPortions = !MoveDataState.CleanupWatermark ||
+        (runningCleanupOldest && *runningCleanupOldest <= *MoveDataState.CleanupWatermark) ||
         (HasIndex() && GetIndexAs<NOlap::TColumnEngineForLogs>().HasCleanupPortionsAtOrBefore(*MoveDataState.CleanupWatermark));
     // HasBlobsForGroups scans the GC queues, so short-circuit it behind the cheap gates.
     const bool cheapGatesPass = MoveDataState.VacuumCompleted && queues.GetTotal() == 0 && !hasCleanupPortions;
