@@ -737,13 +737,12 @@ void TColumnShard::CheckMoveDataGate(const TActorContext& ctx) {
         MoveDataState.CleanupWatermark.reset();
     } else if (!MoveDataState.CleanupWatermark) {
         // Whoever retired a target portion, it now waits in CleanupPortions, sits in the running cleanup, or is gone.
-        MoveDataState.CleanupWatermark =
-            HasIndex() ? GetIndexAs<NOlap::TColumnEngineForLogs>().GetMaxCleanupPortionInstant() : TInstant::Zero();
+        MoveDataState.CleanupWatermark = HasIndex() ? GetIndexAs<NOlap::TColumnEngineForLogs>().GetMaxCleanupPortionInstant() : TInstant::Zero();
     }
     // A running cleanup holds its portions outside CleanupPortions, but only one reaching back to the watermark can hold target data.
     const auto runningCleanupOldest = BackgroundController.GetActiveCleanupOldestRemove();
-    const bool hasCleanupPortions = !MoveDataState.CleanupWatermark ||
-        (runningCleanupOldest && *runningCleanupOldest <= *MoveDataState.CleanupWatermark) ||
+    const bool hasCleanupPortions =
+        !MoveDataState.CleanupWatermark || (runningCleanupOldest && *runningCleanupOldest <= *MoveDataState.CleanupWatermark) ||
         (HasIndex() && GetIndexAs<NOlap::TColumnEngineForLogs>().HasCleanupPortionsAtOrBefore(*MoveDataState.CleanupWatermark));
     // HasBlobsForGroups scans the GC queues, so short-circuit it behind the cheap gates.
     const bool cheapGatesPass = MoveDataState.VacuumCompleted && queues.GetTotal() == 0 && !hasCleanupPortions;
@@ -754,6 +753,11 @@ void TColumnShard::CheckMoveDataGate(const TActorContext& ctx) {
             return;
         case NOlap::NActualizer::EMoveDataGate::BlockedByPortions:
             Counters.GetCSCounters().OnMoveDataGateBlockedByPortions();
+            if (queues.Uncommitted) {
+                LOG_S_INFO("TColumnShard::CheckMoveDataGate: "
+                           << queues.Uncommitted << " uncommitted writes hold blobs in the target groups, waiting for commit or abort at tablet "
+                           << TabletID());
+            }
             return;
         case NOlap::NActualizer::EMoveDataGate::BlockedByCleanup:
             Counters.GetCSCounters().OnMoveDataGateBlockedByCleanup();
