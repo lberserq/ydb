@@ -793,8 +793,7 @@ Y_UNIT_TEST_SUITE(TCutHistoryCutterCounters) {
         UNIT_ASSERT_VALUES_EQUAL(cutter.GetDisprovalAttemptsForTest(key), 0);
     }
 
-    // A failed barrier enters the ~10m disproval cooldown instead of retrying every cadence, and repeated
-    // failures plateau there because the pre-barrier erase resets Attempts before each OnBarrierResult.
+    // A failed barrier waits out the disproval cooldown, and repeated failures plateau at its first step.
     Y_UNIT_TEST(BarrierFailureEntersDisprovalCooldown) {
         TTestBasicRuntime runtime;
         TAppPrepare app;
