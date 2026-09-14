@@ -373,7 +373,8 @@ struct TEvPrivate {
         enum EErrorClass {
             Internal,
             Request,
-            ConstraintViolation
+            ConstraintViolation,
+            LocksBroken
         };
 
     private:
@@ -391,6 +392,8 @@ struct TEvPrivate {
                     return NKikimrDataEvents::TEvWriteResult::STATUS_BAD_REQUEST;
                 case EErrorClass::ConstraintViolation:
                     return NKikimrDataEvents::TEvWriteResult::STATUS_CONSTRAINT_VIOLATION;
+                case EErrorClass::LocksBroken:
+                    return NKikimrDataEvents::TEvWriteResult::STATUS_LOCKS_BROKEN;
             }
         }
 
