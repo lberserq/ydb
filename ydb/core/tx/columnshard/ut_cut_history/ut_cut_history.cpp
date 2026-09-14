@@ -1039,8 +1039,7 @@ Y_UNIT_TEST_SUITE(TCutHistoryCutterCounters) {
         env.AssertNotDisproved();
     }
 
-    // A blob already released by GC is not evidence that the range is still occupied.
-    // A DoNotKeep blob is this tablet's own garbage declaration coming back, so it cannot pin the window.
+    // A blob released by GC or declared DoNotKeep by this tablet cannot pin the window.
     Y_UNIT_TEST(RangeProbeIgnoresCollectedGarbage) {
         TRangeProbeEnv env;
         env.Run({ MakeResponse(MakeBlob(TRangeProbeEnv::TabletId, TRangeProbeEnv::DataChannel, 3), /*keep=*/false, /*doNotKeep=*/true) });
