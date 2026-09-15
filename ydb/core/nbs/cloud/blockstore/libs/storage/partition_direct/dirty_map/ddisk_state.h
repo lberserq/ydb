@@ -1,6 +1,7 @@
 #pragma once
 
-#include <ydb/core/nbs/cloud/blockstore/libs/common/block_range_field.h>
+#include <ydb/core/nbs/cloud/blockstore/libs/common/block_range/block_range_field.h>
+#include <ydb/core/nbs/cloud/blockstore/libs/storage/partition_direct/protos/public.h>
 
 #include <util/generic/string.h>
 
@@ -10,6 +11,27 @@ namespace NYdb::NBS::NBlockStore::NStorage::NPartitionDirect {
 
 ////////////////////////////////////////////////////////////////////////////////
 
+// Allows to receive notifications about changes in data that need to be
+// persisted in the partition local database.
+struct IBehindAheadMonitor
+{
+    virtual ~IBehindAheadMonitor() = default;
+
+    virtual void OnBehindAheadChanged() = 0;
+};
+
+// Tracks the synchronization state of one DDisk.
+//
+// OperationalBlockCount is the watermark: blocks below it are considered
+// operational, except for ranges listed in BehindField. AheadField contains
+// successfully flushed ranges above the watermark. BehindField contains
+// ranges whose data may be stale on a lagging DDisk.
+//
+// While the DDisk is lagging, successful synchronization callbacks are stale
+// and must be ignored: the corresponding range may have been dirtied again
+// after the synchronization started. Once lagging stops, the range can be
+// synchronized and removed from BehindField, potentially advancing the
+// watermark.
 class TDDiskState
 {
 public:
@@ -34,9 +56,20 @@ public:
         Missed,      // Data not flushed to DDisk
     };
 
+    // Creates DDisk state with the specified allocator and maximum block count.
+    TDDiskState(IArenaAllocatorPtr arenaAllocator, ui16 maxBlockCount);
+
     // Enables the use of DDisk. If the operational blocks count less then total
     // block count, then the DDisk is only partially filled (fresh).
-    void Init(ui64 totalBlockCount, ui64 operationalBlockCount);
+    void Init(
+        IBehindAheadMonitor* behindAheadMonitor,
+        ui16 totalBlockCount,
+        ui16 operationalBlockCount);
+
+    // Save ahead and behind maps to proto.
+    void Save(TDDiskStateProto* proto) const;
+    // Load ahead and behind maps from proto.
+    void Load(const TDDiskStateProto& proto);
 
     // Completely disables DDisk usage.
     void SwitchOffline();
@@ -53,31 +86,49 @@ public:
     // passed to the OnRangeFlushed() method.
     [[nodiscard]] bool IsTrackingEnabled() const;
     // Updates the BehindField and the Ahead Field if required.
-    void OnRangeFlushed(TBlockRange64 range, EFlushCompletion flush);
+    void OnRangeFlushed(TBlockRange16 range, EFlushCompletion flush);
 
     [[nodiscard]] EState GetState() const;
-    [[nodiscard]] bool CanReadFromDDisk(TBlockRange64 range) const;
+    [[nodiscard]] bool CanReadFromDDisk(TBlockRange16 range) const;
+    [[nodiscard]] bool HasBehindOverlapping(TBlockRange16 range) const;
 
-    [[nodiscard]] std::optional<TBlockRange64> GetFreshRange() const;
-    void RangeSynced(TBlockRange64 range);
+    [[nodiscard]] std::optional<TBlockRange16> GetFreshRange() const;
+    void RangeSynced(TBlockRange16 range);
 
-    void UpdateWatermarkDebugOnly(ui64 blockCount);
+    // Returns the number of up-to-date blocks while the disk is not lagging.
+    [[nodiscard]] ui16 GetFreshBlockCount() const;
+    // Returns the number of outdated blocks while the disk is lagging.
+    [[nodiscard]] ui16 GetRottenBlockCount() const;
+
+    // Memory usage.
+    [[nodiscard]] TArenaPoolStats GetMemoryStats() const;
+
+    void UpdateWatermarkDebugOnly(ui16 blockCount);
     [[nodiscard]] TString DebugPrint() const;
     [[nodiscard]] TString DebugPrintAhead() const;
     [[nodiscard]] TString DebugPrintBehind() const;
+    [[nodiscard]] TString DebugPrintAheadBehindBrief() const;
 
 private:
+    void CheckInvariants() const;
     [[nodiscard]] bool IsFresh() const;
     void UpdateState(bool force);
-    void AddAhead(TBlockRange64 range);
+    void AddAhead(TBlockRange16 range);
+    void AddBehind(TBlockRange16 range);
+    [[nodiscard]] std::optional<TBlockRange16> GetOperationalRange() const;
+
+    IBehindAheadMonitor* BehindAheadMonitor = nullptr;
+
+    const IArenaAllocatorPtr ArenaAllocator;
+    const ui16 MaxBlockCount;
 
     EState State = EState::Disabled;
 
-    ui64 TotalBlockCount = 0;
+    ui16 TotalBlockCount = 0;
 
     // If the block address below OperationalBlockCount, then it can be read
     // from DDisk (except BehindField).
-    ui64 OperationalBlockCount = 0;
+    ui16 OperationalBlockCount = 0;
 
     // Lagging means that flush operations are not performed and DDisk has
     // outdated data in the ranges listed in the BehindField.

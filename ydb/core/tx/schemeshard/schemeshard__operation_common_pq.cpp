@@ -393,7 +393,7 @@ bool TConfigureParts::ProgressState(TOperationContext& context) {
                 "topicName is empty"
                     <<", pathId: " << txState->TargetPathId);
 
-    TTopicInfo::TPtr pqGroup = context.SS->Topics[txState->TargetPathId];
+    TTopicInfo::TPtr pqGroup = context.SS->Topics.at(txState->TargetPathId);
     Y_VERIFY_S(pqGroup,
                 "pqGroup is null"
                     << ", pathId " << txState->TargetPathId);
@@ -646,6 +646,9 @@ bool TPropose::HandleReply(TEvPrivate::TEvOperationPlan::TPtr& ev, TOperationCon
         context.SS->PersistCreateStep(db, pathId, step);
     }
 
+    txState->PlanStep = step;
+    context.SS->PersistTxPlanStep(db, OperationId, step);
+
     return TryPersistState(context);
 }
 
@@ -725,6 +728,27 @@ bool TPropose::CanPersistState(const TTxState& txState,
         return false;
     }
 
+    // Back-fill of an Id on a pre-existing topic must stamp IdTxStep with the exact plan
+    // step (see PersistState). For an alter StepCreated is already valid, so without this
+    // guard persist could run as soon as the shards report COMPLETE - potentially before
+    // TEvOperationPlan sets PlanStep. That would persist the Id with no IdTxStep, leaving
+    // the name-keyed fallback disabled for writers and losing live producers' mappings.
+    // Wait for the plan step instead; TEvOperationPlan will re-trigger TryPersistState.
+    if (AppData()->FeatureFlags.GetEnableTopicSourceIdMappingById()
+            && txState.TxType == TTxState::TxAlterPQGroup
+            && txState.PlanStep == InvalidStepId) {
+        TTopicInfo::TPtr pqGroup = context.SS->Topics.at(PathId);
+        if (pqGroup && pqGroup->AlterData) {
+            const auto& newTabletConfig = pqGroup->AlterData->GetTabletConfig();
+            if (newTabletConfig.HasId() && !newTabletConfig.GetId().HasTxStep()) {
+                LOG_DEBUG_S(context.Ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
+                            DebugHint() << " can't persist state: " <<
+                            "Id back-fill is waiting for the plan step to stamp TxStep");
+                return false;
+            }
+        }
+    }
+
     return true;
 }
 
@@ -744,10 +768,21 @@ void TPropose::PersistState(const TTxState& txState,
     context.SS->ClearDescribePathCaches(Path);
     context.OnComplete.PublishToSchemeBoard(OperationId, PathId);
 
-    TTopicInfo::TPtr pqGroup = context.SS->Topics[PathId];
+    TTopicInfo::TPtr pqGroup = context.SS->Topics.at(PathId);
 
     NKikimrPQ::TPQTabletConfig tabletConfig = pqGroup->GetTabletConfig();
     NKikimrPQ::TPQTabletConfig newTabletConfig = pqGroup->AlterData->GetTabletConfig();
+
+    // Only an alter can back-fill an Id on a pre-existing topic. A create always stamps the
+    // sentinel TxStep = 0 in CreatePersQueueGroup, so never touch it here.
+    if (txState.TxType == TTxState::TxAlterPQGroup
+            && newTabletConfig.HasId() && !newTabletConfig.GetId().HasTxStep()
+            && txState.PlanStep != InvalidStepId) {
+        // The Id is filled by this alter transaction: remember the exact plan step so
+        // writers keep the name-keyed fallback during the transition window.
+        newTabletConfig.MutableId()->SetTxStep(ui64(txState.PlanStep));
+        Y_PROTOBUF_SUPPRESS_NODISCARD newTabletConfig.SerializeToString(&pqGroup->AlterData->TabletConfig);
+    }
 
     pqGroup->FinishAlter();
 

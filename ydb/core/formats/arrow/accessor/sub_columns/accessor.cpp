@@ -78,7 +78,8 @@ TString TSubColumnsArray::SerializeToString(const TChunkConstructionData& extern
         TChunkConstructionData cData(
             GetRecordsCount(), nullptr, ColumnsData.GetStats().GetField(columnIdx)->type(), externalInfo.GetDefaultSerializer());
         auto* cInfo = proto.AddKeyColumns();
-        auto blobAndMeta = ColumnsData.GetStats().GetAccessorConstructor(columnIdx).SerializeToBlobAndMeta(i, cData);
+        auto blobAndMeta =
+            ColumnsData.GetStats().GetAccessorConstructor(columnIdx, Settings.GetEncodingParams()).SerializeToBlobAndMeta(i, cData);
         if (auto additional = blobAndMeta.Meta->SerializeToProto()) {
             *cInfo->MutableAdditionalAccessorData() = std::move(*additional);
         }
@@ -201,9 +202,9 @@ const NJson::TJsonValue& TJsonRestorer::GetResult() const {
 
 void TJsonRestorer::SetValueByPath(const TString& path, const NJson::TJsonValue& jsonValue) {
     // Path may be empty (for backward compatibility), so make it $."" in this case
-    auto splitResult = NSubColumns::SplitJsonPath(NSubColumns::ToJsonPath(path.empty() ? "\"\"" : path), NSubColumns::TJsonPathSplitSettings{.FillTypes = true});
-    AFL_VERIFY(splitResult.IsSuccess())("error", splitResult.GetErrorMessage())("path", path);
-    const auto [pathItems, pathTypes, _] = splitResult.DetachResult();
+    auto parsedResult = NSubColumns::ParseJsonPath(NSubColumns::ToJsonPath(path.empty() ? "\"\"" : path));
+    AFL_VERIFY(parsedResult.IsSuccess())("error", parsedResult.GetErrorMessage())("path", path);
+    const auto [pathItems, pathTypes, _] = parsedResult.DetachResult().Items;
     AFL_VERIFY(pathItems.size() > 0);
     AFL_VERIFY(pathItems.size() == pathTypes.size());
     NJson::TJsonValue* current = &Result;

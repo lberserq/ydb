@@ -150,7 +150,6 @@ public:
     TNodeMap<bool> Visited;
     bool ForceConfigure = false;
 
-public:
     void Scan(const TExprNode& node) {
         VisitExpr(node, [this](const TExprNode& n) {
             if (n.IsCallable(ConfigureName)) {
@@ -265,7 +264,6 @@ private:
         it->second = hasConfigPending;
     }
 
-private:
     THashSet<TStringBuf> PendingFileAliases_;
     THashSet<TStringBuf> PendingFolderPrefixes_;
 };
@@ -1267,8 +1265,6 @@ IGraphTransformer::TStatus TEvaluateExpressionTransformer::DoTransform(TExprNode
                 });
 
                 result = ctx.ReplaceNodes(std::move(result), replaces);
-                ctx.Step.Repeat(TExprStep::ExpandApplyForLambdas).Repeat(TExprStep::ExpandSeq);
-                hasPendingEvaluations = hasPendingEvaluations.Combine(IGraphTransformer::TStatus(IGraphTransformer::TStatus::Repeat, /*hasRestart=*/true));
                 return result;
             }
 
@@ -1293,7 +1289,12 @@ IGraphTransformer::TStatus TEvaluateExpressionTransformer::DoTransform(TExprNode
             return result;
         };
 
-        return calculateWithCache();
+        auto result = calculateWithCache();
+        if (result && isCodePipeline) {
+            ctx.Step.Repeat(TExprStep::ExpandApplyForLambdas).Repeat(TExprStep::ExpandSeq);
+            hasPendingEvaluations = hasPendingEvaluations.Combine(IGraphTransformer::TStatus(IGraphTransformer::TStatus::Repeat, /*hasRestart=*/true));
+        }
+        return result;
     }, ctx, settings);
 
     if (status.Level == IGraphTransformer::TStatus::Error) {

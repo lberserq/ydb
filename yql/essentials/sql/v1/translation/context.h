@@ -382,7 +382,6 @@ public:
     bool PositionalUnionAll = false;
     bool BogousStarInGroupByOverJoin = false;
     bool UnorderedSubqueries = true;
-    bool PragmaDataWatermarks = true;
     bool WarnOnAnsiAliasShadowing = true;
     ui32 ResultRowsLimit = 0;
     ui64 ResultSizeLimit = 0;
@@ -414,7 +413,6 @@ public:
     bool UseBlocks = false;
     bool EmitTableSource = false;
     bool AnsiLike = false;
-    bool FeatureR010 = false; // Row pattern recognition: FROM clause
     TMaybe<bool> CompactGroupBy;
     bool BlockEngineEnable = false;
     bool BlockEngineForce = false;
@@ -428,6 +426,7 @@ public:
     bool DistinctOverKeys = false;
     bool GroupByExprAfterWhere = false;
     bool FailOnGroupByExprOverride = false;
+    bool RespectWarnPolicyForUnusedSqlHints = false;
     bool EmitUnionMerge = false;
     bool OptimizeSimpleIlike = false;
     EFlattenAndAggrExprsPersistence FlattenAndAggrExprsPersistence =
@@ -489,7 +488,6 @@ class TTranslation {
 protected:
     using TSetType = TSet<ui32>;
 
-protected:
     explicit TTranslation(TContext& ctx);
     TTranslation(const TTranslation&) = default;
 
@@ -526,7 +524,6 @@ public:
 protected:
     void AltNotImplemented(const TString& ruleName, ui32 altCase, const google::protobuf::Message& node, const google::protobuf::Descriptor* descr);
 
-protected:
     TContext& Ctx_;
 };
 
