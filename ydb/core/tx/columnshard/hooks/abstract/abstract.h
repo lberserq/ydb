@@ -73,7 +73,8 @@ public:
         TTL,
         Cleanup,
         GC,
-        CleanupSchemas
+        CleanupSchemas,
+        MoveData
     };
     YDB_ACCESSOR(bool, InterruptionOnLockedTransactions, false);
 
@@ -150,6 +151,9 @@ protected:
     }
 
     virtual TDuration DoGetMaxReadStaleness(const TDuration defaultValue) const {
+        return defaultValue;
+    }
+    virtual TDuration DoGetMoveDataAdmissionWindow(const TDuration defaultValue) const {
         return defaultValue;
     }
 
@@ -366,6 +370,10 @@ public:
         return DoGetMaxReadStaleness(defaultValue);
     }
 
+    TDuration GetMoveDataAdmissionWindow(const TDuration defaultValue) const {
+        return DoGetMoveDataAdmissionWindow(defaultValue);
+    }
+
     TDuration GetMaxReadStalenessInMem() const {
         return 0.9 * GetMaxReadStaleness();
     }
@@ -426,6 +434,16 @@ public:
     }
 
     virtual void OnDeletePathId(const ui64 /* tabletId */, const NColumnShard::TUnifiedPathId& /* pathId */) {
+    }
+
+    virtual bool IsCSCutHistoryEnabled() const {
+        return false;
+    }
+
+    virtual void OnHistoryEntryNominated(const ui32 /*channel*/, const ui32 /*fromGeneration*/) {
+    }
+
+    virtual void OnHistoryEntryCut(const ui32 /*channel*/, const ui32 /*fromGeneration*/) {
     }
 };
 

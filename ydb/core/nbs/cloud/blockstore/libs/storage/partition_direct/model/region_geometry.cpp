@@ -28,6 +28,13 @@ void CheckStripeContained(
 
 ////////////////////////////////////////////////////////////////////////////////
 
+size_t GetDirectBlockGroupIndex(
+    size_t vChunkIndex,
+    size_t directBlockGroupCount)
+{
+    return vChunkIndex % directBlockGroupCount;
+}
+
 size_t GetVChunksPerRegion(ui64 vChunkSize)
 {
     Y_ABORT_UNLESS(vChunkSize > 0 && vChunkSize <= RegionSize);
@@ -77,7 +84,7 @@ size_t GetVChunkIndex(
     return stripeIndex % vChunksPerRegionCount;
 }
 
-TBlockRange64 TranslateToVChunk(
+TBlockRange16 TranslateToVChunk(
     const TVolumeConfig& volumeConfig,
     TBlockRange64 regionRange)
 {
@@ -89,10 +96,12 @@ TBlockRange64 TranslateToVChunk(
         GetVChunksPerRegion(volumeConfig.VChunkSize);
     const size_t stripeIndexInVChunk = stripeIndex / vChunksPerRegionCount;
     const size_t blockIndexInStripe = regionRange.Start % blocksPerStripe;
+    const ui64 vChunkStart =
+        stripeIndexInVChunk * blocksPerStripe + blockIndexInStripe;
 
-    return TBlockRange64::WithLength(
-        stripeIndexInVChunk * blocksPerStripe + blockIndexInStripe,
-        regionRange.Size());
+    return TBlockRange16::WithLength(
+        IntegerCast<ui16>(vChunkStart),
+        IntegerCast<ui16>(regionRange.Size()));
 }
 
 ////////////////////////////////////////////////////////////////////////////////

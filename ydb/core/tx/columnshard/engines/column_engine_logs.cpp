@@ -130,7 +130,7 @@ private:
                 {"pathId", PathId},
                 {"portion", portion->DebugString()});
             if (takePortion) {
-                Result.emplace_back(portion, nonconflicting);
+                Result.emplace_back(portion, conflicting);
             } else {
                 ++TotalFilteredPortionsCount;
             }
@@ -166,7 +166,7 @@ private:
                 {"pathId", PathId},
                 {"portion", portion->DebugString()});
             if (takePortion) {
-                Result.emplace_back(portion, nonconflicting);
+                Result.emplace_back(portion, conflicting);
             } else {
                 ++TotalFilteredPortionsCount;
             }
@@ -201,7 +201,7 @@ private:
                 return true;
             }
 
-            selectedPortionsMap.emplace(portion->GetPortionId(), TColumnEngineForLogs::TSelectedPortionInfo(portion, nonconflicting));
+            selectedPortionsMap.emplace(portion->GetPortionId(), TColumnEngineForLogs::TSelectedPortionInfo(portion, conflicting));
 
             return true;
         };
@@ -665,7 +665,7 @@ std::shared_ptr<TCleanupPortionsColumnEngineChanges> TColumnEngineForLogs::Start
 }
 
 std::vector<std::shared_ptr<TTTLColumnEngineChanges>> TColumnEngineForLogs::StartTtl(const THashMap<TInternalPathId, TTiering>& pathEviction,
-    const std::shared_ptr<NDataLocks::TManager>& dataLocksManager, const ui64 memoryUsageLimit) noexcept {
+    const std::shared_ptr<NDataLocks::TManager>& dataLocksManager, const ui64 memoryUsageLimit, const bool moveDataOnly) noexcept {
     AFL_VERIFY(dataLocksManager);
     YDB_LOG_DEBUG_COMP(NKikimrServices::TX_COLUMNSHARD_ACTUALIZATION, "",
         {"event", "StartTtl"},
@@ -683,7 +683,7 @@ std::vector<std::shared_ptr<TTTLColumnEngineChanges>> TColumnEngineForLogs::Star
             }
             g->RefreshTiering(i.second);
             context.ResetActualInstantForTest();
-            g->BuildActualizationTasks(context, actualizationLag);
+            g->BuildActualizationTasks(context, actualizationLag, moveDataOnly);
         }
     }
 
@@ -693,7 +693,7 @@ std::vector<std::shared_ptr<TTTLColumnEngineChanges>> TColumnEngineForLogs::Star
             if (pathEviction.contains(i.first)) {
                 continue;
             }
-            i.second->BuildActualizationTasks(context, actualizationLag);
+            i.second->BuildActualizationTasks(context, actualizationLag, moveDataOnly);
         }
     } else {
         YDB_LOG_WARN_COMP(NKikimrServices::TX_COLUMNSHARD_ACTUALIZATION, "",

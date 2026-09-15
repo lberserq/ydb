@@ -49,6 +49,7 @@ void TPartitionActor::HandleDeletePartition(
 // Start partition teardown, stop FastPathService first
 void TPartitionActor::StartPartitionTeardown(const NActors::TActorContext& ctx)
 {
+    UnregisterFrontendVolume(ctx);
     Become(&TThis::StateDelete);
 
     LOG_INFO(
@@ -62,6 +63,10 @@ void TPartitionActor::StartPartitionTeardown(const NActors::TActorContext& ctx)
     if (AddHostInFlight) {
         NTabletPipe::CloseClient(ctx, AddHostInFlight->BSPipeClient);
         AddHostInFlight.reset();
+    }
+    if (RemoveHostInFlight) {
+        NTabletPipe::CloseClient(ctx, RemoveHostInFlight->BSPipeClient);
+        RemoveHostInFlight.reset();
     }
 
     // Idempotent: no-op when the endpoint was never started.
@@ -225,6 +230,10 @@ void TPartitionActor::HandleAllocateResultDuringDelete(
         NTabletPipe::CloseClient(ctx, AddHostInFlight->BSPipeClient);
         AddHostInFlight.reset();
     }
+    if (RemoveHostInFlight) {
+        NTabletPipe::CloseClient(ctx, RemoveHostInFlight->BSPipeClient);
+        RemoveHostInFlight.reset();
+    }
 }
 
 // Ignore update volume config during delete
@@ -313,6 +322,37 @@ void TPartitionActor::HandleAddHostToDBGDuringDelete(
         dbgId);
 }
 
+void TPartitionActor::HandlePersistHostHealthDuringDelete(
+    const TEvPartitionDirectPrivate::TEvPersistHostHealth::TPtr& ev,
+    const NActors::TActorContext& ctx)
+{
+    Y_UNUSED(ev);
+    LOG_INFO(
+        ctx,
+        NKikimrServices::NBS_PARTITION,
+        "%s Drop PersistHostHealth during delete",
+        LogTitle.GetWithTime().c_str());
+}
+
+void TPartitionActor::HandleRemoveHostFromDBGDuringDelete(
+    const TEvPartitionDirectPrivate::TEvRemoveHostFromDBG::TPtr& ev,
+    const NActors::TActorContext& ctx)
+{
+    const size_t dbgId = ev->Get()->DirectBlockGroupId;
+    const size_t hostIndex = ev->Get()->HostIndex;
+    if (FastPathService) {
+        RejectRemoveHost(ctx, dbgId, hostIndex, "partition is being deleted");
+        return;
+    }
+
+    LOG_INFO(
+        ctx,
+        NKikimrServices::NBS_PARTITION,
+        "%s Drop RemoveHost during delete (dbgId=%lu): FastPathService stopped",
+        LogTitle.GetWithTime().c_str(),
+        dbgId);
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 STFUNC(TPartitionActor::StateDelete)
@@ -359,6 +399,9 @@ STFUNC(TPartitionActor::StateDelete)
         HFunc(
             TEvPartitionDirectPrivate::TEvAddHostToDBG,
             HandleAddHostToDBGDuringDelete);
+        HFunc(
+            TEvPartitionDirectPrivate::TEvRemoveHostFromDBG,
+            HandleRemoveHostFromDBGDuringDelete);
         // The Run() future is not cancelled by Stop(); ignore a late ready
         // signal
         IgnoreFunc(TEvPartitionDirectPrivate::TEvFastPathServiceReady);

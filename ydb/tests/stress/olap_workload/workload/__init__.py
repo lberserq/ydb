@@ -8,11 +8,15 @@ from ydb.tests.stress.olap_workload.workload.type.insert_delete import WorkloadI
 from ydb.tests.stress.olap_workload.workload.type.transactions import WorkloadTransactions
 from ydb.tests.stress.olap_workload.workload.type.rename_tables import WorkloadRenameTables
 from ydb.tests.stress.olap_workload.workload.type.encodings import WorkloadEncodings
+from ydb.tests.stress.olap_workload.workload.type.cut_history import WorkloadCutHistory, WorkloadCutHistoryVerify
+from ydb.tests.stress.olap_workload.workload.type.move_data import WorkloadMoveData
+from ydb.tests.stress.olap_workload.workload.type.decommission_ledger import WorkloadDecommissionLedger
 
 
 class WorkloadRunner:
-    def __init__(self, client, path, duration, allow_nullables_in_pk):
+    def __init__(self, client, path, duration, allow_nullables_in_pk, endpoint=None):
         self.client = client
+        self.endpoint = endpoint
         self.name = path
         self.tables_prefix = "/".join([self.client.database, self.name])
         self.duration = duration
@@ -28,7 +32,18 @@ class WorkloadRunner:
 
     def _cleanup(self):
         print(f"Cleaning up {self.tables_prefix}...")
-        deleted = self.client.remove_recursively(self.tables_prefix)
+        # Tablet restarts can still land at end of run, and a plain remove dies on Unavailable.
+        deadline = time.time() + 120
+        while True:
+            try:
+                deleted = self.client.remove_recursively(self.tables_prefix)
+                break
+            except (ydb.issues.Unavailable, ydb.issues.BadSession, ydb.issues.ConnectionError) as e:
+                if time.time() >= deadline:
+                    raise
+                # e.__class__: importing workload.type.* shadows the `type` builtin in this package.
+                print(f"Cleaning up {self.tables_prefix}: transient {e.__class__.__name__}, retrying...")
+                time.sleep(3)
         print(f"Cleaning up {self.tables_prefix}... done, {deleted} tables deleted")
 
     def run(self):
@@ -40,6 +55,12 @@ class WorkloadRunner:
             WorkloadRenameTables(self.client, self.name, stop, 10),
             WorkloadEncodings(self.client, self.name, stop),
         ]
+        # WorkloadCutHistoryVerify runs write/delete/verify cycles; restarts come from WorkloadCutHistory.
+        workloads.append(WorkloadCutHistoryVerify(self.client, self.name, stop))
+        # Both subworkloads need the console/message-bus endpoint; skip if not supplied.
+        if self.endpoint:
+            workloads.append(WorkloadCutHistory(self.client, self.name, stop, self.endpoint))
+            workloads.append(WorkloadMoveData(self.client, self.name, stop, self.endpoint, self.client.database))
         for w in workloads:
             w.start()
         started_at = started_at = time.time()
@@ -53,3 +74,26 @@ class WorkloadRunner:
         for w in workloads:
             w.join()
         print("Waiting for stop... stopped")
+
+    def run_ledger(self, report_period=60):
+        """Run only the append-only ledger, report each period, then verify every acknowledged row."""
+        stop = threading.Event()
+        ledger = WorkloadDecommissionLedger(self.client, self.name, stop)
+        ledger.start()
+        started_at = time.time()
+        prev = ledger.snapshot()
+        while time.time() - started_at < self.duration:
+            time.sleep(report_period)
+            cur = ledger.snapshot()
+            m = ledger.phase_metrics(prev, cur)
+            stamp = time.strftime("%H:%M:%S", time.gmtime(cur[0]))
+            print(f"ledger {stamp} rows={m['rows']} rows_per_s={m['rows_per_s']:.1f} "
+                  f"p99_ms={m['p99_s'] * 1000:.0f} total={sum(cur[1])}", flush=True)
+            prev = cur
+        stop.set()
+        ledger.join()
+        errors = ledger.verify()
+        print(f"ledger rows verified: {sum(ledger.snapshot()[1])}, integrity errors: {len(errors)}", flush=True)
+        for e in errors[:20]:
+            print(f"\t{e}", flush=True)
+        return not errors

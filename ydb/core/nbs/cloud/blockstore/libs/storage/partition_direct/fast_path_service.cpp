@@ -5,8 +5,9 @@
 #include "vchunk.h"
 
 #include <ydb/core/nbs/cloud/blockstore/config/config.h>
-#include <ydb/core/nbs/cloud/blockstore/libs/common/block_range.h>
+#include <ydb/core/nbs/cloud/blockstore/libs/common/block_range/block_range.h>
 #include <ydb/core/nbs/cloud/blockstore/libs/common/constants.h>
+#include <ydb/core/nbs/cloud/blockstore/libs/common/memory/arena_allocator.h>
 #include <ydb/core/nbs/cloud/blockstore/libs/service/context.h>
 #include <ydb/core/nbs/cloud/blockstore/libs/storage/model/counters_helpers.h>
 #include <ydb/core/nbs/cloud/blockstore/libs/storage/partition_direct/model/region_geometry.h>
@@ -148,6 +149,8 @@ TFastPathService::TFastPathService(
     , Scheduler(std::move(scheduler))
     , Timer(std::move(timer))
     , DirectBlockGroups(std::move(directBlockGroups))
+    , ArenaAllocator(
+          DirectBlockGroups.front()->GetArenaAllocatorPool()->GetAllocator())
     , ChaosInjectorControls(std::move(chaosInjectorControls))
     , Regions(CreateRegions(
           this,
@@ -183,6 +186,7 @@ TFastPathService::TFastPathService(
           .VChunkSize = StorageConfig->GetVChunkSize()}))
 {
     Y_ABORT_UNLESS(DirectBlockGroups.size() == ChaosInjectorControls.size());
+    Y_ABORT_UNLESS(ArenaAllocator);
 
     const ui64 copyRangeBandwidth =
         StorageConfig->GetCopyRangeBandwidthMbs() * 1_MB;
@@ -458,6 +462,19 @@ void TFastPathService::QueryAddHost(
     ActorSystem->Send(PartitionActorId, event.release());
 }
 
+void TFastPathService::QueryRemoveHost(
+    size_t directBlockGroupId,
+    size_t hostIndex,
+    ui32 dbgConnectionsConfigGeneration)
+{
+    auto event =
+        std::make_unique<TEvPartitionDirectPrivate::TEvRemoveHostFromDBG>(
+            directBlockGroupId,
+            hostIndex,
+            dbgConnectionsConfigGeneration);
+    ActorSystem->Send(PartitionActorId, event.release());
+}
+
 ui64 TFastPathService::GenerateLsn()
 {
     const ui64 lsn = ++SequenceGenerator;
@@ -499,6 +516,21 @@ TDuration TFastPathService::TakeVolumeCopyRangeBudget(ui64 byteCount)
     return CopyRangeBucket->Register(ActorSystem->Timestamp(), byteCount);
 }
 
+void TFastPathService::PersistHostHealth(
+    size_t directBlockGroupId,
+    THostIndex hostIndex,
+    EHostHealth oldHealth,
+    EHostHealth newHealth)
+{
+    auto event =
+        std::make_unique<TEvPartitionDirectPrivate::TEvPersistHostHealth>(
+            directBlockGroupId,
+            hostIndex,
+            oldHealth,
+            newHealth);
+    ActorSystem->Send(PartitionActorId, event.release());
+}
+
 TFastPathServiceInfo TFastPathService::GetMonInfo() const
 {
     return {
@@ -507,6 +539,7 @@ TFastPathServiceInfo TFastPathService::GetMonInfo() const
         .TotalVChunks =
             Regions.size() * GetVChunksPerRegion(VolumeConfig->VChunkSize),
         .DbgCount = DirectBlockGroups.size(),
+        .ArenaMemoryUsage = {.Slots = ArenaAllocator->GetDetailedStat()},
     };
 }
 
