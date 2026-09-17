@@ -3,9 +3,11 @@
 #include "public.h"
 
 #include "host.h"
+#include "host_health_policy.h"
 #include "host_mask.h"
 #include "host_stat.h"
 #include "host_state.h"
+#include "mon_model.h"
 #include "time_predictor.h"
 
 #include <ydb/core/nbs/cloud/blockstore/config/config.h>
@@ -16,39 +18,6 @@
 #include <util/generic/vector.h>
 
 namespace NYdb::NBS::NBlockStore::NStorage::NPartitionDirect {
-
-////////////////////////////////////////////////////////////////////////////////
-
-enum class EHostHealth
-{
-    Online,
-    Sufferer,
-    TemporaryOffline,
-    Offline,
-    Broken,   // changes strictly outside of Oracle
-};
-
-// Indexed by EOperation.
-using TLatencyByOperation = std::array<TLatencyStats, OperationCount>;
-
-struct TOracleHostStat
-{
-    TOracleHostStat(
-        THostIndex index,
-        const THostState& state,
-        EHostHealth health,
-        const THostStat& hostStat,
-        TLatencyByOperation latencyByOperation,
-        TInstant now);
-
-    THostIndex Index;
-    EHostState State;
-    EHostHealth Health;
-    TInflightByOperation InflightByOperation;
-    THostStat::TErrorsInfo Errors;
-    ui64 PBufferUsedSize;
-    TLatencyByOperation LatencyByOperation;
-};
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -78,6 +47,8 @@ public:
     virtual void OnDDiskDisconnected(THostIndex hostIndex, TInstant now) = 0;
     virtual void OnDDiskConnected(THostIndex hostIndex, TInstant now) = 0;
     virtual void OnDDiskBroken(THostIndex hostIndex) = 0;
+
+    virtual void OnHostRemoved(THostIndex hostIndex) = 0;
 
     virtual TDuration GetHostReconnectDelay(THostIndex hostIndex) = 0;
 
@@ -117,7 +88,8 @@ class TOracle: public IOracle
 public:
     TOracle(
         TStorageConfigPtr storageConfig,
-        IHostStateController* hostStateController);
+        IHostStateController* hostStateController,
+        const TVector<EHostHealth>& hostHealths);
     ~TOracle() override;
 
     void Think(TInstant now);
@@ -147,6 +119,8 @@ public:
         THostIndex hostIndex) override;
     // Device is permanently broken, so force the host offline.
     void OnDDiskBroken(THostIndex hostIndex) override;
+
+    void OnHostRemoved(THostIndex hostIndex) override;
 
     [[nodiscard]] THostIndex SelectBestPBufferHost(
         THostMask hosts,
@@ -180,7 +154,7 @@ public:
     // Check if it's valid to QueryAddHost from HostStateController and do it.
     void MaybeQueryAddHost();
 
-    [[nodiscard]] TVector<TOracleHostStat> BuildHostStats(TInstant now) const;
+    [[nodiscard]] TVector<THostSnapshot> BuildHostStats(TInstant now) const;
     [[nodiscard]] size_t GetLatencyHistoryCapacity() const;
 
 private:
@@ -207,6 +181,7 @@ private:
     TVector<EHostHealth> HostsHealths;
     TVector<TBackoffDelayProvider> HostsReconnectDelays;
     TVector<TTimePredictor> TimePredictors;
+    std::unique_ptr<IHostHealthPolicy> HealthPolicy;
 };
 
 ////////////////////////////////////////////////////////////////////////////////

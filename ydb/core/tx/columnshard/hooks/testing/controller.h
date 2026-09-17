@@ -13,6 +13,14 @@
 
 namespace NKikimr::NYDBTest::NColumnShard {
 
+// What a test sees of a committed MoveData row; the row struct itself lives behind blobs_action.
+struct TMoveDataRowEvent {
+    ui32 Channel = 0;
+    ui32 FromGeneration = 0;
+    ui32 ToGenerationExclusive = 0;
+    ui32 GroupId = 0;
+};
+
 class TController: public TReadOnlyController {
 private:
     using TBase = TReadOnlyController;
@@ -27,10 +35,14 @@ private:
     YDB_ACCESSOR_DEF(std::optional<TDuration>, OverrideCompactionActualizationLag);
     YDB_ACCESSOR_DEF(std::optional<TDuration>, OverrideTasksActualizationLag);
     YDB_ACCESSOR_DEF(std::optional<TDuration>, OverrideMaxReadStaleness);
+    YDB_ACCESSOR_DEF(std::optional<TDuration>, OverrideMoveDataAdmissionWindow);
     YDB_ACCESSOR(std::optional<ui64>, OverrideMemoryLimitForPortionReading, 100);
     YDB_ACCESSOR(std::optional<ui64>, OverrideLimitForPortionsMetadataAsk, 1);
     YDB_ACCESSOR(std::optional<NOlap::NSplitter::TSplitSettings>, OverrideBlobSplitSettings, NOlap::NSplitter::TSplitSettings::BuildForTests());
     YDB_FLAG_ACCESSOR(ExternalStorageUnavailable, false);
+
+    std::vector<TMoveDataRowEvent> MoveDataRows;
+    std::function<void()> OnMoveDataRowsWrittenCallback;
 
     YDB_ACCESSOR_DEF(std::optional<NKikimrProto::EReplyStatus>, OverrideBlobPutResultOnWriteValue);
 
@@ -289,6 +301,10 @@ protected:
         return OverrideMaxReadStaleness.value_or(def);
     }
 
+    virtual TDuration DoGetMoveDataAdmissionWindow(const TDuration def) const override {
+        return OverrideMoveDataAdmissionWindow.value_or(def);
+    }
+
     virtual ui64 DoGetMetadataRequestSoftMemoryLimit(const ui64 /* def */) const override {
         return 0;
     }
@@ -364,6 +380,32 @@ public:
     void EnableBackground(const EBackground id) {
         TGuard<TMutex> g(Mutex);
         DisabledBackgrounds.erase(id);
+    }
+
+    virtual void OnMoveDataRowPersisted(
+        const ui32 channel, const ui32 fromGeneration, const ui32 toGenerationExclusive, const ui32 groupId) override {
+        TGuard<TMutex> g(Mutex);
+        MoveDataRows.emplace_back(TMoveDataRowEvent{ channel, fromGeneration, toGenerationExclusive, groupId });
+    }
+
+    std::vector<TMoveDataRowEvent> GetMoveDataRows() const {
+        TGuard<TMutex> g(Mutex);
+        return MoveDataRows;
+    }
+
+    void ClearMoveDataRows() {
+        TGuard<TMutex> g(Mutex);
+        MoveDataRows.clear();
+    }
+
+    virtual void OnMoveDataRowsWritten() override {
+        if (OnMoveDataRowsWrittenCallback) {
+            OnMoveDataRowsWrittenCallback();
+        }
+    }
+
+    void SetOnMoveDataRowsWritten(std::function<void()> callback) {
+        OnMoveDataRowsWrittenCallback = std::move(callback);
     }
 
     std::vector<ui64> GetShardActualIds() const {

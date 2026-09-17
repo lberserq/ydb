@@ -65,7 +65,7 @@ TStepAction::TStepAction(
     : TBase(ownerActorId, source->GetContext()->GetCommonContext()->GetCounters().GetAssembleTasksGuard())
     , Source(std::move(source))
     , Cursor(std::move(cursor))
-    , CachedSourceId(Source->GetDeprecatedPortionId())
+    , CachedSourceId(Source->GetSourceId())
 {
     if (changeSyncSection) {
         Source->StartAsyncSection();
@@ -152,9 +152,9 @@ void TProgramStep::ReportTracing(const std::shared_ptr<IDataSource>& source, con
         }
     }
 
-#define PROGRAM_PROBE_ARGS                                                                                                            \
-    source->GetDataSourceOrbit(), source->GetRawPathId(), source->GetTabletId(), source->GetTxId(), source->GetDeprecatedPortionId(), \
-        step.GetStepIndex(), tracingName, nodeId, finishDurationMs, executionDurationMs, filteredRows
+#define PROGRAM_PROBE_ARGS                                                                                                                      \
+    source->GetDataSourceOrbit(), source->GetRawPathId(), source->GetTabletId(), source->GetTxId(), source->GetSourceId(), step.GetStepIndex(), \
+        tracingName, nodeId, finishDurationMs, executionDurationMs, filteredRows
 #define PROGRAM_PROBE_RESERVED reservedMemory
 #define PROGRAM_PROBE_TAIL tracingExecutionResult, details
     switch (processorType) {
@@ -295,7 +295,6 @@ TConclusion<bool> TProgramStep::DoExecuteInplace(const std::shared_ptr<IDataSour
             source->MutableExecutionContext().OnFailedProgramStepExecution();
             return conclusion;
         }
-
         // A nested continuation may have finished the shared program (extracted resources / stopped visitor)
         // while Execute() was in progress. Do not keep mutating that shared state from this frame.
         // Pin visitor once — HasExecutionVisitor + GetExecutionVisitorVerified is a TOCTOU with Stop().

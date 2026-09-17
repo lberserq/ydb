@@ -1,4 +1,5 @@
 #include <ydb/core/base/tablet_resolver.h>
+#include <ydb/core/base/tablet_pipecache.h>
 #include <ydb/core/formats/arrow/arrow_helpers.h>
 #include <ydb/core/kqp/gateway/actors/scheme.h>
 #include <ydb/core/kqp/gateway/kqp_gateway.h>
@@ -404,6 +405,225 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
             const auto statistics = describe.GetTableDescription().GetMultiColumnStatisticsDescriptions();
             UNIT_ASSERT_VALUES_EQUAL(statistics.size(), 1);
             UNIT_ASSERT_VALUES_EQUAL(statistics[0].GetName(), "orders_stats");
+        }
+    }
+
+    Y_UNIT_TEST(CreateTableWithEqHeightHistogram) {
+        NKikimrConfig::TFeatureFlags featureFlags;
+        featureFlags.SetEnableColumnStatistics(true);
+        TKikimrRunner kikimr(featureFlags);
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+
+        {
+            auto result = session.ExecuteSchemeQuery(R"(
+                CREATE TABLE `/Root/Orders` (
+                    order_id Uint64,
+                    customer_id Uint64,
+                    order_date Date,
+                    status Utf8,
+                    PRIMARY KEY (order_id),
+                    STATISTICS orders_hist ON (customer_id, order_date) WITH (EQ_HEIGHT_HISTOGRAM)
+                );
+            )").ExtractValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+        }
+
+        {
+            auto describe = session.DescribeTable("/Root/Orders").ExtractValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(describe.GetStatus(), EStatus::SUCCESS, describe.GetIssues().ToString());
+            const auto statistics = describe.GetTableDescription().GetMultiColumnStatisticsDescriptions();
+            UNIT_ASSERT_VALUES_EQUAL(statistics.size(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(statistics[0].GetName(), "orders_hist");
+            UNIT_ASSERT_VALUES_EQUAL(statistics[0].GetColumns().size(), 2);
+            UNIT_ASSERT_VALUES_EQUAL(statistics[0].GetColumns()[0], "customer_id");
+            UNIT_ASSERT_VALUES_EQUAL(statistics[0].GetColumns()[1], "order_date");
+            UNIT_ASSERT_VALUES_EQUAL(statistics[0].GetTypes().size(), 1);
+            UNIT_ASSERT(statistics[0].GetTypes()[0] == EMultiColumnStatisticsType::EqHeightHistogram);
+        }
+
+        {
+            auto result = session.ExecuteSchemeQuery(R"(
+                ALTER TABLE `/Root/Orders`
+                    ADD STATISTICS status_hist ON (status) WITH (EQ_HEIGHT_HISTOGRAM);
+            )").ExtractValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+        }
+
+        {
+            auto describe = session.DescribeTable("/Root/Orders").ExtractValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(describe.GetStatus(), EStatus::SUCCESS, describe.GetIssues().ToString());
+            const auto statistics = describe.GetTableDescription().GetMultiColumnStatisticsDescriptions();
+            UNIT_ASSERT_VALUES_EQUAL(statistics.size(), 2);
+            TSet<std::string> names;
+            for (const auto& s : statistics) {
+                names.insert(s.GetName());
+                UNIT_ASSERT_VALUES_EQUAL(s.GetTypes().size(), 1);
+                UNIT_ASSERT(s.GetTypes()[0] == EMultiColumnStatisticsType::EqHeightHistogram);
+            }
+            UNIT_ASSERT(names.contains("orders_hist"));
+            UNIT_ASSERT(names.contains("status_hist"));
+        }
+
+        {
+            auto qSession = kikimr.GetQueryClient().GetSession().GetValueSync().GetSession();
+            auto showResult = qSession.ExecuteQuery(
+                "SHOW CREATE TABLE `/Root/Orders`;",
+                NYdb::NQuery::TTxControl::NoTx()).ExtractValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(showResult.GetStatus(), EStatus::SUCCESS, showResult.GetIssues().ToString());
+            UNIT_ASSERT(!showResult.GetResultSets().empty());
+            NYdb::TResultSetParser parser(showResult.GetResultSet(0));
+            UNIT_ASSERT_C(parser.TryNextRow(), "SHOW CREATE must return at least one row");
+            TString createText = parser.ColumnParser(0).GetOptionalUtf8().value_or("");
+            UNIT_ASSERT_C(createText.Contains("EQ_HEIGHT_HISTOGRAM"),
+                "SHOW CREATE should render EQ_HEIGHT_HISTOGRAM, got: " << createText);
+            UNIT_ASSERT_C(createText.Contains("orders_hist") && createText.Contains("status_hist"),
+                "SHOW CREATE should list both histograms, got: " << createText);
+        }
+    }
+
+    Y_UNIT_TEST(EqHeightHistogramRejectsUnencodableType) {
+        NKikimrConfig::TFeatureFlags featureFlags;
+        featureFlags.SetEnableColumnStatistics(true);
+        TKikimrRunner kikimr(featureFlags);
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+
+        {
+            auto result = session.ExecuteSchemeQuery(R"(
+                CREATE TABLE `/Root/Orders` (
+                    order_id Uint64,
+                    payload Json,
+                    PRIMARY KEY (order_id),
+                    STATISTICS payload_hist ON (payload) WITH (EQ_HEIGHT_HISTOGRAM)
+                );
+            )").ExtractValueSync();
+            UNIT_ASSERT_VALUES_UNEQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+            UNIT_ASSERT_C(TString(result.GetIssues().ToString()).Contains(
+                "EQ_HEIGHT_HISTOGRAM is not supported for column 'payload' of type Json"),
+                result.GetIssues().ToString());
+        }
+
+        {
+            auto result = session.ExecuteSchemeQuery(R"(
+                CREATE TABLE `/Root/Orders` (
+                    order_id Uint64,
+                    payload Json,
+                    status Utf8,
+                    PRIMARY KEY (order_id)
+                );
+            )").ExtractValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+        }
+
+        {
+            auto result = session.ExecuteSchemeQuery(R"(
+                ALTER TABLE `/Root/Orders`
+                    ADD STATISTICS payload_hist ON (payload) WITH (EQ_HEIGHT_HISTOGRAM);
+            )").ExtractValueSync();
+            UNIT_ASSERT_VALUES_UNEQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+            UNIT_ASSERT_C(TString(result.GetIssues().ToString()).Contains(
+                "EQ_HEIGHT_HISTOGRAM is not supported for column 'payload' of type Json"),
+                result.GetIssues().ToString());
+        }
+
+        {
+            auto result = session.ExecuteSchemeQuery(R"(
+                CREATE TABLE `/Root/ColumnOrders` (
+                    order_id Uint64 NOT NULL,
+                    payload Json,
+                    PRIMARY KEY (order_id),
+                    STATISTICS payload_hist ON (payload) WITH (EQ_HEIGHT_HISTOGRAM)
+                )
+                WITH (STORE = COLUMN);
+            )").ExtractValueSync();
+            UNIT_ASSERT_VALUES_UNEQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+            UNIT_ASSERT_C(TString(result.GetIssues().ToString()).Contains(
+                "EQ_HEIGHT_HISTOGRAM is not supported for column 'payload' of type Json"),
+                result.GetIssues().ToString());
+        }
+
+        {
+            auto result = session.ExecuteSchemeQuery(R"(
+                CREATE TABLE `/Root/ColumnOrders` (
+                    order_id Uint64 NOT NULL,
+                    payload Json,
+                    PRIMARY KEY (order_id)
+                )
+                WITH (STORE = COLUMN);
+            )").ExtractValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+        }
+
+        {
+            auto result = session.ExecuteSchemeQuery(R"(
+                ALTER TABLE `/Root/ColumnOrders`
+                    ADD STATISTICS payload_hist ON (payload) WITH (EQ_HEIGHT_HISTOGRAM);
+            )").ExtractValueSync();
+            UNIT_ASSERT_VALUES_UNEQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+            UNIT_ASSERT_C(TString(result.GetIssues().ToString()).Contains(
+                "EQ_HEIGHT_HISTOGRAM is not supported for column 'payload' of type Json"),
+                result.GetIssues().ToString());
+        }
+    }
+
+    Y_UNIT_TEST(CreateColumnTableWithEqHeightHistogram) {
+        NKikimrConfig::TFeatureFlags featureFlags;
+        featureFlags.SetEnableColumnStatistics(true);
+        TKikimrRunner kikimr(featureFlags);
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+
+        {
+            auto result = session.ExecuteSchemeQuery(R"(
+                CREATE TABLE `/Root/ColumnOrders` (
+                    order_id Uint64 NOT NULL,
+                    customer_id Uint64,
+                    order_date Date,
+                    PRIMARY KEY (order_id),
+                    STATISTICS orders_hist ON (customer_id, order_date) WITH (EQ_HEIGHT_HISTOGRAM)
+                )
+                WITH (STORE = COLUMN);
+            )").ExtractValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+        }
+
+        {
+            auto describe = session.DescribeTable("/Root/ColumnOrders").ExtractValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(describe.GetStatus(), EStatus::SUCCESS, describe.GetIssues().ToString());
+            const auto statistics = describe.GetTableDescription().GetMultiColumnStatisticsDescriptions();
+            UNIT_ASSERT_VALUES_EQUAL(statistics.size(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(statistics[0].GetName(), "orders_hist");
+            UNIT_ASSERT_VALUES_EQUAL(statistics[0].GetTypes().size(), 1);
+            UNIT_ASSERT(statistics[0].GetTypes()[0] == EMultiColumnStatisticsType::EqHeightHistogram);
+        }
+
+        {
+            auto result = session.ExecuteSchemeQuery(R"(
+                ALTER TABLE `/Root/ColumnOrders`
+                    ADD STATISTICS date_hist ON (order_date) WITH (EQ_HEIGHT_HISTOGRAM);
+            )").ExtractValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+        }
+
+        {
+            auto describe = session.DescribeTable("/Root/ColumnOrders").ExtractValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(describe.GetStatus(), EStatus::SUCCESS, describe.GetIssues().ToString());
+            UNIT_ASSERT_VALUES_EQUAL(describe.GetTableDescription().GetMultiColumnStatisticsDescriptions().size(), 2);
+        }
+
+        {
+            auto qSession = kikimr.GetQueryClient().GetSession().GetValueSync().GetSession();
+            auto showResult = qSession.ExecuteQuery(
+                "SHOW CREATE TABLE `/Root/ColumnOrders`;",
+                NYdb::NQuery::TTxControl::NoTx()).ExtractValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(showResult.GetStatus(), EStatus::SUCCESS, showResult.GetIssues().ToString());
+            UNIT_ASSERT(!showResult.GetResultSets().empty());
+            NYdb::TResultSetParser parser(showResult.GetResultSet(0));
+            UNIT_ASSERT_C(parser.TryNextRow(), "SHOW CREATE must return at least one row");
+            TString createText = parser.ColumnParser(0).GetOptionalUtf8().value_or("");
+            UNIT_ASSERT_C(createText.Contains("EQ_HEIGHT_HISTOGRAM"),
+                "SHOW CREATE should render EQ_HEIGHT_HISTOGRAM, got: " << createText);
         }
     }
 
@@ -4215,12 +4435,14 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
             return settings;
         }
 
-        TKikimrRunnerWithPauseIndexBuild(bool yqlDetailedLogging = false, bool onlineUnique = false, std::optional<bool> enableIndexStreamWrite = std::nullopt)
+        TKikimrRunnerWithPauseIndexBuild(bool yqlDetailedLogging = false, bool onlineUnique = false,
+            std::optional<bool> enableIndexStreamWrite = std::nullopt, bool pauseValidationResponse = false)
             : TKikimrRunner(MakeSettings(onlineUnique, enableIndexStreamWrite))
             , BuildIndexRequestPromise(NThreading::NewPromise<void>())
             , BuildIndexRequest(BuildIndexRequestPromise.GetFuture())
             , ValidateIndexRequestPromise(NThreading::NewPromise<void>())
             , ValidateIndexRequest(ValidateIndexRequestPromise.GetFuture())
+            , PauseValidationResponse(pauseValidationResponse)
         {
             GetTestServer().GetRuntime()->SetLogPriority(NKikimrServices::BUILD_INDEX, NActors::NLog::PRI_TRACE);
             if (yqlDetailedLogging) {
@@ -4236,8 +4458,12 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
                     BuildIndexRequestPromise.SetValue();
                     BuildIndexRequestEvent.Swap(event);
                     return NActors::TTestActorRuntimeBase::EEventAction::DROP;
-                } else if (!ValidateIndexEventIsIntercepted && event->Type == static_cast<ui32>(NKikimr::TEvDataShard::EvValidateUniqueIndexRequest)) {
-                    Cerr << "NKikimr::TEvDataShard::TEvValidateUniqueIndexRequest is intercepted\n";
+                } else if (!ValidateIndexEventIsIntercepted &&
+                    ((!PauseValidationResponse && event->Type == static_cast<ui32>(NKikimr::TEvDataShard::EvValidateUniqueIndexRequest)) ||
+                     (PauseValidationResponse && event->Type == static_cast<ui32>(NKikimr::TEvDataShard::EvValidateUniqueIndexResponse))))
+                {
+                    Cerr << "NKikimr::TEvDataShard validation "
+                        << (PauseValidationResponse ? "response" : "request") << " is intercepted\n";
                     ValidateIndexEventIsIntercepted = true;
                     ValidateIndexRequestPromise.SetValue();
                     ValidateIndexRequestEvent.Swap(event);
@@ -4263,6 +4489,15 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
             GetTestServer().GetRuntime()->Send(ValidateIndexRequestEvent.Release());
         }
 
+        ui64 GetValidateIndexTabletId() const {
+            return ValidateIndexRequestEvent
+                ->Get<TEvDataShard::TEvValidateUniqueIndexResponse>()->Record.GetTabletId();
+        }
+
+        void DropValidateIndexEvent() {
+            ValidateIndexRequestEvent.Reset();
+        }
+
     private:
         NThreading::TPromise<void> BuildIndexRequestPromise;
         NThreading::TFuture<void> BuildIndexRequest;
@@ -4273,6 +4508,7 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
         NThreading::TFuture<void> ValidateIndexRequest;
         TAutoPtr<IEventHandle> ValidateIndexRequestEvent;
         bool ValidateIndexEventIsIntercepted = false;
+        const bool PauseValidationResponse = false;
     };
 
     void BuildingUniqIndexAllowsTableModifications(bool sqlInterface, bool onlineBuild, std::optional<bool> enableIndexStreamWrite) {
@@ -4438,6 +4674,234 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
 
     Y_UNIT_TEST_TWIN(BuildingUniqIndexAllowsTableModificationsSql, EnableIndexStreamWrite) {
         BuildingUniqIndexAllowsTableModifications(true, true, EnableIndexStreamWrite);
+    }
+
+    Y_UNIT_TEST(OnlineUniqueValidationFailureCleansUpAndAllowsRetry) {
+        TKikimrRunnerWithPauseIndexBuild kikimr(
+            false /* yqlDetailedLogging */, true /* onlineUnique */, true /* enableIndexStreamWrite */);
+
+        kikimr.RunCall([&] {
+            auto queryClient = kikimr.GetQueryClient();
+            auto tableClient = kikimr.GetTableClient();
+
+            auto execute = [&](const TString& query, EStatus expected) {
+                auto result = queryClient.ExecuteQuery(
+                    query, NYdb::NQuery::TTxControl::NoTx()).ExtractValueSync();
+                if (result.GetStatus() != expected) {
+                    ythrow yexception() << "Unexpected status " << result.GetStatus()
+                        << ", expected " << expected << ": " << result.GetIssues().ToString()
+                        << "\nQuery:\n" << query;
+                }
+                return result;
+            };
+
+            execute(R"sql(
+                CREATE TABLE `/Root/TestTable` (
+                    Key Uint64,
+                    Value String,
+                    PRIMARY KEY (Key)
+                );
+            )sql", EStatus::SUCCESS);
+            execute(R"sql(
+                UPSERT INTO `/Root/TestTable` (Key, Value) VALUES
+                    (1, "duplicate"), (2, "initial");
+            )sql", EStatus::SUCCESS);
+
+            auto firstBuild = queryClient.ExecuteQuery(R"sql(
+                ALTER TABLE `/Root/TestTable`
+                ADD INDEX uniq_value_idx GLOBAL UNIQUE ON (Value);
+            )sql", NYdb::NQuery::TTxControl::NoTx());
+
+            // The request is paused before the snapshot is created. Online mode
+            // allows this conflicting row to enter the source table.
+            kikimr.WaitBuildIndex();
+            execute(R"sql(
+                INSERT INTO `/Root/TestTable` (Key, Value) VALUES (3, "duplicate");
+            )sql", EStatus::SUCCESS);
+
+            kikimr.ContinueBuildIndex();
+            kikimr.WaitValidateIndex();
+
+            // A non-conflicting write at the validation boundary must survive
+            // cleanup even though validation subsequently rejects the build.
+            execute(R"sql(
+                INSERT INTO `/Root/TestTable` (Key, Value) VALUES (4, "during-validation");
+            )sql", EStatus::SUCCESS);
+            kikimr.ContinueValidateIndex();
+
+            auto failedBuild = firstBuild.GetValueSync();
+            if (failedBuild.GetStatus() != EStatus::PRECONDITION_FAILED ||
+                failedBuild.GetIssues().ToString().find("Duplicate key found") == std::string::npos)
+            {
+                ythrow yexception() << "Unique build must fail validation: "
+                    << failedBuild.GetStatus() << ": " << failedBuild.GetIssues().ToString();
+            }
+
+            // A failed online build must not expose a partial public index and
+            // must release the table for ordinary modifications.
+            auto describe = tableClient.CreateSession().GetValueSync().GetSession()
+                .DescribeTable("/Root/TestTable").ExtractValueSync();
+            if (!describe.IsSuccess() || !describe.GetTableDescription().GetIndexDescriptions().empty()) {
+                ythrow yexception() << "Failed build left a public index: "
+                    << describe.GetIssues().ToString();
+            }
+            execute(R"sql(
+                UPDATE `/Root/TestTable` SET Value = "repaired" WHERE Key = 3;
+            )sql", EStatus::SUCCESS);
+
+            // Retry after repairing the duplicate. The interception points are
+            // one-shot, so this build runs to READY without timing or sleeps.
+            execute(R"sql(
+                ALTER TABLE `/Root/TestTable`
+                ADD INDEX uniq_value_idx GLOBAL UNIQUE ON (Value);
+            )sql", EStatus::SUCCESS);
+
+            describe = tableClient.CreateSession().GetValueSync().GetSession()
+                .DescribeTable("/Root/TestTable").ExtractValueSync();
+            if (!describe.IsSuccess() || describe.GetTableDescription().GetIndexDescriptions().size() != 1 ||
+                describe.GetTableDescription().GetIndexDescriptions().front().GetIndexType() != EIndexType::GlobalUnique)
+            {
+                ythrow yexception() << "Retried unique index is not READY/public: "
+                    << describe.GetIssues().ToString();
+            }
+
+            // The recovered index enforces uniqueness, while the table remains
+            // writable for a non-conflicting value.
+            execute(R"sql(
+                INSERT INTO `/Root/TestTable` (Key, Value) VALUES (5, "duplicate");
+            )sql", EStatus::PRECONDITION_FAILED);
+            execute(R"sql(
+                INSERT INTO `/Root/TestTable` (Key, Value) VALUES (5, "free");
+            )sql", EStatus::SUCCESS);
+
+            auto indexed = execute(R"sql(
+                SELECT Key FROM `/Root/TestTable` VIEW uniq_value_idx ORDER BY Key;
+            )sql", EStatus::SUCCESS);
+            NKqp::CompareYson(R"([[[1u]];[[2u]];[[3u]];[[4u]];[[5u]]])",
+                FormatResultSetYson(indexed.GetResultSet(0)));
+            return true;
+        });
+    }
+
+    Y_UNIT_TEST(OnlineUniqueValidationRecoversAfterDataShardReboot) {
+        // Intercept the response, not the request: validation has completed on
+        // DataShard, but SchemeShard has not persisted the result yet.
+        TKikimrRunnerWithPauseIndexBuild kikimr(
+            false /* yqlDetailedLogging */, true /* onlineUnique */,
+            true /* enableIndexStreamWrite */, true /* pauseValidationResponse */);
+
+        kikimr.RunCall([&] {
+            auto queryClient = kikimr.GetQueryClient();
+            auto tableClient = kikimr.GetTableClient();
+
+            auto execute = [&](const TString& query, EStatus expected) {
+                auto result = queryClient.ExecuteQuery(
+                    query, NYdb::NQuery::TTxControl::NoTx()).ExtractValueSync();
+                if (result.GetStatus() != expected) {
+                    ythrow yexception() << "Unexpected status " << result.GetStatus()
+                        << ", expected " << expected << ": " << result.GetIssues().ToString()
+                        << "\nQuery:\n" << query;
+                }
+                return result;
+            };
+
+            execute(R"sql(
+                CREATE TABLE `/Root/TestTable` (
+                    Key Uint64,
+                    Value String,
+                    PRIMARY KEY (Key)
+                );
+            )sql", EStatus::SUCCESS);
+            execute(R"sql(
+                UPSERT INTO `/Root/TestTable` (Key, Value) VALUES
+                    (1, "a"), (2, "b"), (3, "c");
+            )sql", EStatus::SUCCESS);
+
+            auto build = queryClient.ExecuteQuery(R"sql(
+                ALTER TABLE `/Root/TestTable`
+                ADD INDEX uniq_value_idx GLOBAL UNIQUE ON (Value);
+            )sql", NYdb::NQuery::TTxControl::NoTx());
+            kikimr.WaitBuildIndex();
+            kikimr.ContinueBuildIndex();
+            kikimr.WaitValidateIndex();
+
+            // Validation has already scanned the shadow index. A concurrent
+            // distinct write is accepted and must be reflected atomically;
+            // a duplicate is rejected without a partial main-table effect.
+            execute(R"sql(
+                INSERT INTO `/Root/TestTable` (Key, Value) VALUES (4, "d");
+            )sql", EStatus::SUCCESS);
+            execute(R"sql(
+                INSERT INTO `/Root/TestTable` (Key, Value) VALUES (100, "a");
+            )sql", EStatus::PRECONDITION_FAILED);
+
+            // Validation has finished, but its response is still held. Reboot
+            // the affected index DataShard at this exact boundary, then let
+            // SchemeShard consume the already produced response and finalize
+            // from persisted validation/build state.
+            auto& runtime = *kikimr.GetTestServer().GetRuntime();
+            const ui64 validationShard = kikimr.GetValidateIndexTabletId();
+            runtime.Send(MakePipePerNodeCacheID(false), NActors::TActorId(),
+                new TEvPipeCache::TEvForward(
+                    new TEvents::TEvPoisonPill(), validationShard, false));
+            auto afterReboot = execute(R"sql(
+                SELECT COUNT(*) AS Count
+                FROM `/Root/TestTable/uniq_value_idx/indexImplTable`;
+            )sql", EStatus::SUCCESS);
+            NKqp::CompareYson(R"([[4u]])",
+                FormatResultSetYson(afterReboot.GetResultSet(0)));
+            // The old response is intentionally lost. Restart recovery has
+            // already produced a new response while the readiness probe drove
+            // the rebooted tablet, so no stale response is replayed.
+            kikimr.DropValidateIndexEvent();
+
+            auto buildResult = build.GetValueSync();
+            if (!buildResult.IsSuccess()) {
+                ythrow yexception() << "Unique build did not recover after DataShard reboot: "
+                    << buildResult.GetStatus() << ": " << buildResult.GetIssues().ToString();
+            }
+
+            auto describe = tableClient.CreateSession().GetValueSync().GetSession()
+                .DescribeTable("/Root/TestTable").ExtractValueSync();
+            if (!describe.IsSuccess() || describe.GetTableDescription().GetIndexDescriptions().size() != 1 ||
+                describe.GetTableDescription().GetIndexDescriptions().front().GetIndexType() != EIndexType::GlobalUnique)
+            {
+                ythrow yexception() << "Recovered unique index is not public/Ready: "
+                    << describe.GetIssues().ToString();
+            }
+
+            // The table is unlocked after recovery and the constraint remains
+            // atomic for subsequent writes.
+            execute(R"sql(
+                INSERT INTO `/Root/TestTable` (Key, Value) VALUES (5, "e");
+            )sql", EStatus::SUCCESS);
+            execute(R"sql(
+                INSERT INTO `/Root/TestTable` (Key, Value) VALUES (101, "b");
+            )sql", EStatus::PRECONDITION_FAILED);
+
+            const TString expectedMain =
+                R"([[[1u];["a"]];[[2u];["b"]];[[3u];["c"]];[[4u];["d"]];[[5u];["e"]]])";
+            auto main = execute(R"sql(
+                SELECT Key, Value FROM `/Root/TestTable` ORDER BY Key;
+            )sql", EStatus::SUCCESS);
+            NKqp::CompareYson(expectedMain, FormatResultSetYson(main.GetResultSet(0)));
+
+            auto viaIndex = execute(R"sql(
+                SELECT Key, Value FROM `/Root/TestTable`
+                VIEW uniq_value_idx ORDER BY Key;
+            )sql", EStatus::SUCCESS);
+            NKqp::CompareYson(expectedMain, FormatResultSetYson(viaIndex.GetResultSet(0)));
+
+            auto impl = execute(R"sql(
+                SELECT Value, Key
+                FROM `/Root/TestTable/uniq_value_idx/indexImplTable`
+                ORDER BY Value, Key;
+            )sql", EStatus::SUCCESS);
+            NKqp::CompareYson(
+                R"([[["a"];[1u]];[["b"];[2u]];[["c"];[3u]];[["d"];[4u]];[["e"];[5u]]])",
+                FormatResultSetYson(impl.GetResultSet(0)));
+            return true;
+        });
     }
 
     void ValidatingUniqIndex(bool sqlInterface, bool isUnique) {
@@ -12392,6 +12856,14 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
         {
             const auto query = R"(
                 --!syntax_v1
+                CREATE TOPIC `/Root/dead_letter_queue_97`
+            )";
+            const auto result = executeQuery(query);
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+        }
+        {
+            const auto query = R"(
+                --!syntax_v1
                 ALTER TOPIC `/Root/topic`
                     ALTER CONSUMER cs SET (default_processing_timeout = Interval('PT31S'), max_processing_attempts = 67, dead_letter_policy = 'move', dead_letter_queue = 'dead_letter_queue_97')
             )";
@@ -12523,6 +12995,87 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
             UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::GENERIC_ERROR, result.GetIssues().ToString());
             UNIT_ASSERT_STRING_CONTAINS_C(result.GetIssues().ToString(), "dead_letter_queue is required for shared consumers with dead letter policy 'move'", result.GetIssues().ToString());
         }
+        {
+            const auto query = R"(
+                --!syntax_v1
+                CREATE TOPIC `/Root/topic1` (
+                    CONSUMER cs WITH (type='shared', dead_letter_policy='move', dead_letter_queue='')
+                )
+            )";
+            const auto result = executeQuery(query);
+            UNIT_ASSERT_VALUES_UNEQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+            UNIT_ASSERT_STRING_CONTAINS_C(result.GetIssues().ToString(), "Dead letter queue cannot be empty", result.GetIssues().ToString());
+        }
+    }
+
+    Y_UNIT_TEST_TWIN(CreateTopicSharedConsumerDlqAccessDenied, UseQueryService) {
+        TKikimrRunner kikimr;
+        auto adminQueryClient = kikimr.GetQueryClient();
+        auto adminSession = kikimr.GetTableClient().CreateSession().GetValueSync().GetSession();
+
+        {
+            const auto result = ExecuteGeneric<UseQueryService>(adminQueryClient, adminSession, R"(
+                --!syntax_v1
+                CREATE TOPIC `/Root/dlq`
+            )");
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+        }
+
+        kikimr.GetTestClient().GrantConnect("user@builtin");
+        {
+            const auto result = ExecuteGeneric<UseQueryService>(adminQueryClient, adminSession, R"(
+                --!syntax_v1
+                GRANT CREATE QUEUE, DESCRIBE SCHEMA ON `/Root` TO `user@builtin`;
+            )");
+            UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
+            Sleep(TDuration::MilliSeconds(300));
+        }
+
+        auto userQueryClient = kikimr.GetQueryClient(NQuery::TClientSettings().AuthToken("user@builtin"));
+        auto userSession = kikimr.GetTableClient(NYdb::NTable::TClientSettings().AuthToken("user@builtin"))
+            .CreateSession().GetValueSync().GetSession();
+
+        const auto result = ExecuteGeneric<UseQueryService>(userQueryClient, userSession, R"(
+            --!syntax_v1
+            CREATE TOPIC `/Root/topic` (
+                CONSUMER cs WITH (
+                    type='shared',
+                    dead_letter_policy='move',
+                    dead_letter_queue='/Root/dlq'
+                )
+            )
+        )");
+        // Query service wraps scheme UNAUTHORIZED as GENERIC_ERROR (execution).
+        const auto expected = UseQueryService ? EStatus::GENERIC_ERROR : EStatus::UNAUTHORIZED;
+        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), expected, result.GetIssues().ToString());
+        UNIT_ASSERT_STRING_CONTAINS_C(result.GetIssues().ToString(),
+            "Access denied for user@builtin on path /Root/dlq",
+            result.GetIssues().ToString());
+        UNIT_ASSERT_STRING_CONTAINS_C(result.GetIssues().ToString(),
+            "AlterSchema or UpdateRow",
+            result.GetIssues().ToString());
+    }
+
+    Y_UNIT_TEST_TWIN(CreateTopicSharedConsumerDlqDoesNotExist, UseQueryService) {
+        TKikimrRunner kikimr;
+        auto queryClient = kikimr.GetQueryClient();
+        auto session = kikimr.GetTableClient().CreateSession().GetValueSync().GetSession();
+
+        const auto result = ExecuteGeneric<UseQueryService>(queryClient, session, R"(
+            --!syntax_v1
+            CREATE TOPIC `/Root/topic` (
+                CONSUMER cs WITH (
+                    type='shared',
+                    dead_letter_policy='move',
+                    dead_letter_queue='/Root/missing_dlq'
+                )
+            )
+        )");
+        const auto expected = UseQueryService ? EStatus::GENERIC_ERROR : EStatus::SCHEME_ERROR;
+        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), expected, result.GetIssues().ToString());
+        UNIT_ASSERT_STRING_CONTAINS_C(result.GetIssues().ToString(),
+            "does not exist",
+            result.GetIssues().ToString());
     }
 
     Y_UNIT_TEST_TWIN(CreateAndAlterTopicMetricsLevel, UseQueryService) {
@@ -12613,8 +13166,12 @@ Y_UNIT_TEST_SUITE(KqpScheme) {
         NWorkloadManager::TSampleQueries::CheckSuccess(ydb->ExecuteQuery(dropSql, settings));
     }
 
-    Y_UNIT_TEST(CreateBackupCollectionDisabledByDefault) {
-        TKikimrRunner kikimr;
+    Y_UNIT_TEST(CreateBackupCollectionDisabled) {
+        NKikimrConfig::TAppConfig config;
+        config.MutableFeatureFlags()->SetEnableBackupService(false);
+
+        TKikimrRunner kikimr(NKqp::TKikimrSettings(config)
+            .SetEnableBackupService(false));
 
         auto db = kikimr.GetTableClient();
         auto session = db.CreateSession().GetValueSync().GetSession();
@@ -13336,13 +13893,13 @@ END DO)",
                 const auto& issues = result.GetIssues().ToString();
                 if (!issues.contains("Streaming query /Root/MyFolder/MyStreamingQuery already exists") &&
                     !issues.contains("Scheme transaction ESchemeOpCreateStreamingQuery failed StatusAlreadyExists: execution completed, streaming query /Root/MyFolder/MyStreamingQuery already exists")) {
-                    UNIT_FAIL(TStringBuilder() << "Unexpected GENERIC_ERROR error: " << issues);
+                    UNIT_FAIL(TStringBuilder() << "Unexpected SCHEME_ERROR error: " << issues);
                 }
-            } else if (result.GetStatus() == EStatus::ABORTED) {
+            } else if (result.GetStatus() == EStatus::PRECONDITION_FAILED) {
                 const auto& issues = result.GetIssues().ToString();
                 if (!issues.contains("Streaming query /Root/MyFolder/MyStreamingQuery already under operation CREATE STREAMING QUERY") &&
                     !(issues.contains("Lock streaming query failed") && issues.contains("Transaction locks invalidated"))) {
-                    UNIT_FAIL(TStringBuilder() << "Unexpected ABORTED error: " << issues);
+                    UNIT_FAIL(TStringBuilder() << "Unexpected PRECONDITION_FAILED error: " << issues);
                 }
             } else {
                 UNIT_FAIL(TStringBuilder() << "Unexpected result status: " << result.GetStatus() << ", issues: " << result.GetIssues().ToOneLineString());
@@ -13531,11 +14088,11 @@ END DO)",
             const auto result = resultFeature.ExtractValueSync();
             if (result.GetStatus() == EStatus::SUCCESS) {
                 ++successCount;
-            } else if (result.GetStatus() == EStatus::ABORTED) {
+            } else if (result.GetStatus() == EStatus::PRECONDITION_FAILED) {
                 const auto& issues = result.GetIssues().ToString();
                 if (!issues.contains("Streaming query /Root/MyFolder/MyStreamingQuery already under operation ALTER STREAMING QUERY") &&
                     !(issues.contains("Lock streaming query failed") && issues.contains("Transaction locks invalidated"))) {
-                    UNIT_FAIL(TStringBuilder() << "Unexpected ABORTED error: " << issues);
+                    UNIT_FAIL(TStringBuilder() << "Unexpected PRECONDITION_FAILED error: " << issues);
                 }
             } else {
                 UNIT_FAIL(TStringBuilder() << "Unexpected result status: " << result.GetStatus() << ", issues: " << result.GetIssues().ToOneLineString());
@@ -13663,11 +14220,11 @@ END DO)",
                     !issues.contains("Path `/Root/MyFolder/MyStreamingQuery` does not exist")) {
                     UNIT_FAIL(TStringBuilder() << "Unexpected NOT_FOUND error: " << issues);
                 }
-            } else if (result.GetStatus() == EStatus::ABORTED) {
+            } else if (result.GetStatus() == EStatus::PRECONDITION_FAILED) {
                 const auto& issues = result.GetIssues().ToString();
                 if (!issues.contains("Streaming query /Root/MyFolder/MyStreamingQuery already under operation DROP STREAMING QUERY") &&
                     !(issues.contains("Lock streaming query failed") && issues.contains("Transaction locks invalidated"))) {
-                    UNIT_FAIL(TStringBuilder() << "Unexpected ABORTED error: " << issues);
+                    UNIT_FAIL(TStringBuilder() << "Unexpected PRECONDITION_FAILED error: " << issues);
                 }
             } else {
                 UNIT_FAIL(TStringBuilder() << "Unexpected result status: " << result.GetStatus() << ", issues: " << result.GetIssues().ToOneLineString());
@@ -13677,8 +14234,6 @@ END DO)",
         UNIT_ASSERT_VALUES_EQUAL(successCount, 1);
         CheckObjectNotFound(runtime, "/Root/MyFolder/MyStreamingQuery");
     }
-
-
 
     Y_UNIT_TEST(StreamingQueriesAclValidation) {
         auto kikimr = SetupStreamingSource();

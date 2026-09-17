@@ -1192,6 +1192,7 @@ private:
         txProto.SetType(GetPhyTxType(*txSettings.Type));
 
         bool hasEffectStage = false;
+        bool hasPqSources = false;
 
         TMap<ui64, ui32> stagesMap;
         THashMap<ui64, NKqpProto::TKqpPhyStage*> physicalStageByID;
@@ -1203,13 +1204,23 @@ private:
             CompileStage(stage, *physicalStageByID[stage.Ref().UniqueId()], ctx, stagesMap, rPredictor, tablesMap, physicalStageByID);
             hasEffectStage |= physicalStageByID[stage.Ref().UniqueId()]->GetIsEffectsStage();
             stagesMap[stage.Ref().UniqueId()] = txProto.StagesSize() - 1;
+            const auto* compiledStage = physicalStageByID[stage.Ref().UniqueId()];
+            for (const auto& src : compiledStage->GetSources()) {
+                if (src.HasExternalSource() && src.GetExternalSource().GetType() == "PqSource") {
+                    hasPqSources = true;
+                    break;
+                }
+            }
         }
         for (auto&& i : *txProto.MutableStages()) {
             i.MutableProgram()->MutableSettings()->SetLevelDataPrediction(rPredictor.GetLevelDataVolume(i.GetProgram().GetSettings().GetStageLevel()));
         }
 
-        txProto.SetEnableShuffleElimination(Config->OptShuffleElimination.Get().GetOrElse(Config->GetDefaultEnableShuffleElimination()));
+        // Map connections produced by either optimization need partition-preserving task layout.
+        const bool enableShuffleElimination = Config->OptShuffleElimination.Get().GetOrElse(Config->GetDefaultEnableShuffleElimination());
+        txProto.SetEnableShuffleElimination(enableShuffleElimination);
         txProto.SetHasEffects(hasEffectStage);
+        txProto.SetHasPqSources(hasPqSources);
         txProto.SetDqChannelVersion(Config->DqChannelVersion.Get().GetOrElse(Config->GetDqChannelVersion()));
         for (const auto& paramBinding : tx.ParamBindings()) {
             TString paramName(paramBinding.Name().Value());
@@ -1624,6 +1635,21 @@ private:
                 auto inner = value.Maybe<TCoJust>() ? value.Cast<TCoJust>().Input() : value;
                 if (inner.Maybe<TCoParameter>()) {
                     prefixProto->MutableValue()->MutableParamValue()->SetParamName(inner.Cast<TCoParameter>().Name().StringValue());
+                } else if (auto member = inner.Maybe<TCoMember>()) {
+                    auto parameter = member.Cast().Struct().Maybe<TCoParameter>();
+                    YQL_ENSURE(parameter, "Unexpected fulltext prefix value callable '" << inner.Ref().Content() << "'");
+
+                    const auto parameterType = parameter.Cast().Ref().GetTypeAnn();
+                    YQL_ENSURE(parameterType->GetKind() == ETypeAnnotationKind::Struct,
+                        "Expected a struct parameter for fulltext prefix member");
+
+                    const auto memberIndex = parameterType->Cast<TStructExprType>()->FindItem(member.Cast().Name().Value());
+                    YQL_ENSURE(memberIndex, "Fulltext prefix parameter member '" << member.Cast().Name().Value()
+                        << "' is missing from its struct type");
+
+                    auto* paramElement = prefixProto->MutableValue()->MutableParamElementValue();
+                    paramElement->SetParamName(parameter.Cast().Name().StringValue());
+                    paramElement->SetElementIndex(*memberIndex);
                 } else {
                     FillLiteralProto(inner.Cast<TCoDataCtor>(), *prefixProto->MutableValue()->MutableLiteralValue());
                 }
@@ -2089,9 +2115,11 @@ private:
 
         TVector<TStringBuf> lookupColumns;
         if (shape.IsStructOfNewAndOldValues) {
+            // These values are already carried by the input's "old" struct, so NeedLookup stays false.
+            // Register them as LookupColumns only to provide runtime metadata for indexes and RETURNING.
             for (const auto& item : shape.OldStructType->GetItems()) {
                 const auto& columnName = item->GetName();
-                AFL_ENSURE(!mainKeyColumnsSet.contains(columnName) && lookupColumnsSet.contains(columnName));
+                AFL_ENSURE(!mainKeyColumnsSet.contains(columnName));
 
                 const auto columnMeta = tableMeta->Columns.FindPtr(columnName);
                 YQL_ENSURE(columnMeta != nullptr, "Unknown column in sink: \"" + TString(columnName) + "\"");
@@ -2151,6 +2179,7 @@ private:
     // sub-tables for the relevance variant).
     void FillFulltextIndexSettings(size_t index, const TIndexDescription& indexDescription, const TKikimrTableMetadataPtr& implTable, NKikimrKqp::TKqpTableSinkIndexSettings* indexSettings, THashMap<TString, THashSet<TString>>& tablesMap,
             const TKikimrTableMetadataPtr& tableMeta, const TVector<TStringBuf>& columns, const TVector<TStringBuf>& lookupColumns) {
+        YQL_ENSURE(indexDescription.KeyColumns.size() > 0);
         if (indexDescription.Type == TIndexDescription::EType::GlobalFulltextCompact) {
             indexSettings->SetIndexType(NKqpProto::EKqpFullTextIndexType::EKqpFullTextCompact);
             *indexSettings->MutableFulltextSettings() = std::get<NKikimrSchemeOp::TFulltextIndexDescription>(indexDescription.SpecializedIndexDescription).GetSettings();
@@ -2161,23 +2190,33 @@ private:
             *indexSettings->MutableFulltextSettings() = std::get<NKikimrSchemeOp::TFulltextIndexDescription>(indexDescription.SpecializedIndexDescription).GetSettings();
             // Get dict, docs, stats tables
             auto dictTable = tableMeta->ImplTables[index];
-            YQL_ENSURE(dictTable->Name.EndsWith(NTableIndex::NFulltext::DictTable));
-            auto docsTable = dictTable->Next;
+            if (!dictTable->Name.EndsWith(NTableIndex::NFulltext::DictTable)) {
+                dictTable = nullptr;
+            }
+            auto docsTable = dictTable ? dictTable->Next : tableMeta->ImplTables[index];
             YQL_ENSURE(docsTable->Name.EndsWith(NTableIndex::NFulltext::DocsTable));
             auto statsTable = docsTable->Next;
             YQL_ENSURE(statsTable->Name.EndsWith(NTableIndex::NFulltext::StatsTable));
             // And pass their metadata
-            FillTableId(*dictTable, *indexSettings->MutableDictTable());
-            FillTablesMap(dictTable->Name, tablesMap);
-            for (const auto& columnName: {NTableIndex::NFulltext::TokenColumn, NTableIndex::NFulltext::FreqColumn}) {
-                const auto& columnMeta = dictTable->Columns.at(columnName);
-                FillColumnProto(columnName, &columnMeta, indexSettings->AddDictColumns());
-                tablesMap[dictTable->Name].emplace(columnName);
+            if (dictTable) {
+                FillTableId(*dictTable, *indexSettings->MutableDictTable());
+                FillTablesMap(dictTable->Name, tablesMap);
+                for (const auto& columnName: {NTableIndex::NFulltext::TokenColumn, NTableIndex::NFulltext::FreqColumn}) {
+                    const auto& columnMeta = dictTable->Columns.at(columnName);
+                    FillColumnProto(columnName, &columnMeta, indexSettings->AddDictColumns());
+                    tablesMap[dictTable->Name].emplace(columnName);
+                }
             }
             FillTableId(*statsTable, *indexSettings->MutableStatsTable());
             FillTablesMap(statsTable->Name, tablesMap);
-            for (const auto& columnName: {NTableIndex::NFulltext::IdColumn,
-                NTableIndex::NFulltext::DocCountColumn, NTableIndex::NFulltext::SumDocLengthColumn}) {
+            TVector<TString> statsCols = {indexDescription.KeyColumns.begin(),
+                indexDescription.KeyColumns.end()-1};
+            if (!statsCols.size()) {
+                statsCols.push_back(NTableIndex::NFulltext::IdColumn);
+            }
+            statsCols.push_back(NTableIndex::NFulltext::DocCountColumn);
+            statsCols.push_back(NTableIndex::NFulltext::SumDocLengthColumn);
+            for (const auto& columnName: statsCols) {
                 const auto& columnMeta = statsTable->Columns.at(columnName);
                 FillColumnProto(columnName, &columnMeta, indexSettings->AddStatsColumns());
                 tablesMap[statsTable->Name].emplace(columnName);
@@ -2201,7 +2240,7 @@ private:
         }
 
         FillTablesMap(implTable->Name, tablesMap);
-        for (size_t i = 0; i+1 < indexDescription.KeyColumns.size(); i++) {
+        for (size_t i = 0; i < indexDescription.KeyColumns.size()-1; i++) {
             // Add prefix columns
             const auto& columnName = indexDescription.KeyColumns[i];
             const auto& columnMeta = implTable->Columns.at(columnName);
@@ -2314,9 +2353,9 @@ private:
                 indexDescription.Type == TIndexDescription::EType::GlobalJsonCompact);
             auto implTable = tableMeta->ImplTables[index];
             if (indexDescription.Type == TIndexDescription::EType::GlobalFulltextCompactRelevance) {
-                // Alphabetically impl (posting) is the last table, after Dict, Docs and Stats
-                YQL_ENSURE(implTable->Next && implTable->Next->Next && implTable->Next->Next->Next);
-                implTable = implTable->Next->Next->Next;
+                // Alphabetically impl (posting) is the last table, after Docs and Stats
+                YQL_ENSURE(implTable->Next && implTable->Next->Next);
+                implTable = implTable->Next->Next;
                 YQL_ENSURE(implTable->Name.EndsWith(NTableIndex::ImplTable));
             }
 
@@ -2375,7 +2414,8 @@ private:
 
         const auto affectedIndexes = ComputeAffectedIndexes(settings, tableMeta, columnsSet, mainKeyColumnsSet);
 
-        const bool needOldValues = ComputeNeedOldValues(settings, tableMeta, affectedIndexes.Affected, columnsSet, mainKeyColumnsSet, localDefaultColumns.Names);
+        const bool needOldValues = shape.IsStructOfNewAndOldValues
+            || ComputeNeedOldValues(settings, tableMeta, affectedIndexes.Affected, columnsSet, mainKeyColumnsSet, localDefaultColumns.Names);
         const bool needLookup = needOldValues && !shape.IsStructOfNewAndOldValues;
         settingsProto.SetNeedLookup(needLookup);
 

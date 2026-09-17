@@ -12,6 +12,7 @@
 #include <ydb/core/tx/columnshard/data_sharing/manager/shared_blobs.h>
 #include <ydb/core/util/backoff.h>
 
+#include <util/generic/hash_set.h>
 #include <util/generic/string.h>
 
 #include <map>
@@ -144,6 +145,8 @@ private:
     const ui32 CurrentGen;
     ui32 CurrentStep;
     std::optional<TGenStep> CollectGenStepInFlight;
+    // Blobs handed to the task are in no queue below until it commits.
+    bool GCTaskInFlight = false;
     // Lists of blobs that need Keep flag to be set
     TBlobsByGenStep BlobsToKeep;
     // Lists of blobs that need DoNotKeep flag to be set
@@ -177,6 +180,14 @@ private:
 
 public:
     TBlobManager(TIntrusivePtr<TTabletStorageInfo> tabletInfo, const ui32 gen, const TTabletId selfTabletId);
+
+    // Scans the pending keep/delete queues, not live portions.
+    bool HasBlobsForGroups(const THashSet<ui32>& groups) const;
+
+    // True once the first GC round of this incarnation committed a barrier covering every earlier generation.
+    bool HasCollectedBeforeCurrentGeneration() const {
+        return LastCollectedGenStep >= TGenStep(CurrentGen, 0);
+    }
 
     bool HasToDelete(const TUnifiedBlobId& blobId, const TTabletId tabletId) const {
         return BlobsToDelete.Contains(tabletId, blobId) || BlobsToDeleteDelayed.Contains(tabletId, blobId);
@@ -238,7 +249,18 @@ public:
     virtual void DeleteBlobOnExecute(const TTabletId tabletId, const TUnifiedBlobId& blobId, IBlobManagerDb& db) override;
     virtual void DeleteBlobOnComplete(const TTabletId tabletId, const TUnifiedBlobId& blobId) override;
 
+    // Non-active history entries of data channels whose group is being decommissioned.
+    std::vector<TMoveDataRow> GetDrainedIntervalsForGroups(const THashSet<ui32>& groups) const;
+
+    // True when MoveData persisted a row for exactly this interval and group.
+    bool HasMoveDataRow(const ui32 channel, const ui32 fromGeneration, const ui32 toGenerationExclusive, const ui32 groupId) const;
+
+    void AddMoveDataRowOnExecute(
+        IBlobManagerDb& db, const ui32 channel, const ui32 fromGeneration, const ui32 toGenerationExclusive, const ui32 groupId);
+    void AddMoveDataRowOnComplete(const ui32 channel, const ui32 fromGeneration, const ui32 toGenerationExclusive, const ui32 groupId);
+
 private:
+    std::vector<TMoveDataRow> MoveDataRows;
     std::deque<TGenStep> FindNewGCBarriers();
     void PopGCBarriers(const TGenStep gs);
     void PopGCBarriers(const ui32 count);

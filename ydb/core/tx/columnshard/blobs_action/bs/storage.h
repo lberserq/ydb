@@ -38,6 +38,26 @@ public:
         return Manager->HasToDelete(blobId, tabletId);
     }
 
+    virtual bool HasBlobsForGroups(const THashSet<ui32>& groups) const override {
+        return Manager->HasBlobsForGroups(groups) || TBase::HasBlobsForGroups(groups);
+    }
+
+    std::vector<NOlap::TMoveDataRow> GetDrainedIntervalsForGroups(const THashSet<ui32>& groups) const {
+        return Manager->GetDrainedIntervalsForGroups(groups);
+    }
+
+    void AddMoveDataRowOnExecute(IBlobManagerDb& db, const NOlap::TMoveDataRow& row) {
+        Manager->AddMoveDataRowOnExecute(db, row.Channel, row.FromGeneration, row.ToGenerationExclusive, row.GroupId);
+    }
+
+    void AddMoveDataRowOnComplete(const NOlap::TMoveDataRow& row) {
+        Manager->AddMoveDataRowOnComplete(row.Channel, row.FromGeneration, row.ToGenerationExclusive, row.GroupId);
+    }
+
+    virtual bool HasCollectedBeforeCurrentGeneration() const override {
+        return Manager->HasCollectedBeforeCurrentGeneration();
+    }
+
     virtual TTabletsByBlob GetBlobsToDelete() const override {
         return Manager->GetBlobsToDeleteAll();
     }

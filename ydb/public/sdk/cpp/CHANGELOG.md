@@ -1,6 +1,16 @@
+## v3.23.0
+
+* Added optional `TRetryOperationSettings::StopToken` for cooperative cancellation between retry attempts.
+
+* Added `EQ_HEIGHT_HISTOGRAM` to `EMultiColumnStatisticsType`.
+
+## v3.22.0
+
 * Added `IWriteSession::Flush` to asynchronously wait until all previously accepted topic writes are acknowledged.
 
 * Fixed query parameters with incomplete types being sent to the server; the parameter builder now reports the error locally.
+
+* Added the initial process-wide SDK runtime infrastructure. Driver cancellation and callback accounting are now isolated per driver, without changing public APIs or resource-sharing behavior.
 
 ## v3.21.1
 
