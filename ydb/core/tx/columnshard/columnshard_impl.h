@@ -597,6 +597,44 @@ private:
     void StartOneCompactionTask(const std::shared_ptr<NOlap::NCompaction::TGeneralCompactColumnEngineChanges>& indexChanges,
         const std::shared_ptr<NPrioritiesQueue::TAllocationGuard>& guard);
 
+    struct TCutHistoryInterval {
+        ui32 Channel;
+        ui32 From;
+        ui32 To;
+        ui32 Group;
+        ui64 BlobReferences = 0;
+        bool Sent = false;
+    };
+
+    struct TCutHistoryScan {
+        std::vector<TCutHistoryInterval> Intervals;
+        std::vector<std::pair<TInternalPathId, ui64>> Portions;
+        size_t Position = 0;
+        size_t Pending = 0;
+        TInstant Started;
+        std::optional<TInstant> Finished;
+    };
+
+    std::optional<TCutHistoryScan> CutHistoryScan;
+    static constexpr ui64 CutHistoryRequestLimit = 64;
+
+    struct TCutHistoryRequest {
+        ui64 TabletID;
+        ui32 Channel;
+        ui32 FromGeneration;
+        ui32 GroupID;
+        TInstant Timestamp;
+        TActorId Recipient;
+        ui32 ToGeneration;
+        ui32 SendingGeneration;
+    };
+    class TTxSaveCutHistoryRequests;
+    class TCutHistoryResultProcessor;
+    void StartCutHistoryScan(const TActorContext& ctx);
+    void FinishCutHistoryBatch(const NOlap::TDataAccessorsResult& result);
+    void TryCutHistory(const TActorContext& ctx);
+    void Handle(TEvPrivate::TEvContinueCutHistory::TPtr& ev, const TActorContext& ctx);
+    void SubmitMetadataRequest(const NOlap::TCSMetadataRequest& request);
     void SetupMetadata();
     bool SetupTtl();
     void SetupCleanupPortions(const NOlap::ISnapshotHolders& snapshotHolders);

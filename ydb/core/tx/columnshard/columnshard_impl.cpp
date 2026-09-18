@@ -59,6 +59,8 @@
 #include <ydb/library/actors/struct_log/log_stack.h>
 #include <ydb/services/metadata/service.h>
 
+#include <util/generic/algorithm.h>
+#include <util/generic/mapfindptr.h>
 #include <util/generic/object_counter.h>
 
 #define YDB_LOG_THIS_FILE_COMPONENT NKikimrServices::TX_COLUMNSHARD
@@ -506,6 +508,9 @@ void TColumnShard::EnqueueBackgroundActivities(const bool periodic) {
     Counters.GetCSCounters().OnStartBackground();
 
     if (!TablesManager.HasPrimaryIndex()) {
+        if (CutHistoryScan) {
+            SetupGC();
+        }
         YDB_LOG_NOTICE_COMP(NKikimrServices::TX_COLUMNSHARD, "",
             {"problem", "Background activities cannot be started: no index at tablet"});
         return;
@@ -882,15 +887,18 @@ void TColumnShard::SetupMetadata() {
         return;
     }
     std::vector<NOlap::TCSMetadataRequest> requests = TablesManager.MutablePrimaryIndex().CollectMetadataRequests();
-    for (auto&& i : requests) {
-        const ui64 accessorsMemory =
-            i.GetRequest()->PredictAccessorsMemory(TablesManager.GetPrimaryIndex()->GetVersionedIndex().GetLastSchema());
-        NOlap::NResourceBroker::NSubscribe::ITask::StartResourceSubscription(
-            ResourceSubscribeActor, std::make_shared<TAccessorsMemorySubscriber>(accessorsMemory, i.GetRequest()->GetTaskId(),
-                                        TTLTaskSubscription, std::shared_ptr<NOlap::TDataAccessorsRequest>(i.GetRequest()),
-                                        std::make_shared<TCSMetadataSubscriber>(SelfId(), i.GetProcessor(), Generation()),
-                                        DataAccessorsManager.GetObjectPtrVerified(), nullptr));
+    for (const auto& request : requests) {
+        SubmitMetadataRequest(request);
     }
+}
+
+void TColumnShard::SubmitMetadataRequest(const NOlap::TCSMetadataRequest& request) {
+    const ui64 memory = request.GetRequest()->PredictAccessorsMemory(TablesManager.GetPrimaryIndex()->GetVersionedIndex().GetLastSchema());
+    auto task = std::make_shared<TAccessorsMemorySubscriber>(memory, request.GetRequest()->GetTaskId(), TTLTaskSubscription,
+        std::shared_ptr<NOlap::TDataAccessorsRequest>(request.GetRequest()),
+        std::make_shared<TCSMetadataSubscriber>(SelfId(), request.GetProcessor(), Generation()), DataAccessorsManager.GetObjectPtrVerified(),
+        nullptr);
+    NOlap::NResourceBroker::NSubscribe::ITask::StartResourceSubscription(ResourceSubscribeActor, task);
 }
 
 bool TColumnShard::SetupTtl() {
@@ -1627,54 +1635,71 @@ public:
         bool reask = false;
         YDB_LOG_CREATE_CONTEXT(
             {"event", "TTxAskPortionChunks::Execute"});
-        for (auto&& i : PortionsByPath) {
-            const auto& granule = Self->GetIndexAs<NOlap::TColumnEngineForLogs>().GetGranuleVerified(i.first);
-            for (auto&& c : i.second.GetConsumers()) {
-                NActors::TLogContextGuard lcGuard = NActors::TLogContextBuilder::Build()("consumer", c.first)("path_id", i.first);
-                YDB_LOG_TRACE_COMP(NKikimrServices::TX_COLUMNSHARD, "Dump size",
-                    {"size", c.second.GetPortionsCount()});
-                for (auto&& portion : c.second.GetPortions(granule)) {
-                    const ui64 p = portion->GetPortionId();
-                    const NOlap::TPortionAddress pAddress = portion->GetAddress();
-                    auto itPortionConstructor = Constructors.find(pAddress);
-                    if (itPortionConstructor == Constructors.end()) {
-                        TPortionConstructorV2 constructor(portion);
-                        itPortionConstructor = Constructors.emplace(pAddress, std::move(constructor)).first;
-                    } else if (itPortionConstructor->second.IsReady()) {
+        std::vector<NOlap::TPortionInfo::TConstPtr> portions;
+        for (const auto& [pathId, byConsumer] : PortionsByPath) {
+            const auto granule = Self->GetIndexAs<NOlap::TColumnEngineForLogs>().GetGranuleOptional(pathId);
+            if (!granule) {
+                continue;
+            }
+            for (const auto& [_, consumer] : byConsumer.GetConsumers()) {
+                for (const ui64 portionId : consumer.GetPortionIds()) {
+                    if (auto portion = granule->GetPortionOptional(portionId, false)) {
+                        portions.emplace_back(std::move(portion));
+                    }
+                }
+            }
+        }
+        // Cache requests regroup addresses in hash maps; restore global PortionId order here.
+        SortUniqueBy(portions, [](const auto& portion) {
+            return std::make_pair(portion->GetPortionId(), portion->GetPathId());
+        });
+        for (const auto& portion : portions) {
+            const auto pathId = portion->GetPathId();
+            const ui64 p = portion->GetPortionId();
+            const NOlap::TPortionAddress pAddress = portion->GetAddress();
+            auto itPortionConstructor = Constructors.find(pAddress);
+            if (itPortionConstructor == Constructors.end()) {
+                TPortionConstructorV2 constructor(portion);
+                itPortionConstructor = Constructors.emplace(pAddress, std::move(constructor)).first;
+            } else if (itPortionConstructor->second.IsReady()) {
+                continue;
+            }
+            if (!itPortionConstructor->second.HasRecords()) {
+                auto rowset = db.Table<NColumnShard::Schema::IndexColumnsV2>().Key(pathId.GetRawValue(), p).Select();
+                if (!rowset.IsReady()) {
+                    reask = true;
+                } else {
+                    if (rowset.EndOfSet()) {
+                        AFL_VERIFY(portion->HasRemoveSnapshot() || !Self->GetTablesManager().HasTable(pathId))
+                        ("path_id", pathId)("portion_id", p);
+                        Constructors.erase(pAddress);
                         continue;
                     }
-                    if (!itPortionConstructor->second.HasRecords()) {
-                        auto rowset = db.Table<NColumnShard::Schema::IndexColumnsV2>().Key(i.first.GetRawValue(), p).Select();
-                        if (!rowset.IsReady()) {
-                            reask = true;
-                        } else {
-                            AFL_VERIFY(!rowset.EndOfSet())("path_id", i.first)("portion_id", p)(
-                                "debug", itPortionConstructor->second.GetPortionInfo()->DebugString(true));
-                            NOlap::TColumnChunkLoadContextV2 info(rowset, selector);
-                            itPortionConstructor->second.SetRecords(std::move(info));
-                        }
-                    }
-                    if (!itPortionConstructor->second.HasIndexes()) {
-                        if (!itPortionConstructor->second.GetPortionInfo()
-                                 ->GetSchema(Self->GetIndexAs<NOlap::TColumnEngineForLogs>().GetVersionedIndex())
-                                 ->GetIndexesCount()) {
-                            itPortionConstructor->second.SetIndexes({});
-                        } else {
-                            auto rowset = db.Table<NColumnShard::Schema::IndexIndexes>().Prefix(i.first.GetRawValue(), p).Select();
-                            if (!rowset.IsReady()) {
+                    NOlap::TColumnChunkLoadContextV2 info(rowset, selector);
+                    itPortionConstructor->second.SetRecords(std::move(info));
+                }
+            }
+            if (!itPortionConstructor->second.HasIndexes()) {
+                if (!itPortionConstructor->second.GetPortionInfo()
+                         ->GetSchema(Self->GetIndexAs<NOlap::TColumnEngineForLogs>().GetVersionedIndex())
+                         ->GetIndexesCount()) {
+                    itPortionConstructor->second.SetIndexes({});
+                } else {
+                    auto rowset = db.Table<NColumnShard::Schema::IndexIndexes>().Prefix(pathId.GetRawValue(), p).Select();
+                    if (!rowset.IsReady()) {
+                        reask = true;
+                    } else {
+                        std::vector<NOlap::TIndexChunkLoadContext> indexes;
+                        bool localReask = false;
+                        while (!localReask && !rowset.EndOfSet()) {
+                            indexes.emplace_back(NOlap::TIndexChunkLoadContext(rowset, &selector));
+                            if (!rowset.Next()) {
                                 reask = true;
-                            } else {
-                                std::vector<NOlap::TIndexChunkLoadContext> indexes;
-                                bool localReask = false;
-                                while (!localReask && !rowset.EndOfSet()) {
-                                    indexes.emplace_back(NOlap::TIndexChunkLoadContext(rowset, &selector));
-                                    if (!rowset.Next()) {
-                                        reask = true;
-                                        localReask = true;
-                                    }
-                                }
-                                itPortionConstructor->second.SetIndexes(std::move(indexes));
+                                localReask = true;
                             }
+                        }
+                        if (!localReask) {
+                            itPortionConstructor->second.SetIndexes(std::move(indexes));
                         }
                     }
                 }
@@ -1684,8 +1709,10 @@ public:
             return false;
         }
 
-        for (auto&& i : Constructors) {
-            FetchedAccessors.emplace_back(std::move(i.second));
+        for (const auto& portion : portions) {
+            if (auto* constructor = MapFindPtr(Constructors, portion->GetAddress()); constructor && constructor->IsReady()) {
+                FetchedAccessors.emplace_back(std::move(*constructor));
+            }
         }
 
         YDB_LOG_TRACE_COMP(NKikimrServices::TX_COLUMNSHARD, "Dump stage",
@@ -1804,6 +1831,7 @@ void TColumnShard::Handle(NOlap::NDataSharing::NEvents::TEvAckFinishFromInitiato
 };
 
 void TColumnShard::Handle(NOlap::NDataSharing::NEvents::TEvApplyLinksModification::TPtr& ev, const TActorContext& ctx) {
+    SharingSessionsManager->OnSharingAdmission();
     YDB_LOG_NOTICE_COMP(NKikimrServices::TX_COLUMNSHARD, "",
         {"process", "BlobsSharing"},
         {"event", "TEvApplyLinksModification"},
@@ -1919,6 +1947,7 @@ STFUNC(TColumnShard::StateWork) {
         HFunc(TEvPrivate::TEvWriteBlobsResult, Handle);
         HFunc(TEvPrivate::TEvStartCompaction, Handle);
         HFunc(TEvPrivate::TEvMetadataAccessorsInfo, Handle);
+        HFunc(TEvPrivate::TEvContinueCutHistory, Handle);
         HFunc(NPrivateEvents::NWrite::TEvWritePortionResult, Handle);
 
         HFunc(TEvMediatorTimecast::TEvRegisterTabletResult, Handle);
