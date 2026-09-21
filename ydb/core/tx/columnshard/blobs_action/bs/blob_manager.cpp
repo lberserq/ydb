@@ -585,6 +585,16 @@ bool TBlobManager::HasBlobsForGroups(const THashSet<ui32>& groups) const {
     return AnyOf(BlobsToKeep, keptBlobInGroups) || AnyOf(BlobsToDelete, deletedBlobInGroups) || AnyOf(BlobsToDeleteDelayed, deletedBlobInGroups);
 }
 
+bool TBlobManager::HasBlobsInRange(const ui32 channel, const ui32 from, const ui32 to) const {
+    const auto matches = [&](const TLogoBlobID& id) {
+        return id.TabletID() == static_cast<ui64>(SelfTabletId) && id.Channel() == channel && id.Generation() >= from && id.Generation() < to;
+    };
+    const auto deletedMatches = [&](const auto& blob) {
+        return matches(blob.first.GetLogoBlobId());
+    };
+    return AnyOf(BlobsToKeep, matches) || AnyOf(BlobsToDelete, deletedMatches) || AnyOf(BlobsToDeleteDelayed, deletedMatches);
+}
+
 TBlobStorageGroupType TBlobManager::GetBlobStorageGroupType() const {
     // We assume here that all the channels have the same group type.
     // So, just in case, in the future 0, 1 channels be different from the rest, the code will still work.

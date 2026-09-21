@@ -626,6 +626,44 @@ private:
     void StartOneCompactionTask(const std::shared_ptr<NOlap::NCompaction::TGeneralCompactColumnEngineChanges>& indexChanges,
         const std::shared_ptr<NPrioritiesQueue::TAllocationGuard>& guard);
 
+    struct TCutHistoryInterval {
+        ui32 Channel = 0;
+        ui32 From = 0;
+        ui32 To = 0;
+        ui32 Group = 0;
+        ui64 BlobReferences = 0;
+        bool Sent = false;
+    };
+
+    struct TCutHistoryScan {
+        std::vector<TCutHistoryInterval> Intervals;
+        std::vector<std::pair<TInternalPathId, ui64>> Portions;
+        size_t Position = 0;
+        size_t Pending = 0;
+        TInstant Started;
+        std::optional<TInstant> Finished;
+    };
+
+    std::optional<TCutHistoryScan> CutHistoryScan;
+    static constexpr ui64 CutHistoryRequestLimit = 64;
+
+    struct TCutHistoryRequest {
+        ui64 TabletID = 0;
+        ui32 Channel = 0;
+        ui32 FromGeneration = 0;
+        ui32 GroupID = 0;
+        TInstant Timestamp;
+        TActorId Recipient;
+        ui32 ToGeneration = 0;
+        ui32 SendingGeneration = 0;
+    };
+    class TTxSaveCutHistoryRequests;
+    class TCutHistoryResultProcessor;
+    void StartCutHistoryScan(const TActorContext& ctx);
+    void FinishCutHistoryBatch(const NOlap::TDataAccessorsResult& result);
+    void TryCutHistory(const TActorContext& ctx);
+    void Handle(TEvPrivate::TEvContinueCutHistory::TPtr& ev, const TActorContext& ctx);
+    void SubmitMetadataRequest(const NOlap::TCSMetadataRequest& request);
     void SetupMetadata();
     // Re-arms only the move's accessor requests, ungated: they must not queue behind tiering's.
     void SetupMoveDataMetadata();

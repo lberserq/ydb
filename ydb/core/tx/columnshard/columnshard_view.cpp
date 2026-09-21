@@ -8,6 +8,7 @@
 #include <contrib/libs/apache/arrow/cpp/src/arrow/type.h>
 #include <library/cpp/json/writer/json.h>
 #include <util/datetime/base.h>
+#include <util/generic/algorithm.h>
 
 #include <limits>
 
@@ -519,6 +520,7 @@ public:
 private:
     NMon::TEvRemoteHttpInfo::TPtr HttpInfoEvent;
     NJson::TJsonValue JsonReport = NJson::JSON_MAP;
+    std::vector<TColumnShard::TCutHistoryRequest> CutHistoryRequests;
     TString RenderCompactionPage();
     TString RenderMainPage();
     TString RenderPortionsPage();
@@ -658,7 +660,34 @@ TString RenderScanTracesPage(ui64 tabletId, ui32 nodeId) {
 }
 
 bool TTxMonitoring::Execute(TTransactionContext& txc, const TActorContext&) {
-    return Self->TablesManager.FillMonitoringReport(txc, JsonReport["tables_manager"]);
+    CutHistoryRequests.clear();
+    if (!Self->TablesManager.FillMonitoringReport(txc, JsonReport["tables_manager"])) {
+        return false;
+    }
+    const auto page = HttpInfoEvent->Get()->Cgi().Get("page");
+    if (!EqualToOneOf(page, "compaction", "portions")) {
+        using T = Schema::CutHistoryRequests;
+        NIceDb::TNiceDb db(txc.DB);
+        auto row = db.Table<T>().Range().Select();
+        if (!row.IsReady()) {
+            return false;
+        }
+        while (!row.EndOfSet()) {
+            auto& request = CutHistoryRequests.emplace_back();
+            request.TabletID = row.GetValue<T::TabletID>();
+            request.Channel = row.GetValue<T::Channel>();
+            request.FromGeneration = row.GetValue<T::FromGeneration>();
+            request.GroupID = row.GetValue<T::GroupID>();
+            request.Timestamp = TInstant::MicroSeconds(row.GetValue<T::TimestampUs>());
+            request.Recipient = row.GetValue<T::Recipient>();
+            request.ToGeneration = row.GetValue<T::ToGeneration>();
+            request.SendingGeneration = row.GetValue<T::SendingGeneration>();
+            if (!row.Next()) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 template <typename T>
@@ -789,6 +818,17 @@ TString TTxMonitoring::RenderMainPage() {
         const TString logUrl = RenderLwTraceShardLogUrl("YDB_CS_DATA_SOURCE", "StartSourceProcessing", Self->TabletID(), nodeId);
         html << "<h3>" << RenderLwTraceStartLink(createUrl, traceId, logUrl, "Traces for all portions on shard") << "</h3>";
     }
+
+    html << "<h3>Persisted CutHistory send attempts (latest " << TColumnShard::CutHistoryRequestLimit
+         << "; Hive confirmation is not tracked)</h3><pre>";
+    for (const auto& request : CutHistoryRequests) {
+        html << TEscapeHtml(TStringBuilder() << request.Timestamp << " recipient=" << request.Recipient
+                                             << " toGeneration=" << request.ToGeneration << " sendingGeneration=" << request.SendingGeneration
+                                             << " TabletID: " << request.TabletID << " Channel: " << request.Channel
+                                             << " GroupID: " << request.GroupID << " FromGeneration: " << request.FromGeneration)
+             << "\n";
+    }
+    html << "</pre>";
 
     html << "<h3>Tiering Errors</h3>";
     auto readErrors = Self->Counters.GetEvictionCounters().TieringErrors->GetAllReadErrors();

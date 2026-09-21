@@ -59,6 +59,8 @@
 #include <ydb/library/actors/struct_log/log_stack.h>
 #include <ydb/services/metadata/service.h>
 
+#include <util/generic/algorithm.h>
+#include <util/generic/mapfindptr.h>
 #include <util/generic/object_counter.h>
 
 #define YDB_LOG_THIS_FILE_COMPONENT NKikimrServices::TX_COLUMNSHARD
@@ -508,6 +510,9 @@ void TColumnShard::EnqueueBackgroundActivities(const bool periodic) {
     Counters.GetCSCounters().OnStartBackground();
 
     if (!TablesManager.HasPrimaryIndex()) {
+        if (CutHistoryScan) {
+            SetupGC();
+        }
         YDB_LOG_NOTICE_COMP(NKikimrServices::TX_COLUMNSHARD, "",
             {"problem", "Background activities cannot be started: no index at tablet"});
         return;
@@ -914,6 +919,10 @@ void TColumnShard::SetupMoveDataMetadata() {
     }
     StartMetadataRequests(
         GetIndexAs<NOlap::TColumnEngineForLogs>().CollectMoveDataMetadataRequests(NActors::TActivationContext::Now()), MoveDataTaskSubscription);
+}
+
+void TColumnShard::SubmitMetadataRequest(const NOlap::TCSMetadataRequest& request) {
+    StartMetadataRequests({ request }, TTLTaskSubscription);
 }
 
 bool TColumnShard::SetupTtl() {
@@ -1654,58 +1663,71 @@ public:
         bool reask = false;
         YDB_LOG_CREATE_CONTEXT(
             {"event", "TTxAskPortionChunks::Execute"});
-        for (auto&& i : PortionsByPath) {
-            const auto& granule = Self->GetIndexAs<NOlap::TColumnEngineForLogs>().GetGranuleVerified(i.first);
-            for (auto&& c : i.second.GetConsumers()) {
-                NActors::TLogContextGuard lcGuard = NActors::TLogContextBuilder::Build()("consumer", c.first)("path_id", i.first);
-                YDB_LOG_TRACE_COMP(NKikimrServices::TX_COLUMNSHARD, "Dump size",
-                    {"size", c.second.GetPortionsCount()});
-                for (auto&& portion : c.second.GetPortions(granule)) {
-                    const ui64 p = portion->GetPortionId();
-                    const NOlap::TPortionAddress pAddress = portion->GetAddress();
-                    auto itPortionConstructor = Constructors.find(pAddress);
-                    if (itPortionConstructor == Constructors.end()) {
-                        TPortionConstructorV2 constructor(portion);
-                        itPortionConstructor = Constructors.emplace(pAddress, std::move(constructor)).first;
-                    } else if (itPortionConstructor->second.IsReady()) {
+        std::vector<NOlap::TPortionInfo::TConstPtr> portions;
+        for (const auto& [pathId, byConsumer] : PortionsByPath) {
+            const auto granule = Self->GetIndexAs<NOlap::TColumnEngineForLogs>().GetGranuleOptional(pathId);
+            if (!granule) {
+                continue;
+            }
+            for (const auto& [_, consumer] : byConsumer.GetConsumers()) {
+                for (const ui64 portionId : consumer.GetPortionIds()) {
+                    if (auto portion = granule->GetPortionOptional(portionId, false)) {
+                        portions.emplace_back(std::move(portion));
+                    }
+                }
+            }
+        }
+        // Cache requests regroup addresses in hash maps; restore global PortionId order here.
+        SortUniqueBy(portions, [](const auto& portion) {
+            return std::make_pair(portion->GetPortionId(), portion->GetPathId());
+        });
+        for (const auto& portion : portions) {
+            const auto pathId = portion->GetPathId();
+            const ui64 p = portion->GetPortionId();
+            const NOlap::TPortionAddress pAddress = portion->GetAddress();
+            auto itPortionConstructor = Constructors.find(pAddress);
+            if (itPortionConstructor == Constructors.end()) {
+                TPortionConstructorV2 constructor(portion);
+                itPortionConstructor = Constructors.emplace(pAddress, std::move(constructor)).first;
+            } else if (itPortionConstructor->second.IsReady()) {
+                continue;
+            }
+            if (!itPortionConstructor->second.HasRecords()) {
+                auto rowset = db.Table<NColumnShard::Schema::IndexColumnsV2>().Key(pathId.GetRawValue(), p).Select();
+                if (!rowset.IsReady()) {
+                    reask = true;
+                } else {
+                    if (rowset.EndOfSet()) {
+                        AFL_VERIFY(portion->HasRemoveSnapshot() || !Self->GetTablesManager().HasTable(pathId))
+                        ("path_id", pathId)("portion_id", p);
+                        Constructors.erase(pAddress);
                         continue;
                     }
-                    if (!itPortionConstructor->second.HasRecords()) {
-                        auto rowset = db.Table<NColumnShard::Schema::IndexColumnsV2>().Key(i.first.GetRawValue(), p).Select();
-                        if (!rowset.IsReady()) {
-                            reask = true;
-                        } else if (rowset.EndOfSet()) {
-                            // Cleanup erased the rows while the object lingers: only remove-marked portions may lack them.
-                            AFL_VERIFY(itPortionConstructor->second.GetPortionInfo()->HasRemoveSnapshot())("path_id", i.first)("portion_id", p)(
-                                "debug", itPortionConstructor->second.GetPortionInfo()->DebugString(true));
-                            Constructors.erase(itPortionConstructor);
-                            continue;
-                        } else {
-                            NOlap::TColumnChunkLoadContextV2 info(rowset, selector);
-                            itPortionConstructor->second.SetRecords(std::move(info));
-                        }
-                    }
-                    if (!itPortionConstructor->second.HasIndexes()) {
-                        if (!itPortionConstructor->second.GetPortionInfo()
-                                 ->GetSchema(Self->GetIndexAs<NOlap::TColumnEngineForLogs>().GetVersionedIndex())
-                                 ->GetIndexesCount()) {
-                            itPortionConstructor->second.SetIndexes({});
-                        } else {
-                            auto rowset = db.Table<NColumnShard::Schema::IndexIndexes>().Prefix(i.first.GetRawValue(), p).Select();
-                            if (!rowset.IsReady()) {
+                    NOlap::TColumnChunkLoadContextV2 info(rowset, selector);
+                    itPortionConstructor->second.SetRecords(std::move(info));
+                }
+            }
+            if (!itPortionConstructor->second.HasIndexes()) {
+                if (!itPortionConstructor->second.GetPortionInfo()
+                         ->GetSchema(Self->GetIndexAs<NOlap::TColumnEngineForLogs>().GetVersionedIndex())
+                         ->GetIndexesCount()) {
+                    itPortionConstructor->second.SetIndexes({});
+                } else {
+                    auto rowset = db.Table<NColumnShard::Schema::IndexIndexes>().Prefix(pathId.GetRawValue(), p).Select();
+                    if (!rowset.IsReady()) {
+                        reask = true;
+                    } else {
+                        std::vector<NOlap::TIndexChunkLoadContext> indexes;
+                        bool localReask = false;
+                        while (!localReask && !rowset.EndOfSet()) {
+                            indexes.emplace_back(NOlap::TIndexChunkLoadContext(rowset, &selector));
+                            if (!rowset.Next()) {
                                 reask = true;
-                            } else {
-                                std::vector<NOlap::TIndexChunkLoadContext> indexes;
-                                bool localReask = false;
-                                while (!localReask && !rowset.EndOfSet()) {
-                                    indexes.emplace_back(NOlap::TIndexChunkLoadContext(rowset, &selector));
-                                    if (!rowset.Next()) {
-                                        reask = true;
-                                        localReask = true;
-                                    }
-                                }
-                                itPortionConstructor->second.SetIndexes(std::move(indexes));
+                                localReask = true;
                             }
+                        }
+                        if (!localReask) {
+                            itPortionConstructor->second.SetIndexes(std::move(indexes));
                         }
                     }
                 }
@@ -1715,12 +1737,10 @@ public:
             return false;
         }
 
-        for (auto&& i : Constructors) {
-            // A portion erased between restarts of this transaction is never revisited and would reach parsing without its records.
-            if (!i.second.IsReady()) {
-                continue;
+        for (const auto& portion : portions) {
+            if (auto* constructor = MapFindPtr(Constructors, portion->GetAddress()); constructor && constructor->IsReady()) {
+                FetchedAccessors.emplace_back(std::move(*constructor));
             }
-            FetchedAccessors.emplace_back(std::move(i.second));
         }
 
         YDB_LOG_TRACE_COMP(NKikimrServices::TX_COLUMNSHARD, "Dump stage",
@@ -1839,6 +1859,7 @@ void TColumnShard::Handle(NOlap::NDataSharing::NEvents::TEvAckFinishFromInitiato
 };
 
 void TColumnShard::Handle(NOlap::NDataSharing::NEvents::TEvApplyLinksModification::TPtr& ev, const TActorContext& ctx) {
+    SharingSessionsManager->OnSharingAdmission();
     YDB_LOG_NOTICE_COMP(NKikimrServices::TX_COLUMNSHARD, "",
         {"process", "BlobsSharing"},
         {"event", "TEvApplyLinksModification"},
@@ -1954,6 +1975,7 @@ STFUNC(TColumnShard::StateWork) {
         HFunc(TEvPrivate::TEvWriteBlobsResult, Handle);
         HFunc(TEvPrivate::TEvStartCompaction, Handle);
         HFunc(TEvPrivate::TEvMetadataAccessorsInfo, Handle);
+        HFunc(TEvPrivate::TEvContinueCutHistory, Handle);
         HFunc(NPrivateEvents::NWrite::TEvWritePortionResult, Handle);
 
         HFunc(TEvMediatorTimecast::TEvRegisterTabletResult, Handle);
