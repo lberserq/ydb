@@ -204,7 +204,9 @@ void TColumnShard::TryCutHistory(const TActorContext& ctx) {
         if (nextEntry == history.end() || nextEntry->FromGeneration != interval.To) {
             continue;
         }
-        if (!storage->CanCutHistory(interval.Channel, interval.From, interval.To)) {
+        const auto blocker = storage->GetCutHistoryBlocker(interval.Channel, interval.From, interval.To);
+        if (blocker != NOlap::NBlobOperations::NBlobStorage::TOperator::ECutHistoryBlocker::None) {
+            Counters.GetCSCounters().OnCutHistoryGateBlocked((size_t)blocker);
             continue;
         }
         auto event = std::make_unique<TEvTablet::TEvCutTabletHistory>();

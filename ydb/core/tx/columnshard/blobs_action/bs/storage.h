@@ -34,9 +34,37 @@ public:
     TOperator(const TString& storageId, const NActors::TActorId& tabletActorId, const TIntrusivePtr<TTabletStorageInfo>& tabletInfo,
         const ui64 generation, const std::shared_ptr<NDataSharing::TStorageSharedBlobsManager>& sharedBlobs);
 
+    // Named so a stuck interval reports which predicate holds it, instead of a bare false.
+    enum class ECutHistoryBlocker {
+        None,
+        Stopped,
+        GCInFlight,
+        NotCollectedThrough,
+        BlobsInRange,
+        SharedBlobsInRange,
+    };
+
+    ECutHistoryBlocker GetCutHistoryBlocker(const ui32 channel, const ui32 from, const ui32 to) const {
+        if (GetStopped()) {
+            return ECutHistoryBlocker::Stopped;
+        }
+        if (HasGCInFlight()) {
+            return ECutHistoryBlocker::GCInFlight;
+        }
+        if (!Manager->HasCollectedThrough(to)) {
+            return ECutHistoryBlocker::NotCollectedThrough;
+        }
+        if (Manager->HasBlobsInRange(channel, from, to)) {
+            return ECutHistoryBlocker::BlobsInRange;
+        }
+        if (GetSharedBlobs()->HasBlobsInRange(channel, from, to)) {
+            return ECutHistoryBlocker::SharedBlobsInRange;
+        }
+        return ECutHistoryBlocker::None;
+    }
+
     bool CanCutHistory(const ui32 channel, const ui32 from, const ui32 to) const {
-        return !GetStopped() && !HasGCInFlight() && Manager->HasCollectedThrough(to) && !Manager->HasBlobsInRange(channel, from, to) &&
-               !GetSharedBlobs()->HasBlobsInRange(channel, from, to);
+        return GetCutHistoryBlocker(channel, from, to) == ECutHistoryBlocker::None;
     }
 
     virtual bool HasToDelete(const TUnifiedBlobId& blobId, const TTabletId tabletId) const override {

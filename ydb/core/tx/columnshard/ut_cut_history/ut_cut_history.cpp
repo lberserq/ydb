@@ -264,6 +264,12 @@ Y_UNIT_TEST_SUITE(TColumnShardCutHistory) {
         UNIT_ASSERT_VALUES_EQUAL_C(f.Samples("Scan"), 1u, "the scan must have finished, leaving only the barrier missing");
         UNIT_ASSERT_VALUES_EQUAL_C(cuts, 0u, "cut before a GC round covered the interval");
 
+        // While the round is held the gate must name what blocks it, not just refuse.
+        const auto blocked = f.Counters()->GetCounter("Deriviative/CutHistory/GateBlocked/GCInFlight/Count", true);
+        UNIT_ASSERT_C(blocked->Val() > 0, "a held GC round must be reported as the GCInFlight blocker");
+        UNIT_ASSERT_VALUES_EQUAL_C(f.Counters()->GetCounter("Deriviative/CutHistory/GateBlocked/BlobsInRange/Count", true)->Val(), 0u,
+            "the interval is drained, so no blob-range blocker may be reported");
+
         holdGC = false;
         for (auto& ev : held) {
             f.Runtime.Send(ev.Release());

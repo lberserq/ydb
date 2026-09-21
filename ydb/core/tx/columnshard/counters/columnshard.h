@@ -106,6 +106,11 @@ private:
     NMonitoring::TDynamicCounters::TCounterPtr CutHistoryScansAborted;
     NMonitoring::THistogramPtr CutHistoryScanDurationMs;
     NMonitoring::THistogramPtr CutHistoryWaitDurationMs;
+    // Indexed by TOperator::ECutHistoryBlocker; the header stays free of the storage operator.
+    static constexpr std::array<TStringBuf, 6> CutHistoryBlockerNames = { "None", "Stopped", "GCInFlight", "NotCollectedThrough", "BlobsInRange",
+        "SharedBlobsInRange" };
+    static constexpr size_t CutHistoryBlockerCount = CutHistoryBlockerNames.size();
+    std::array<NMonitoring::TDynamicCounters::TCounterPtr, CutHistoryBlockerCount> CutHistoryGateBlocked;
     NMonitoring::TDynamicCounters::TCounterPtr IndexMetadataLimitBytes;
 
     // Aggregation clients, not gauges: tablets share one module_id=CS subgroup, Set() would race.
@@ -332,6 +337,11 @@ public:
     void OnCutHistoryRequestSent(const TDuration duration) const {
         CutHistoryRequestsSent->Inc();
         CutHistoryWaitDurationMs->Collect(duration.MilliSeconds());
+    }
+
+    void OnCutHistoryGateBlocked(const size_t blocker) const {
+        AFL_VERIFY(blocker < CutHistoryBlockerCount)("blocker", blocker);
+        CutHistoryGateBlocked[blocker]->Inc();
     }
 
     void OnIndexMetadataLimit(const ui64 limit) const {

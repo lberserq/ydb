@@ -35,8 +35,15 @@ TCSCounters::TCSCounters()
 
     CutHistoryRequestsSent = TBase::GetDeriviative("CutHistory/RequestsSent/Count");
     CutHistoryScansAborted = TBase::GetDeriviative("CutHistory/ScansAborted/Count");
-    CutHistoryScanDurationMs = TBase::GetHistogram("CutHistory/Scan/DurationMs", NMonitoring::ExponentialHistogram(18, 2, 1));
-    CutHistoryWaitDurationMs = TBase::GetHistogram("CutHistory/ScanToSend/DurationMs", NMonitoring::ExponentialHistogram(18, 2, 1));
+    // Explicit ladders: base-2 octaves put the whole wait population in one bin, so its percentiles were interpolation.
+    CutHistoryScanDurationMs = TBase::GetHistogram("CutHistory/Scan/DurationMs",
+        NMonitoring::ExplicitHistogram({ 1, 2, 3, 5, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768 }));
+    CutHistoryWaitDurationMs = TBase::GetHistogram(
+        "CutHistory/ScanToSend/DurationMs", NMonitoring::ExplicitHistogram({ 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2000, 3000, 5000, 7500,
+                                                10000, 15000, 20000, 30000, 45000, 60000, 90000, 120000, 180000, 300000 }));
+    for (size_t i = 0; i < CutHistoryBlockerCount; ++i) {
+        CutHistoryGateBlocked[i] = TBase::GetDeriviative("CutHistory/GateBlocked/" + ToString(CutHistoryBlockerNames[i]) + "/Count");
+    }
     IndexMetadataLimitBytes = TBase::GetValue("IndexMetadata/Limit/Bytes");
 
     MoveDataActive = TBase::GetValueAutoAggregationsClient("MoveData/Active");
