@@ -211,6 +211,7 @@ class TColumnShard: public TActor<TColumnShard>, public NTabletFlatExecutor::TTa
     friend class TTxExportFinish;
     friend class TTxRunGC;
     friend class TTxProcessGCResult;
+    friend class TTxGarbageCollectionFinished;
     friend class TTxReadBlobRanges;
     friend class TTxApplyNormalizer;
     friend class TTxMonitoring;

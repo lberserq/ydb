@@ -13,12 +13,14 @@ bool TTxGarbageCollectionFinished::Execute(TTransactionContext& txc, const TActo
     return true;
 }
 
-void TTxGarbageCollectionFinished::Complete(const TActorContext& /*ctx*/) {
+void TTxGarbageCollectionFinished::Complete(const TActorContext& ctx) {
     TMemoryProfileGuard mpg("TTxGarbageCollectionFinished::Complete");
     YDB_LOG_DEBUG("",
         {"tx", "TxGarbageCollectionFinished"},
         {"event", "complete"});
     Action->OnCompleteTxAfterCleaning(*Self, Action);
+    // This round is what makes CanCutHistory true, so the cut goes out now instead of on the next wakeup.
+    Self->TryCutHistory(ctx);
 }
 
 bool TTxGarbageCollectionStart::Execute(TTransactionContext& txc, const TActorContext& /*ctx*/) {

@@ -239,6 +239,40 @@ Y_UNIT_TEST_SUITE(TColumnShardCutHistory) {
         UNIT_ASSERT_STRING_CONTAINS(rebootedPage->Get()->Html, journal);
     }
 
+    // The GC round is what makes CanCutHistory true, so it must send the cut itself, not leave it to a wakeup.
+    Y_UNIT_TEST(CutFollowsTheGCRoundWithoutAWakeup) {
+        TFixture f;
+        ui32 cuts = 0;
+        bool holdGC = true;
+        std::vector<TAutoPtr<IEventHandle>> held;
+        auto observer = f.Runtime.AddObserver<IEventHandle>([&](IEventHandle::TPtr& ev) {
+            if (!ev->HasEvent()) {
+                return;
+            }
+            if (const auto* gc = dynamic_cast<TEvBlobStorage::TEvCollectGarbageResult*>(ev->GetBase());
+                holdGC && gc && gc->TabletId == TabletId && gc->Channel == FirstDataChannel) {
+                held.emplace_back(ev.Release());
+            } else if (const auto* cut = dynamic_cast<TEvTablet::TEvCutTabletHistory*>(ev->GetBase());
+                       cut && cut->Record.GetChannel() == FirstDataChannel) {
+                ++cuts;
+                ev.Reset();
+            }
+        });
+        f.Restart(NewGroup);
+        f.Drive();
+        UNIT_ASSERT_C(!held.empty(), "no GC round was held back, so the barrier is not what blocks the cut");
+        UNIT_ASSERT_VALUES_EQUAL_C(f.Samples("Scan"), 1u, "the scan must have finished, leaving only the barrier missing");
+        UNIT_ASSERT_VALUES_EQUAL_C(cuts, 0u, "cut before a GC round covered the interval");
+
+        holdGC = false;
+        for (auto& ev : held) {
+            f.Runtime.Send(ev.Release());
+        }
+        // Deliberately no Wakeup: only TTxGarbageCollectionFinished can produce the cut here.
+        f.Runtime.SimulateSleep(TDuration::Seconds(1));
+        UNIT_ASSERT_VALUES_EQUAL_C(cuts, 1u, "the cut waited for a periodic wakeup instead of going out with the GC round");
+    }
+
     Y_UNIT_TEST(CleanedPortionWaitsForQueuedBlob) {
         TFixture f;
         f.Controller->DisableBackground(EBackground::Compaction);
