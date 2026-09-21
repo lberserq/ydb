@@ -56,7 +56,6 @@ struct Schema: NIceDb::Schema {
         NormalizerEventsTableId,
         ColumnsV1TableId,
         ColumnsV2TableId,
-        MoveDataRowsTableId,
         CutHistoryRequestsTableId
     };
 
@@ -802,25 +801,12 @@ struct Schema: NIceDb::Schema {
         using TColumns = TableColumns<PathId, PortionId, Metadata, BlobIds>;
     };
 
-    struct MoveDataRows: Table<MoveDataRowsTableId> {
-        struct Channel: Column<1, NScheme::NTypeIds::Uint32> {};
-
-        struct FromGeneration: Column<2, NScheme::NTypeIds::Uint32> {};
-
-        struct ToGenerationExclusive: Column<3, NScheme::NTypeIds::Uint32> {};
-
-        struct GroupId: Column<4, NScheme::NTypeIds::Uint32> {};
-
-        using TKey = TableKey<Channel, FromGeneration>;
-        using TColumns = TableColumns<Channel, FromGeneration, ToGenerationExclusive, GroupId>;
-    };
-
     using TTables = SchemaTables<Value, TxInfo, SchemaPresetInfo, SchemaPresetVersionInfo, TtlSettingsPresetInfo, TtlSettingsPresetVersionInfo,
         TableInfo, TableVersionInfo, LongTxWrites, BlobsToKeep, BlobsToDelete, BlobsToDeleteWT, InsertTable, IndexGranules, IndexColumns,
         IndexCounters, SmallBlobs, OneToOneEvictedBlobs, Operations, TierBlobsDraft, TierBlobsToDelete, TierBlobsToDeleteWT, IndexIndexes,
         SharedBlobIds, BorrowedBlobIds, SourceSessions, DestinationSessions, OperationTxIds, IndexPortions, BackgroundSessions, ShardingInfo,
         Normalizers, NormalizerEvents, InFlightSnapshots, TxDependencies, TxStates, TxEvents, IndexColumnsV1, IndexColumnsV2, TableInfoV1,
-        MoveDataRows, CutHistoryRequests>;
+        CutHistoryRequests>;
 
     //
 
