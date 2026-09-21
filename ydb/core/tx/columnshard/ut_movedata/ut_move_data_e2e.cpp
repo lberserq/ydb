@@ -70,6 +70,32 @@ const TEvPrivate::TEvWriteIndex* AsWriteIndex(IEventHandle::TPtr& ev) {
     return dynamic_cast<const TEvPrivate::TEvWriteIndex*>(ev->GetBase());
 }
 
+// What the boot scan did, for the message of an assert that expected a cut and did not get one.
+TString CutHistoryStats(TTestBasicRuntime& runtime) {
+    const auto subgroup =
+        GetServiceCounters(runtime.GetDynamicCounters(0), "tablets")->GetSubgroup("subsystem", "columnshard")->GetSubgroup("module_id", "CS");
+    ui64 scans = 0;
+    if (const auto histogram = subgroup->FindHistogram("Histogram/CutHistory/Scan/DurationMs")) {
+        const auto snapshot = histogram->Snapshot();
+        for (ui32 i = 0; i < snapshot->Count(); ++i) {
+            scans += snapshot->Value(i);
+        }
+    }
+    return TStringBuilder() << "scans=" << scans << " aborted=" << subgroup->GetCounter("Deriviative/CutHistory/ScansAborted/Count", true)->Val()
+                            << " sent=" << subgroup->GetCounter("Deriviative/CutHistory/RequestsSent/Count", true)->Val();
+}
+
+// Channels 0/1 have cutters of their own, so only channels 2+ say anything about the ColumnShard scan.
+std::vector<NKikimrTabletBase::TEvCutTabletHistory> DataChannelCuts(const std::vector<NKikimrTabletBase::TEvCutTabletHistory>& all) {
+    std::vector<NKikimrTabletBase::TEvCutTabletHistory> result;
+    for (const auto& record : all) {
+        if (record.GetChannel() >= FirstDataChannel) {
+            result.push_back(record);
+        }
+    }
+    return result;
+}
+
 // One shard whose portion data sits in OldGroup, driven through a MoveData session by manual wakeups.
 class TMoveDataFixture {
 public:
@@ -81,8 +107,8 @@ public:
     // The cutter sends TEvCutTabletHistory here, so it must be a real actor.
     TActorId Launcher;
 
-    explicit TMoveDataFixture(const bool moveDataEnabled = true)
-        : Controller(SetupRuntime(moveDataEnabled))
+    explicit TMoveDataFixture(const bool moveDataEnabled = true, const bool cutHistoryEnabled = false)
+        : Controller(SetupRuntime(moveDataEnabled, cutHistoryEnabled))
     {
         // Without a real mediator the rewrite plan-step never ages, so set staleness to zero.
         Controller->SetOverrideMaxReadStaleness(TDuration::Zero());
@@ -178,11 +204,25 @@ private:
     // First generation in NewGroup, once ReassignPastWrittenData has run.
     ui32 ReassignedFrom = 0;
 
-    NYDBTest::TControllers::TGuard<NYDBTest::NColumnShard::TController> SetupRuntime(const bool moveDataEnabled) {
+    NYDBTest::TControllers::TGuard<NYDBTest::NColumnShard::TController> SetupRuntime(const bool moveDataEnabled, const bool cutHistoryEnabled) {
         Runtime.SetScheduledLimit(10'000);
         TTester::Setup(Runtime, { new NFake::TProxyDS(TGroupId::FromValue(0)), OldGroupProxy, NewGroupProxy,
                                     new NFake::TProxyDS(TGroupId::FromValue(Max<ui32>())) });
         Runtime.GetAppData().FeatureFlags.SetEnableColumnshardGroupDecommission(moveDataEnabled);
+        Runtime.GetAppData().FeatureFlags.SetEnableCutHistory(cutHistoryEnabled);
+        if (cutHistoryEnabled) {
+            // The runtime drops scheduled events by default, and the boot scan walks portions on one.
+            auto previous = Runtime.SetScheduledEventFilter([](TTestActorRuntimeBase&, TAutoPtr<IEventHandle>&, TDuration, TInstant&) {
+                return true;
+            });
+            Runtime.SetScheduledEventFilter(
+                [previous](TTestActorRuntimeBase& r, TAutoPtr<IEventHandle>& event, TDuration delay, TInstant& deadline) {
+                    if (event->HasEvent() && dynamic_cast<TEvPrivate::TEvContinueCutHistory*>(event->GetBase())) {
+                        return false;
+                    }
+                    return previous(r, event, delay, deadline);
+                });
+        }
         return NYDBTest::TControllers::RegisterCSControllerGuard<NYDBTest::NColumnShard::TController>();
     }
 };
@@ -573,6 +613,57 @@ Y_UNIT_TEST_SUITE(TColumnShardMoveDataE2E) {
         });
         UNIT_ASSERT_C(response, "no Success after the first GC round of the incarnation committed");
         f.AssertDrainedSuccess(response);
+    }
+
+    // Both legs in one tablet: only the incarnation booting after Success re-derives the interval as empty and cuts it.
+    Y_UNIT_TEST(CutHistoryFollowsMoveDataAcrossTheRestart) {
+        TMoveDataFixture f(/*moveDataEnabled=*/true, /*cutHistoryEnabled=*/true);
+        f.Controller->DisableBackground(EBackground::TTL);
+        f.Write(1, 0, 1000);
+        f.Controller->WaitCompactions(TDuration::Seconds(10));
+        f.ReassignPastWrittenData();
+
+        std::vector<NKikimrTabletBase::TEvCutTabletHistory> cuts;
+        auto observer = f.Runtime.AddObserver<IEventHandle>([&](IEventHandle::TPtr& ev) {
+            if (!ev->HasEvent()) {
+                return;
+            }
+            if (const auto* cut = dynamic_cast<const TEvTablet::TEvCutTabletHistory*>(ev->GetBase())) {
+                cuts.push_back(cut->Record);
+            }
+        });
+
+        // The portions still live in OldGroup, so the scan counts references and refuses the cut.
+        f.DriveGate(20);
+        UNIT_ASSERT_VALUES_EQUAL_C(DataChannelCuts(cuts).size(), 0u, "cut an interval whose portions are still in the old group");
+
+        f.StartMove();
+        const auto response = f.DriveGate(150, [&](const ui32 i) {
+            if (i == 25) {
+                f.Write(2, 1000, 1001);
+            }
+        });
+        UNIT_ASSERT_C(response, "no TEvMoveDataResponse: the move never drained OldGroup");
+        f.AssertDrainedSuccess(response);
+        UNIT_ASSERT_VALUES_EQUAL_C(DataChannelCuts(cuts).size(), 0u,
+            "cut inside the generation that was still writing - the scan of this incarnation predates the move");
+
+        // A compaction landing mid-scan would abort it, and the scan runs once per incarnation.
+        f.Controller->DisableBackground(EBackground::Compaction);
+        // The restart Hive issues on Success; the cut then waits for this incarnation's GC barrier.
+        f.Restart();
+        f.DriveGate(300, {}, [&] {
+            return !DataChannelCuts(cuts).empty();
+        });
+
+        const auto cut = DataChannelCuts(cuts);
+        UNIT_ASSERT_C(!cut.empty(), "the drained interval was never cut after the restart: " << CutHistoryStats(f.Runtime));
+        for (const auto& record : cut) {
+            UNIT_ASSERT_VALUES_EQUAL(record.GetTabletID(), TabletId);
+            UNIT_ASSERT_VALUES_EQUAL(record.GetFromGeneration(), 0u);
+            UNIT_ASSERT_VALUES_EQUAL(record.GetGroupID(), OldGroup);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(f.ReadRows(), 1000);
     }
 
     // MoveData must rewrite index blobs (InheritPortionStorage=false) left in BlobStorage by a tiered portion.
