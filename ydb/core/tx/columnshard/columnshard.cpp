@@ -726,12 +726,13 @@ void TColumnShard::CheckMoveDataGate(const TActorContext& ctx) {
     if (!MoveDataState.Active) {
         return;
     }
+    Counters.GetCSCounters().OnMoveDataGateChecked();
 
     NOlap::NActualizer::TMoveDataQueueSizes queues;
     if (HasIndex()) {
         queues = GetIndexAs<NOlap::TColumnEngineForLogs>().GetMoveDataQueueSizes();
     }
-    Counters.GetCSCounters().OnMoveDataQueues(queues.Pending, queues.ConfirmedToMove, queues.InFlight);
+    Counters.GetCSCounters().OnMoveDataQueues(queues.Pending, queues.ConfirmedToMove, queues.InFlight, queues.Uncommitted);
     if (queues.Rejected > MoveDataState.ReportedRejections) {
         Counters.GetCSCounters().OnMoveDataPortionsRejected(queues.Rejected - MoveDataState.ReportedRejections);
         MoveDataState.ReportedRejections = queues.Rejected;

@@ -118,6 +118,10 @@ private:
     std::shared_ptr<TValueAggregationClient> MoveDataPortionsPending;
     std::shared_ptr<TValueAggregationClient> MoveDataPortionsConfirmedToMove;
     std::shared_ptr<TValueAggregationClient> MoveDataPortionsInFlight;
+    // The fourth term of GetTotal(): without it a gate blocked by uncommitted writes reports three zeroes.
+    std::shared_ptr<TValueAggregationClient> MoveDataPortionsUncommitted;
+    // Denominator for the GateBlocked family: without it a frozen zero cannot tell a passing gate from one never evaluated.
+    NMonitoring::TDynamicCounters::TCounterPtr MoveDataGateCheckedCount;
     NMonitoring::TDynamicCounters::TCounterPtr MoveDataGateBlockedByVacuumCount;
     NMonitoring::TDynamicCounters::TCounterPtr MoveDataGateBlockedByPortionsCount;
     NMonitoring::TDynamicCounters::TCounterPtr MoveDataGateBlockedByCleanupCount;
@@ -235,10 +239,15 @@ public:
     }
 
     // Scalars, not TMoveDataQueueSizes: keeps this library off the actualizer headers.
-    void OnMoveDataQueues(const ui64 pending, const ui64 confirmedToMove, const ui64 inFlight) const {
+    void OnMoveDataQueues(const ui64 pending, const ui64 confirmedToMove, const ui64 inFlight, const ui64 uncommitted) const {
         MoveDataPortionsPending->SetValue(pending);
         MoveDataPortionsConfirmedToMove->SetValue(confirmedToMove);
         MoveDataPortionsInFlight->SetValue(inFlight);
+        MoveDataPortionsUncommitted->SetValue(uncommitted);
+    }
+
+    void OnMoveDataGateChecked() const {
+        MoveDataGateCheckedCount->Add(1);
     }
 
     void OnMoveDataGateBlockedByVacuum() const {
@@ -271,6 +280,7 @@ public:
         MoveDataPortionsPending->SetValue(0);
         MoveDataPortionsConfirmedToMove->SetValue(0);
         MoveDataPortionsInFlight->SetValue(0);
+        MoveDataPortionsUncommitted->SetValue(0);
     }
 
     void OnWriteOverloadMetadata(const ui64 size) const {

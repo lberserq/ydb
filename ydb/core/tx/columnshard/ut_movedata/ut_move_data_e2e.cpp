@@ -62,6 +62,12 @@ i64 GateBlockedByFirstGCRound(TTestBasicRuntime& runtime) {
     return subgroup->GetCounter("Deriviative/MoveData/GateBlocked/FirstGCRound/Count", true)->Val();
 }
 
+i64 GateBlockedByPortions(TTestBasicRuntime& runtime) {
+    const auto subgroup =
+        GetServiceCounters(runtime.GetDynamicCounters(0), "tablets")->GetSubgroup("subsystem", "columnshard")->GetSubgroup("module_id", "CS");
+    return subgroup->GetCounter("Deriviative/MoveData/GateBlocked/Portions/Count", true)->Val();
+}
+
 // Private event ids repeat across components, so the type id alone does not identify TEvWriteIndex.
 const TEvPrivate::TEvWriteIndex* AsWriteIndex(IEventHandle::TPtr& ev) {
     if (ev->GetTypeRewrite() != TEvPrivate::TEvWriteIndex::EventType || !ev->HasEvent()) {
@@ -289,6 +295,8 @@ Y_UNIT_TEST_SUITE(TColumnShardMoveDataE2E) {
                 f.Write(2, 1000, 1001);
             }
         }), "answered Success while an uncommitted write held blobs in the old group");
+        // Uncommitted is the only non-zero term of GetTotal() here, so this names the branch a stuck shrink reports.
+        UNIT_ASSERT_C(GateBlockedByPortions(f.Runtime) > 0, "an uncommitted write held the gate without reporting the Portions branch");
 
         f.CommitLock(3, writeIds, 7);
         const auto response = f.DriveGate(150, [&](const ui32 i) {
