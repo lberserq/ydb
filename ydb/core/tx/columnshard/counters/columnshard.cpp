@@ -33,7 +33,31 @@ TCSCounters::TCSCounters()
     FutureIndexationInputBytes = TBase::GetDeriviative("FutureIndexationInput/Bytes");
     IndexationInputBytes = TBase::GetDeriviative("IndexationInput/Bytes");
 
+    CutHistoryRequestsSent = TBase::GetDeriviative("CutHistory/RequestsSent/Count");
+    CutHistoryScansAborted = TBase::GetDeriviative("CutHistory/ScansAborted/Count");
+    // Explicit ladders: base-2 octaves put the whole wait population in one bin, so its percentiles were interpolation.
+    CutHistoryScanDurationMs = TBase::GetHistogram("CutHistory/Scan/DurationMs",
+        NMonitoring::ExplicitHistogram({ 1, 2, 3, 5, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768 }));
+    CutHistoryWaitDurationMs = TBase::GetHistogram(
+        "CutHistory/ScanToSend/DurationMs", NMonitoring::ExplicitHistogram({ 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2000, 3000, 5000, 7500,
+                                                10000, 15000, 20000, 30000, 45000, 60000, 90000, 120000, 180000, 300000 }));
+    for (size_t i = 0; i < CutHistoryBlockerCount; ++i) {
+        CutHistoryGateBlocked[i] = TBase::GetDeriviative("CutHistory/GateBlocked/" + ToString(CutHistoryBlockerNames[i]) + "/Count");
+    }
     IndexMetadataLimitBytes = TBase::GetValue("IndexMetadata/Limit/Bytes");
+
+    MoveDataActive = TBase::GetValueAutoAggregationsClient("MoveData/Active");
+    MoveDataPortionsPending = TBase::GetValueAutoAggregationsClient("MoveData/Portions/Pending");
+    MoveDataPortionsConfirmedToMove = TBase::GetValueAutoAggregationsClient("MoveData/Portions/ConfirmedToMove");
+    MoveDataPortionsInFlight = TBase::GetValueAutoAggregationsClient("MoveData/Portions/InFlight");
+    MoveDataPortionsUncommitted = TBase::GetValueAutoAggregationsClient("MoveData/Portions/Uncommitted");
+    MoveDataGateCheckedCount = TBase::GetDeriviative("MoveData/Gate/Checked/Count");
+    MoveDataGateBlockedByVacuumCount = TBase::GetDeriviative("MoveData/GateBlocked/Vacuum/Count");
+    MoveDataGateBlockedByPortionsCount = TBase::GetDeriviative("MoveData/GateBlocked/Portions/Count");
+    MoveDataPortionsRejectedCount = TBase::GetDeriviative("MoveData/Portions/Rejected/Count");
+    MoveDataGateBlockedByCleanupCount = TBase::GetDeriviative("MoveData/GateBlocked/Cleanup/Count");
+    MoveDataGateBlockedByGCCount = TBase::GetDeriviative("MoveData/GateBlocked/GC/Count");
+    MoveDataGateBlockedByFirstGCRoundCount = TBase::GetDeriviative("MoveData/GateBlocked/FirstGCRound/Count");
 
     OverloadMetadataBytes = TBase::GetDeriviative("Overload/Metadata/Bytes");
     OverloadMetadataCount = TBase::GetDeriviative("Overload/Metadata/Count");

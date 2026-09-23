@@ -102,7 +102,32 @@ private:
     NMonitoring::TDynamicCounters::TCounterPtr FutureIndexationInputBytes;
     NMonitoring::TDynamicCounters::TCounterPtr IndexationInputBytes;
 
+    NMonitoring::TDynamicCounters::TCounterPtr CutHistoryRequestsSent;
+    NMonitoring::TDynamicCounters::TCounterPtr CutHistoryScansAborted;
+    NMonitoring::THistogramPtr CutHistoryScanDurationMs;
+    NMonitoring::THistogramPtr CutHistoryWaitDurationMs;
+    // Indexed by TOperator::ECutHistoryBlocker; the header stays free of the storage operator.
+    static constexpr std::array<TStringBuf, 6> CutHistoryBlockerNames = { "None", "Stopped", "GCInFlight", "NotCollectedThrough", "BlobsInRange",
+        "SharedBlobsInRange" };
+    static constexpr size_t CutHistoryBlockerCount = CutHistoryBlockerNames.size();
+    std::array<NMonitoring::TDynamicCounters::TCounterPtr, CutHistoryBlockerCount> CutHistoryGateBlocked;
     NMonitoring::TDynamicCounters::TCounterPtr IndexMetadataLimitBytes;
+
+    // Aggregation clients, not gauges: tablets share one module_id=CS subgroup, Set() would race.
+    std::shared_ptr<TValueAggregationClient> MoveDataActive;
+    std::shared_ptr<TValueAggregationClient> MoveDataPortionsPending;
+    std::shared_ptr<TValueAggregationClient> MoveDataPortionsConfirmedToMove;
+    std::shared_ptr<TValueAggregationClient> MoveDataPortionsInFlight;
+    // The fourth term of GetTotal(): without it a gate blocked by uncommitted writes reports three zeroes.
+    std::shared_ptr<TValueAggregationClient> MoveDataPortionsUncommitted;
+    // Denominator for the GateBlocked family: without it a frozen zero cannot tell a passing gate from one never evaluated.
+    NMonitoring::TDynamicCounters::TCounterPtr MoveDataGateCheckedCount;
+    NMonitoring::TDynamicCounters::TCounterPtr MoveDataGateBlockedByVacuumCount;
+    NMonitoring::TDynamicCounters::TCounterPtr MoveDataGateBlockedByPortionsCount;
+    NMonitoring::TDynamicCounters::TCounterPtr MoveDataGateBlockedByCleanupCount;
+    NMonitoring::TDynamicCounters::TCounterPtr MoveDataGateBlockedByGCCount;
+    NMonitoring::TDynamicCounters::TCounterPtr MoveDataGateBlockedByFirstGCRoundCount;
+    NMonitoring::TDynamicCounters::TCounterPtr MoveDataPortionsRejectedCount;
 
     NMonitoring::TDynamicCounters::TCounterPtr OverloadMetadataBytes;
     NMonitoring::TDynamicCounters::TCounterPtr OverloadMetadataCount;
@@ -209,6 +234,55 @@ public:
         SplitCompactionGranulePortionsCount->SetValue(portionsCount);
     }
 
+    void OnMoveDataStarted() const {
+        MoveDataActive->SetValue(1);
+    }
+
+    // Scalars, not TMoveDataQueueSizes: keeps this library off the actualizer headers.
+    void OnMoveDataQueues(const ui64 pending, const ui64 confirmedToMove, const ui64 inFlight, const ui64 uncommitted) const {
+        MoveDataPortionsPending->SetValue(pending);
+        MoveDataPortionsConfirmedToMove->SetValue(confirmedToMove);
+        MoveDataPortionsInFlight->SetValue(inFlight);
+        MoveDataPortionsUncommitted->SetValue(uncommitted);
+    }
+
+    void OnMoveDataGateChecked() const {
+        MoveDataGateCheckedCount->Add(1);
+    }
+
+    void OnMoveDataGateBlockedByVacuum() const {
+        MoveDataGateBlockedByVacuumCount->Add(1);
+    }
+
+    // A portion left the queues because none of its blobs resolved into a target group.
+    void OnMoveDataPortionsRejected(const ui64 count) const {
+        MoveDataPortionsRejectedCount->Add(count);
+    }
+
+    void OnMoveDataGateBlockedByPortions() const {
+        MoveDataGateBlockedByPortionsCount->Add(1);
+    }
+
+    void OnMoveDataGateBlockedByCleanup() const {
+        MoveDataGateBlockedByCleanupCount->Add(1);
+    }
+
+    void OnMoveDataGateBlockedByGC() const {
+        MoveDataGateBlockedByGCCount->Add(1);
+    }
+
+    void OnMoveDataGateBlockedByFirstGCRound() const {
+        MoveDataGateBlockedByFirstGCRoundCount->Add(1);
+    }
+
+    void OnMoveDataFinished() const {
+        MoveDataActive->SetValue(0);
+        MoveDataPortionsPending->SetValue(0);
+        MoveDataPortionsConfirmedToMove->SetValue(0);
+        MoveDataPortionsInFlight->SetValue(0);
+        MoveDataPortionsUncommitted->SetValue(0);
+    }
+
     void OnWriteOverloadMetadata(const ui64 size) const {
         OverloadMetadataBytes->Add(size);
         OverloadMetadataCount->Add(1);
@@ -260,6 +334,24 @@ public:
 
     void IndexationInput(const ui64 size) const {
         IndexationInputBytes->Add(size);
+    }
+
+    void OnCutHistoryScanAborted() const {
+        CutHistoryScansAborted->Inc();
+    }
+
+    void OnCutHistoryScanFinished(const TDuration duration) const {
+        CutHistoryScanDurationMs->Collect(duration.MilliSeconds());
+    }
+
+    void OnCutHistoryRequestSent(const TDuration duration) const {
+        CutHistoryRequestsSent->Inc();
+        CutHistoryWaitDurationMs->Collect(duration.MilliSeconds());
+    }
+
+    void OnCutHistoryGateBlocked(const size_t blocker) const {
+        AFL_VERIFY(blocker < CutHistoryBlockerCount)("blocker", blocker);
+        CutHistoryGateBlocked[blocker]->Inc();
     }
 
     void OnIndexMetadataLimit(const ui64 limit) const {

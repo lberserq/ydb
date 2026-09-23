@@ -211,6 +211,7 @@ class TColumnShard: public TActor<TColumnShard>, public NTabletFlatExecutor::TTa
     friend class TTxExportFinish;
     friend class TTxRunGC;
     friend class TTxProcessGCResult;
+    friend class TTxGarbageCollectionFinished;
     friend class TTxReadBlobRanges;
     friend class TTxApplyNormalizer;
     friend class TTxMonitoring;
@@ -344,6 +345,10 @@ class TColumnShard: public TActor<TColumnShard>, public NTabletFlatExecutor::TTa
     void Handle(TEvDataShard::TEvCancelBackup::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvCancelRestore::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvCompactTable::TPtr& ev, const TActorContext& ctx);
+    void Handle(TEvTablet::TEvMoveData::TPtr& ev, const TActorContext& ctx);
+    virtual void MoveDataCompleted(const TActorContext& ctx) override;
+    // Split out of MoveDataCompleted so the wakeup can drive it without claiming vacuum finished.
+    void CheckMoveDataGate(const TActorContext& ctx);
 
     void Handle(TEvColumnShard::TEvOverloadUnsubscribe::TPtr& ev, const TActorContext& ctx);
     void Handle(NLongTxService::TEvLongTxService::TEvLockStatus::TPtr& ev, const TActorContext& ctx);
@@ -517,6 +522,8 @@ private:
     std::unique_ptr<NTabletPipe::IClientCache> PipeClientCache;
     NOlap::NResourceBroker::NSubscribe::TTaskContext CompactTaskSubscription;
     NOlap::NResourceBroker::NSubscribe::TTaskContext TTLTaskSubscription;
+    // Own type: this string drives both the broker queue and the ResourceType sensor label.
+    NOlap::NResourceBroker::NSubscribe::TTaskContext MoveDataTaskSubscription;
 
     ui64 InProgressTxId = 0;
     bool ProgressTxScheduled = false;
@@ -534,6 +541,28 @@ private:
 
     TActorId StatsReportPipe;
     std::unique_ptr<TEvDataShard::TEvPeriodicTableStats> LastStats;
+
+    // Stateless v1: no persistence; on restart Hive re-sends TEvMoveData.
+    struct TMoveDataState {
+        TActorId HiveSender;
+        THashSet<ui32> TargetGroups;
+        bool Active = false;
+        // Set by the executor's MoveDataCompleted(): vacuum done, the blob gates still pending.
+        bool VacuumCompleted = false;
+        // Epoch-initialized so the first check fires; the cadence is a lower bound, not a period.
+        TInstant LastGateCheckAt;
+        // The actualizer count is cumulative; track what was reported to keep the sensor a rate.
+        ui64 ReportedRejections = 0;
+        // Newest pending cleanup when the queues last drained; the gate waits for cleanup to pass it.
+        std::optional<TInstant> CleanupWatermark;
+    };
+
+    static constexpr TDuration MoveDataGateCheckCadence = TDuration::Seconds(5);
+
+    TMoveDataState MoveDataState;
+
+    // Number of metadata-accessor requests this tablet has in flight; gates SetupMetadata.
+    std::shared_ptr<TAtomicCounter> MetadataRequestsInFlight = std::make_shared<TAtomicCounter>();
 
     // In-flight forced-compaction requests (ALTER TABLE ... COMPACT). Kept in memory only, mirroring
     // DataShard's CompactionWaiters: on restart/move the SchemeShard's persisted queue re-sends
@@ -597,7 +626,49 @@ private:
     void StartOneCompactionTask(const std::shared_ptr<NOlap::NCompaction::TGeneralCompactColumnEngineChanges>& indexChanges,
         const std::shared_ptr<NPrioritiesQueue::TAllocationGuard>& guard);
 
+    struct TCutHistoryInterval {
+        ui32 Channel = 0;
+        ui32 From = 0;
+        ui32 To = 0;
+        ui32 Group = 0;
+        ui64 BlobReferences = 0;
+        bool Sent = false;
+    };
+
+    struct TCutHistoryScan {
+        std::vector<TCutHistoryInterval> Intervals;
+        std::vector<std::pair<TInternalPathId, ui64>> Portions;
+        size_t Position = 0;
+        size_t Pending = 0;
+        TInstant Started;
+        std::optional<TInstant> Finished;
+    };
+
+    std::optional<TCutHistoryScan> CutHistoryScan;
+    static constexpr ui64 CutHistoryRequestLimit = 64;
+
+    struct TCutHistoryRequest {
+        ui64 TabletID = 0;
+        ui32 Channel = 0;
+        ui32 FromGeneration = 0;
+        ui32 GroupID = 0;
+        TInstant Timestamp;
+        TActorId Recipient;
+        ui32 ToGeneration = 0;
+        ui32 SendingGeneration = 0;
+    };
+    class TTxSaveCutHistoryRequests;
+    class TCutHistoryResultProcessor;
+    void StartCutHistoryScan(const TActorContext& ctx);
+    void FinishCutHistoryBatch(const NOlap::TDataAccessorsResult& result);
+    void TryCutHistory(const TActorContext& ctx);
+    void Handle(TEvPrivate::TEvContinueCutHistory::TPtr& ev, const TActorContext& ctx);
+    void SubmitMetadataRequest(const NOlap::TCSMetadataRequest& request);
     void SetupMetadata();
+    // Re-arms only the move's accessor requests, ungated: they must not queue behind tiering's.
+    void SetupMoveDataMetadata();
+    void StartMetadataRequests(
+        std::vector<NOlap::TCSMetadataRequest>&& requests, const NOlap::NResourceBroker::NSubscribe::TTaskContext& taskContext);
     bool SetupTtl();
     void SetupCleanupPortions(const NOlap::ISnapshotHolders& snapshotHolders);
     void SetupCleanupTables(const NOlap::ISnapshotHolders& snapshotHolders);

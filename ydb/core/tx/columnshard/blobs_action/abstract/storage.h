@@ -14,6 +14,8 @@
 #include <ydb/library/accessor/accessor.h>
 #include <ydb/library/actors/struct_log/log_stack.h>
 
+#include <util/generic/hash_set.h>
+
 #include <optional>
 
 namespace NKikimr::NOlap {
@@ -111,6 +113,16 @@ public:
     virtual bool HasToDelete(const TUnifiedBlobId& blobId, const TTabletId initiatorTabletId) const = 0;
     virtual std::shared_ptr<IBlobInUseTracker> GetBlobsTracker() const = 0;
 
+    // Only the native BS operator tracks these queues; other implementations return false.
+    virtual bool HasBlobsForGroups(const THashSet<ui32>& groups) const {
+        return SharedBlobs && SharedBlobs->HasBlobsForGroups(groups);
+    }
+
+    // Only the native BS operator runs GC rounds against BlobStorage; elsewhere there is no barrier to wait for.
+    virtual bool HasCollectedBeforeCurrentGeneration() const {
+        return true;
+    }
+
     virtual ~IBlobsStorageOperator() = default;
 
     TString DebugString() const {
@@ -146,6 +158,10 @@ public:
             result->SetCacheAfterRead(false);
         }
         return result;
+    }
+
+    bool HasGCInFlight() const {
+        return CurrentGCAction && CurrentGCAction->IsInProgress();
     }
 
     void StartGC(const std::shared_ptr<IBlobsGCAction>& action) {
