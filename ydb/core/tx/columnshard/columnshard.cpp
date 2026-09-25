@@ -734,7 +734,8 @@ void TColumnShard::CheckMoveDataGate(const TActorContext& ctx) {
     if (HasIndex()) {
         queues = GetIndexAs<NOlap::TColumnEngineForLogs>().GetMoveDataQueueSizes();
     }
-    Counters.GetCSCounters().OnMoveDataQueues(queues.Pending, queues.ConfirmedToMove, queues.InFlight);
+    Counters.GetCSCounters().OnMoveDataQueues(queues.Pending, queues.ConfirmedToMove, queues.InFlight, queues.Uncommitted);
+    Counters.GetCSCounters().OnMoveDataGateChecked();
     if (queues.Rejected > MoveDataState.ReportedRejections) {
         Counters.GetCSCounters().OnMoveDataPortionsRejected(queues.Rejected - MoveDataState.ReportedRejections);
         MoveDataState.ReportedRejections = queues.Rejected;
