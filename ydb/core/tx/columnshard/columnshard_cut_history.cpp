@@ -333,7 +333,7 @@ void TColumnShard::Handle(TEvPrivate::TEvContinueCutHistory::TPtr&, const TActor
         return;
     }
     scan.Pending = request->GetSize();
-    SubmitMetadataRequest(NOlap::TCSMetadataRequest(request, std::make_shared<TCutHistoryResultProcessor>(this)));
+    SubmitMetadataRequest(NOlap::TCSMetadataRequest(request, std::make_shared<TCutHistoryResultProcessor>(this)), TTLTaskSubscription);
 }
 
 void TColumnShard::FinishCutHistoryBatch(const NOlap::TDataAccessorsResult& result) {
