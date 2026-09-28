@@ -56,6 +56,7 @@ TString TProcessMemory::DebugString() const {
         << "  InternalProcessId: " << InternalProcessId << Endl
         << "  OwnerActorId: " << OwnerActorId.ToString() << Endl
         << "  PriorityProcessFlag: " << PriorityProcessFlag << Endl
+        << "  SlotHolder: " << Admission->HasSlot() << Endl
         << "  MemoryUsage: " << MemoryUsage << Endl
         << "  LinksCount: " << LinksCount << Endl
         << "  DefaultStage: " << DefaultStage->DebugString() << Endl;

@@ -20,6 +20,7 @@ private:
     TExternalIdsControl GroupIds;
     ui32 Links = 1;
     const NActors::TActorId OwnerActorId;
+    const std::shared_ptr<TProcessAdmission> Admission;
 
     TAllocationInfo& GetAllocationInfoVerified(const ui64 allocationId) const {
         auto it = AllocationInfo.find(allocationId);
@@ -42,7 +43,7 @@ private:
         if (it == AllocationInfo.end()) {
             it = AllocationInfo
                      .emplace(task->GetIdentifier(),
-                         std::make_shared<TAllocationInfo>(ExternalProcessId, ExternalScopeId, externalGroupId, task, stage))
+                         std::make_shared<TAllocationInfo>(ExternalProcessId, ExternalScopeId, externalGroupId, task, stage, Admission))
                      .first;
         }
         return it->second;
@@ -51,10 +52,13 @@ private:
     friend class TAllocationGroups;
 
 public:
-    TProcessMemoryScope(const ui64 externalProcessId, const ui64 externalScopeId, const NActors::TActorId& ownerActorId)
+    TProcessMemoryScope(const ui64 externalProcessId, const ui64 externalScopeId, const NActors::TActorId& ownerActorId,
+        const std::shared_ptr<TProcessAdmission>& admission)
         : ExternalProcessId(externalProcessId)
         , ExternalScopeId(externalScopeId)
-        , OwnerActorId(ownerActorId) {
+        , OwnerActorId(ownerActorId)
+        , Admission(admission) {
+        AFL_VERIFY(Admission);
     }
 
     void Register() {
@@ -208,6 +212,7 @@ private:
 
     const NActors::TActorId OwnerActorId;
     bool PriorityProcessFlag = false;
+    const std::shared_ptr<TProcessAdmission> Admission = std::make_shared<TProcessAdmission>();
     ui64 MemoryUsage = 0;
 
     YDB_ACCESSOR(ui32, LinksCount, 1);
@@ -243,6 +248,15 @@ public:
 
     bool IsPriorityProcess() const {
         return PriorityProcessFlag;
+    }
+
+    bool HasSlot() const {
+        return Admission->HasSlot();
+    }
+
+    void SetSlot(const bool value) {
+        AFL_VERIFY(Admission->HasSlot() != value);
+        Admission->SetSlot(value);
     }
 
     bool AllocationUpdated(const ui64 externalScopeId, const ui64 allocationId) {
@@ -312,7 +326,7 @@ public:
     void RegisterScope(const ui64 externalScopeId) {
         auto it = AllocationScopes.find(externalScopeId);
         if (it == AllocationScopes.end()) {
-            AFL_VERIFY(AllocationScopes.emplace(externalScopeId, std::make_shared<TProcessMemoryScope>(ExternalProcessId, externalScopeId, OwnerActorId)).second);
+            AFL_VERIFY(AllocationScopes.emplace(externalScopeId, std::make_shared<TProcessMemoryScope>(ExternalProcessId, externalScopeId, OwnerActorId, Admission)).second);
         } else {
             it->second->Register();
         }

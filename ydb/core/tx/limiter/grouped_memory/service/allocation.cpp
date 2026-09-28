@@ -7,15 +7,18 @@
 namespace NKikimr::NOlap::NGroupedMemoryManager {
 
 TAllocationInfo::TAllocationInfo(const ui64 processId, const ui64 scopeId, const ui64 allocationExternalGroupId,
-    const std::shared_ptr<IAllocation>& allocation, const std::shared_ptr<TStageFeatures>& stage)
+    const std::shared_ptr<IAllocation>& allocation, const std::shared_ptr<TStageFeatures>& stage,
+    const std::shared_ptr<TProcessAdmission>& admission)
     : Allocation(allocation)
     , AllocationExternalGroupId(allocationExternalGroupId)
     , Identifier(TValidator::CheckNotNull(Allocation)->GetIdentifier())
     , ProcessId(processId)
     , ScopeId(scopeId)
-    , Stage(stage) {
+    , Stage(stage)
+    , Admission(admission) {
     AFL_VERIFY(Stage);
     AFL_VERIFY(Allocation);
+    AFL_VERIFY(Admission);
     YDB_LOG_INFO("",
         {"event", "add"},
         {"id", Allocation->GetIdentifier()},
@@ -62,7 +65,7 @@ void TAllocationInfo::SetAllocatedVolume(const ui64 value) {
 }
 
 bool TAllocationInfo::IsAllocatable(const ui64 additional) const {
-    return Stage->IsAllocatable(AllocatedVolume, additional);
+    return Stage->IsAllocatable(AllocatedVolume, additional, Admission->HasSlot());
 }
 
 TAllocationInfo::~TAllocationInfo() {

@@ -24,8 +24,12 @@ private:
     std::set<TProcessMemoryUsage> WaitingProcesses;
     std::shared_ptr<TStageFeatures> DefaultStage;
     TIdsControl ProcessIds;
+    ui32 SlotHolders = 0;
 
     void TryAllocateWaiting();
+    bool TryGrantSlot(TProcessMemory& process);
+    TProcessMemory* FindOldestWithoutSlot();
+    bool HasWaitingSlotHolder() const;
     void RefreshSignals() const {
         Signals->ProcessesCount->Set(Processes.size());
     }
@@ -113,7 +117,7 @@ public:
     void AllocationUpdated(const ui64 externalProcessId, const ui64 externalScopeId, const ui64 allocationId);
 
     void SetMemoryConsumptionUpdateFunction(std::function<void(ui64)> func);
-    void UpdateMemoryLimits(const ui64 limit, const std::optional<ui64>& hardLimit);
+    void UpdateMemoryLimits(const ui64 limit, const std::optional<ui64>& hardLimit, const ui64 slotLimit);
 
     bool IsEmpty() const {
         return Processes.empty();

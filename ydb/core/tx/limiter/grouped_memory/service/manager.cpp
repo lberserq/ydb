@@ -68,9 +68,10 @@ void TManager::TryAllocateWaiting() {
         process.TryAllocateWaiting(0);
         UpdateWaitingProcesses(&process);
     }
+    const bool slotHolderWaiting = HasWaitingSlotHolder();
     for (auto waitingIt = WaitingProcesses.begin(); waitingIt != WaitingProcesses.end();) {
         // Check root availability
-        if (!DefaultStage->IsAllocatable(1, 0)) {
+        if (!DefaultStage->IsAllocatable(1, 0, slotHolderWaiting)) {
             break;
         }
         auto it = ProcessesOrdered.find(*waitingIt);
@@ -140,6 +141,7 @@ void TManager::RegisterProcess(const ui64 externalProcessId, const std::vector<s
             internalProcessId, TProcessMemory(externalProcessId, internalProcessId, OwnerActorId, Processes.empty(), stages, DefaultStage));
         AFL_VERIFY(info.second);
         ProcessesOrdered.emplace(info.first->second.BuildUsageAddress(), &info.first->second);
+        Y_UNUSED(TryGrantSlot(info.first->second));
         UpdateWaitingProcesses(&info.first->second);
     } else {
         auto& process = Processes.find(*internalId)->second;
@@ -162,14 +164,57 @@ void TManager::UnregisterProcess(const ui64 externalProcessId) {
     auto processUsageAddress = it->second.BuildUsageAddress();
     AFL_VERIFY(ProcessesOrdered.erase(processUsageAddress));
     WaitingProcesses.erase(processUsageAddress);
+    const bool slotReleased = it->second.HasSlot();
     it->second.Unregister();
     Processes.erase(it);
+    bool slotMoved = false;
+    if (slotReleased) {
+        --SlotHolders;
+        if (auto* next = FindOldestWithoutSlot()) {
+            slotMoved = TryGrantSlot(*next);
+        }
+    }
     const ui64 nextInternalProcessId = ProcessIds.GetMinInternalIdDef(internalProcessId);
     if (internalProcessId < nextInternalProcessId) {
         GetProcessMemoryVerified(nextInternalProcessId).SetPriorityProcess();
         TryAllocateWaiting();
+    } else if (slotMoved) {
+        TryAllocateWaiting();
     }
     RefreshSignals();
+}
+
+bool TManager::TryGrantSlot(TProcessMemory& process) {
+    if (SlotHolders >= Config.GetSlotsCount()) {
+        return false;
+    }
+    process.SetSlot(true);
+    ++SlotHolders;
+    return true;
+}
+
+TProcessMemory* TManager::FindOldestWithoutSlot() {
+    for (auto&& i : ProcessIds.GetInternalIdToExternalIds()) {
+        auto& process = GetProcessMemoryVerified(i.first);
+        if (!process.HasSlot()) {
+            return &process;
+        }
+    }
+    return nullptr;
+}
+
+bool TManager::HasWaitingSlotHolder() const {
+    if (!SlotHolders) {
+        return false;
+    }
+    for (auto&& i : WaitingProcesses) {
+        auto it = ProcessesOrdered.find(i);
+        AFL_VERIFY(it != ProcessesOrdered.end());
+        if (it->second->HasSlot()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void TManager::RegisterProcessScope(const ui64 externalProcessId, const ui64 externalProcessScopeId) {
@@ -192,10 +237,10 @@ void TManager::SetMemoryConsumptionUpdateFunction(std::function<void(ui64)> func
     DefaultStage->SetMemoryConsumptionUpdateFunction(std::move(func));
 }
 
-void TManager::UpdateMemoryLimits(const ui64 limit, const std::optional<ui64>& hardLimit) {
+void TManager::UpdateMemoryLimits(const ui64 limit, const std::optional<ui64>& hardLimit, const ui64 slotLimit) {
     AFL_ENSURE(DefaultStage);
     bool isLimitIncreased = false;
-    DefaultStage->UpdateMemoryLimits(limit, hardLimit, isLimitIncreased);
+    DefaultStage->UpdateMemoryLimits(limit, hardLimit, slotLimit, isLimitIncreased);
     if (isLimitIncreased) {
         TryAllocateWaiting();
     }
@@ -220,6 +265,7 @@ TString TManager::DebugString() const {
        << "  ProcessesCount=" << Processes.size() << Endl
        << "  ProcessesOrderedCount=" << ProcessesOrdered.size() << Endl
        << "  WaitingProcessesCount=" << WaitingProcesses.size() << Endl
+       << "  SlotHolders=" << SlotHolders << Endl
        << "  DefaultStage=" << (DefaultStage ? DefaultStage->DebugString() : "null") << Endl
        << "  ProcessIds={" << Endl
        << "    Size=" << ProcessIds.GetSize() << Endl

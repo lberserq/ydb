@@ -7,6 +7,8 @@
 
 #include <library/cpp/lwtrace/mon/mon_lwtrace.h>
 
+#include <algorithm>
+
 
 namespace NKikimr::NOlap::NGroupedMemoryManager {
 
@@ -126,8 +128,9 @@ void TMemoryLimiterActor::Handle(NMemory::TEvConsumerLimit::TPtr& ev) {
     const ui64 countBuckets = Config.GetCountBuckets() ? Config.GetCountBuckets() : 1;
     const ui64 hardLimitBytes = ev->Get()->LimitBytes * HardLimitMultiplier / countBuckets;
     const ui64 limitBytes = hardLimitBytes * NKikimr::NOlap::TGlobalLimits::GroupedMemoryLimiterSoftLimitCoefficient;
+    const ui64 slotLimitBytes = std::clamp<ui64>(hardLimitBytes * Config.GetSlotLimitCoefficient(), limitBytes, hardLimitBytes);
     for (auto& manager: Managers) {
-        manager->UpdateMemoryLimits(limitBytes, hardLimitBytes);
+        manager->UpdateMemoryLimits(limitBytes, hardLimitBytes, slotLimitBytes);
     }
 }
 

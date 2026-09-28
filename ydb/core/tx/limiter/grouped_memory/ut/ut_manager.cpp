@@ -276,4 +276,258 @@ Y_UNIT_TEST_SUITE(GroupedMemoryLimiter) {
         UNIT_ASSERT_VALUES_EQUAL(stage->GetUsage().Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(TObjectCounter<TAllocation>::ObjectCount(), 0);
     }
+
+    class TFailableAllocation: public TAllocation {
+    public:
+        bool Failed = false;
+
+    private:
+        virtual void DoOnAllocationImpossible(const TString& /*errorMessage*/) override {
+            Failed = true;
+        }
+
+    public:
+        using TAllocation::TAllocation;
+    };
+
+    struct TSlotsEnv {
+        std::shared_ptr<NOlap::NGroupedMemoryManager::TCounters> Counters;
+        NOlap::NGroupedMemoryManager::TConfig Config;
+        std::shared_ptr<NOlap::NGroupedMemoryManager::TStageFeatures> Stage;
+        std::shared_ptr<NOlap::NGroupedMemoryManager::TManager> Manager;
+
+        TSlotsEnv(const ui32 slotsCount, const ui64 limit, const std::optional<ui64>& hardLimit, const std::optional<ui64>& slotLimit)
+            : Counters(std::make_shared<NOlap::NGroupedMemoryManager::TCounters>(MakeIntrusive<NMonitoring::TDynamicCounters>(), "test")) {
+            NKikimrConfig::TGroupedMemoryLimiterConfig protoConfig;
+            protoConfig.SetMemoryLimit(limit);
+            protoConfig.SetSlotsCount(slotsCount);
+            UNIT_ASSERT(Config.DeserializeFromProto(protoConfig));
+            Stage = std::make_shared<NOlap::NGroupedMemoryManager::TStageFeatures>(
+                "GLOBAL", limit, hardLimit, nullptr, Counters->BuildStageCounters("general"), slotLimit);
+            Manager = std::make_shared<NOlap::NGroupedMemoryManager::TManager>(NActors::TActorId(), Config, "test", Counters, Stage);
+        }
+
+        void StartProcess(const ui64 processId, const std::vector<ui64>& groups) {
+            Manager->RegisterProcess(processId, {});
+            Manager->RegisterProcessScope(processId, 0);
+            for (auto&& g : groups) {
+                Manager->RegisterGroup(processId, 0, g);
+            }
+        }
+
+        void FinishProcess(const ui64 processId, const std::vector<ui64>& groups) {
+            for (auto&& g : groups) {
+                Manager->UnregisterGroup(processId, 0, g);
+            }
+            Manager->UnregisterProcessScope(processId, 0);
+            Manager->UnregisterProcess(processId);
+        }
+
+        void Free(const ui64 processId, const std::shared_ptr<TAllocation>& alloc) {
+            alloc->Guard.reset();
+            Manager->UnregisterAllocation(processId, 0, alloc->GetIdentifier());
+        }
+    };
+
+    Y_UNIT_TEST(SlotsOffKeepsCurrentAdmission) {
+        TSlotsEnv env(0, 100, 300, 200);
+        UNIT_ASSERT_VALUES_EQUAL(env.Stage->GetSlotLimit(), 200);
+        {
+            NOlap::NGroupedMemoryManager::TStageFeatures plain("GLOBAL", 100, std::nullopt, nullptr, nullptr);
+            UNIT_ASSERT_VALUES_EQUAL(plain.GetSlotLimit(), plain.GetLimit());
+        }
+        {
+            env.StartProcess(0, { 1, 2 });
+            env.StartProcess(1, { 1 });
+            auto a0 = std::make_shared<TAllocation>(100);
+            env.Manager->RegisterAllocation(0, 0, 1, a0, {});
+            UNIT_ASSERT(a0->IsAllocated());
+            auto a0b = std::make_shared<TAllocation>(100);
+            env.Manager->RegisterAllocation(0, 0, 2, a0b, {});
+            UNIT_ASSERT(!a0b->IsAllocated());
+            auto a1 = std::make_shared<TAllocation>(50);
+            env.Manager->RegisterAllocation(1, 0, 1, a1, {});
+            UNIT_ASSERT(!a1->IsAllocated());
+
+            env.Free(0, a0);
+            UNIT_ASSERT(a0b->IsAllocated());
+            UNIT_ASSERT(!a1->IsAllocated());
+
+            env.Free(0, a0b);
+            UNIT_ASSERT(a1->IsAllocated());
+            env.Free(1, a1);
+            env.FinishProcess(1, { 1 });
+            env.FinishProcess(0, { 1, 2 });
+        }
+        UNIT_ASSERT_VALUES_EQUAL(env.Stage->GetUsage().Val(), 0);
+        UNIT_ASSERT(env.Manager->IsEmpty());
+        UNIT_ASSERT_VALUES_EQUAL(TObjectCounter<TAllocation>::ObjectCount(), 0);
+    }
+
+    Y_UNIT_TEST(SlotHolderAdmittedBetweenSoftAndSlotLimit) {
+        TSlotsEnv env(2, 100, 300, 200);
+        {
+            env.StartProcess(0, { 1 });
+            env.StartProcess(1, { 1 });
+            env.StartProcess(2, { 1 });
+
+            auto a2a = std::make_shared<TAllocation>(30);
+            env.Manager->RegisterAllocation(2, 0, 1, a2a, {});
+            UNIT_ASSERT(a2a->IsAllocated());
+
+            auto a0 = std::make_shared<TAllocation>(100);
+            env.Manager->RegisterAllocation(0, 0, 1, a0, {});
+            UNIT_ASSERT(a0->IsAllocated());
+            UNIT_ASSERT_VALUES_EQUAL(env.Stage->GetUsage().Val(), 130);
+
+            auto a2b = std::make_shared<TAllocation>(50);
+            env.Manager->RegisterAllocation(2, 0, 1, a2b, {});
+            UNIT_ASSERT(!a2b->IsAllocated());
+
+            auto a1 = std::make_shared<TAllocation>(50);
+            env.Manager->RegisterAllocation(1, 0, 1, a1, {});
+            UNIT_ASSERT(a1->IsAllocated());
+            UNIT_ASSERT_VALUES_EQUAL(env.Stage->GetUsage().Val(), 180);
+
+            auto a1b = std::make_shared<TAllocation>(60);
+            env.Manager->RegisterAllocation(1, 0, 1, a1b, {});
+            UNIT_ASSERT(!a1b->IsAllocated());
+
+            env.Free(0, a0);
+            UNIT_ASSERT(a1b->IsAllocated());
+            UNIT_ASSERT(!a2b->IsAllocated());
+            UNIT_ASSERT_VALUES_EQUAL(env.Stage->GetUsage().Val(), 140);
+
+            env.Free(1, a1);
+            env.Free(1, a1b);
+            UNIT_ASSERT(a2b->IsAllocated());
+
+            env.Free(2, a2a);
+            env.Free(2, a2b);
+            env.FinishProcess(2, { 1 });
+            env.FinishProcess(1, { 1 });
+            env.FinishProcess(0, { 1 });
+        }
+        UNIT_ASSERT_VALUES_EQUAL(env.Stage->GetUsage().Val(), 0);
+        UNIT_ASSERT(env.Manager->IsEmpty());
+        UNIT_ASSERT_VALUES_EQUAL(TObjectCounter<TAllocation>::ObjectCount(), 0);
+    }
+
+    Y_UNIT_TEST(HardLimitStillFailsSlotHolder) {
+        TSlotsEnv env(2, 100, 300, 1000);
+        UNIT_ASSERT_VALUES_EQUAL(env.Stage->GetSlotLimit(), 300);
+        {
+            env.StartProcess(0, { 1 });
+            env.StartProcess(1, { 1 });
+
+            auto a0 = std::make_shared<TAllocation>(250);
+            env.Manager->RegisterAllocation(0, 0, 1, a0, {});
+            UNIT_ASSERT(a0->IsAllocated());
+
+            auto a1 = std::make_shared<TAllocation>(40);
+            env.Manager->RegisterAllocation(1, 0, 1, a1, {});
+            UNIT_ASSERT(a1->IsAllocated());
+
+            auto a1b = std::make_shared<TAllocation>(20);
+            env.Manager->RegisterAllocation(1, 0, 1, a1b, {});
+            UNIT_ASSERT(!a1b->IsAllocated());
+
+            auto forced = std::make_shared<TFailableAllocation>(100);
+            env.Manager->RegisterAllocation(0, 0, 1, forced, {});
+            UNIT_ASSERT(forced->Failed);
+            UNIT_ASSERT(!forced->IsAllocated());
+            UNIT_ASSERT_VALUES_EQUAL(env.Stage->GetUsage().Val(), 290);
+
+            env.Free(0, a0);
+            UNIT_ASSERT(a1b->IsAllocated());
+            env.Free(1, a1);
+            env.Free(1, a1b);
+            env.FinishProcess(1, { 1 });
+            env.FinishProcess(0, { 1 });
+        }
+        UNIT_ASSERT_VALUES_EQUAL(env.Stage->GetUsage().Val(), 0);
+        UNIT_ASSERT(env.Manager->IsEmpty());
+        UNIT_ASSERT_VALUES_EQUAL(TObjectCounter<TAllocation>::ObjectCount(), 0);
+    }
+
+    Y_UNIT_TEST(FreedSlotMovesToOldestProcessAndWakesQueued) {
+        TSlotsEnv env(2, 100, 300, 200);
+        {
+            env.StartProcess(0, { 1 });
+            env.Manager->RegisterProcess(1, {});
+            env.Manager->RegisterProcess(1, {});
+            env.StartProcess(2, { 1 });
+            env.StartProcess(3, { 1 });
+
+            auto a0 = std::make_shared<TAllocation>(100);
+            env.Manager->RegisterAllocation(0, 0, 1, a0, {});
+            UNIT_ASSERT(a0->IsAllocated());
+
+            auto a2 = std::make_shared<TAllocation>(50);
+            env.Manager->RegisterAllocation(2, 0, 1, a2, {});
+            UNIT_ASSERT(!a2->IsAllocated());
+            auto a3 = std::make_shared<TAllocation>(50);
+            env.Manager->RegisterAllocation(3, 0, 1, a3, {});
+            UNIT_ASSERT(!a3->IsAllocated());
+
+            env.Manager->UnregisterProcess(1);
+            UNIT_ASSERT(!a2->IsAllocated());
+
+            env.Manager->UnregisterProcess(1);
+            UNIT_ASSERT(a2->IsAllocated());
+            UNIT_ASSERT(!a3->IsAllocated());
+            UNIT_ASSERT_VALUES_EQUAL(env.Stage->GetUsage().Val(), 150);
+
+            env.Free(0, a0);
+            UNIT_ASSERT(a3->IsAllocated());
+            env.Free(2, a2);
+            env.Free(3, a3);
+            env.FinishProcess(3, { 1 });
+            env.FinishProcess(2, { 1 });
+            env.FinishProcess(0, { 1 });
+        }
+        UNIT_ASSERT_VALUES_EQUAL(env.Stage->GetUsage().Val(), 0);
+        UNIT_ASSERT(env.Manager->IsEmpty());
+        UNIT_ASSERT_VALUES_EQUAL(TObjectCounter<TAllocation>::ObjectCount(), 0);
+    }
+
+    Y_UNIT_TEST(RootGateDoesNotStarveQueuedSlotHolder) {
+        TSlotsEnv env(2, 100, 300, 200);
+        {
+            env.StartProcess(0, { 1, 2 });
+            env.StartProcess(1, { 1 });
+            env.StartProcess(2, { 1 });
+
+            auto a0 = std::make_shared<TAllocation>(100);
+            env.Manager->RegisterAllocation(0, 0, 1, a0, {});
+            UNIT_ASSERT(a0->IsAllocated());
+            auto a0b = std::make_shared<TAllocation>(100);
+            env.Manager->RegisterAllocation(0, 0, 2, a0b, {});
+            UNIT_ASSERT(a0b->IsAllocated());
+            UNIT_ASSERT_VALUES_EQUAL(env.Stage->GetUsage().Val(), 200);
+
+            auto a1 = std::make_shared<TAllocation>(50);
+            env.Manager->RegisterAllocation(1, 0, 1, a1, {});
+            UNIT_ASSERT(!a1->IsAllocated());
+            auto a2 = std::make_shared<TAllocation>(10);
+            env.Manager->RegisterAllocation(2, 0, 1, a2, {});
+            UNIT_ASSERT(!a2->IsAllocated());
+
+            env.Free(0, a0b);
+            UNIT_ASSERT(a1->IsAllocated());
+            UNIT_ASSERT(!a2->IsAllocated());
+            UNIT_ASSERT_VALUES_EQUAL(env.Stage->GetUsage().Val(), 150);
+
+            env.Free(0, a0);
+            UNIT_ASSERT(a2->IsAllocated());
+            env.Free(1, a1);
+            env.Free(2, a2);
+            env.FinishProcess(2, { 1 });
+            env.FinishProcess(1, { 1 });
+            env.FinishProcess(0, { 1, 2 });
+        }
+        UNIT_ASSERT_VALUES_EQUAL(env.Stage->GetUsage().Val(), 0);
+        UNIT_ASSERT(env.Manager->IsEmpty());
+        UNIT_ASSERT_VALUES_EQUAL(TObjectCounter<TAllocation>::ObjectCount(), 0);
+    }
 };

@@ -4,6 +4,9 @@
 
 #include <util/string/builder.h>
 
+#include <algorithm>
+#include <limits>
+
 #define YDB_LOG_THIS_FILE_COMPONENT NKikimrServices::GROUPED_MEMORY_LIMITER
 
 namespace NKikimr::NOlap::NGroupedMemoryManager {
@@ -12,7 +15,8 @@ TString TStageFeatures::DebugString() const {
     TStringBuilder result;
     result << "TStageFeatures{" << Endl
            << "  name=" << Name << Endl
-           << "  limit=" << Limit << Endl;
+           << "  limit=" << Limit << Endl
+           << "  slot_limit=" << SlotLimit << Endl;
     if (Owner) {
         result << "  owner=" << Owner->DebugString() << Endl;
     }
@@ -20,16 +24,22 @@ TString TStageFeatures::DebugString() const {
     return result;
 }
 
+ui64 TStageFeatures::ClampSlotLimit(const ui64 slotLimit) const {
+    return std::min(std::max(slotLimit, Limit), HardLimit.value_or(std::numeric_limits<ui64>::max()));
+}
+
 TStageFeatures::TStageFeatures(const TString& name, const std::optional<ui64>& limit, const std::optional<ui64>& hardLimit,
-    const std::shared_ptr<TStageFeatures>& owner, const std::shared_ptr<TStageCounters>& counters)
+    const std::shared_ptr<TStageFeatures>& owner, const std::shared_ptr<TStageCounters>& counters, const std::optional<ui64>& slotLimit)
     : Name(name)
     , Limit(limit.value_or(DEFAULT_LIMIT))
     , HardLimit(hardLimit)
+    , SlotLimit(ClampSlotLimit(slotLimit.value_or(Limit)))
     , Owner(owner)
     , Counters(counters)
     , UseLimitFromConfig(limit.has_value()) {
     if (Counters) {
         Counters->ValueSoftLimit->Set(Limit);
+        Counters->ValueSlotLimit->Set(SlotLimit);
         if (HardLimit) {
             Counters->ValueHardLimit->Set(*HardLimit);
         }
@@ -135,12 +145,14 @@ void TStageFeatures::UpdateVolume(const ui64 from, const ui64 to, const bool all
     UpdateConsumption(this);
 }
 
-bool TStageFeatures::IsAllocatable(const ui64 volume, const ui64 additional) const {
-    if (Limit < additional + Usage.Val() + volume) {
+bool TStageFeatures::IsAllocatable(const ui64 volume, const ui64 additional, const bool slotHolder) const {
+    // SlotLimit is a root-only threshold; every child stage keeps its own Limit
+    const ui64 limit = (slotHolder && !Owner) ? SlotLimit : Limit;
+    if (limit < additional + Usage.Val() + volume) {
         return false;
     }
     if (Owner) {
-        return Owner->IsAllocatable(volume, additional);
+        return Owner->IsAllocatable(volume, additional, slotHolder);
     }
     return true;
 }
@@ -181,25 +193,28 @@ void TStageFeatures::AttachCounters(const std::shared_ptr<TStageCounters>& count
     Counters = counters;
     if (Counters) {
         Counters->ValueSoftLimit->Set(Limit);
+        Counters->ValueSlotLimit->Set(SlotLimit);
         if (HardLimit) {
             Counters->ValueHardLimit->Set(*HardLimit);
         }
     }
 }
 
-void TStageFeatures::UpdateMemoryLimits(const ui64 limit, const std::optional<ui64>& hardLimit, bool& isLimitIncreased) {
+void TStageFeatures::UpdateMemoryLimits(const ui64 limit, const std::optional<ui64>& hardLimit, const ui64 slotLimit, bool& isLimitIncreased) {
     if (UseLimitFromConfig) {
         isLimitIncreased = false;
         return;
     }
 
-    isLimitIncreased = limit > Limit;
-
     Limit = limit;
     HardLimit = hardLimit;
+    const ui64 newSlotLimit = ClampSlotLimit(slotLimit);
+    isLimitIncreased = limit > Limit || newSlotLimit > SlotLimit;
+    SlotLimit = newSlotLimit;
 
     if (Counters) {
         Counters->ValueSoftLimit->Set(Limit);
+        Counters->ValueSlotLimit->Set(SlotLimit);
         if (HardLimit) {
             Counters->ValueHardLimit->Set(*HardLimit);
         }

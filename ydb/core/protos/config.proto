@@ -854,6 +854,10 @@ message TGroupedMemoryLimiterConfig {
     optional uint64 MemoryLimit = 2;
     optional uint64 HardMemoryLimit = 3;
     optional uint64 CountBuckets = 4;
+    // Processes per bucket allowed above the soft limit; 0 disables the feature
+    optional uint32 SlotsCount = 5;
+    // Share of the bucket hard limit available to slot holders; clamped to [soft, hard]
+    optional double SlotLimitCoefficient = 6;
 }
 
 message TExternalIndexConfig {

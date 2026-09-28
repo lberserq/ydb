@@ -11,6 +11,21 @@ enum class EAllocationStatus {
     Failed
 };
 
+// Live admission state of a process, shared by reference with every allocation it owns
+class TProcessAdmission {
+private:
+    bool SlotHolder = false;
+
+public:
+    bool HasSlot() const {
+        return SlotHolder;
+    }
+
+    void SetSlot(const bool value) {
+        SlotHolder = value;
+    }
+};
+
 class TAllocationInfo: public NColumnShard::TMonitoringObjectsCounter<TAllocationInfo> {
 private:
     std::shared_ptr<IAllocation> Allocation;
@@ -20,6 +35,7 @@ private:
     YDB_READONLY(ui64, ProcessId, 0);
     YDB_READONLY(ui64, ScopeId, 0);
     YDB_READONLY(std::shared_ptr<TStageFeatures>, Stage, nullptr);
+    const std::shared_ptr<TProcessAdmission> Admission;
     bool AllocationFailed = false;
     TInstant StartInstant = TInstant::Now();
 
@@ -53,7 +69,8 @@ public:
     TString DebugString() const;
 
     TAllocationInfo(const ui64 processId, const ui64 scopeId, const ui64 allocationExternalGroupId,
-        const std::shared_ptr<IAllocation>& allocation, const std::shared_ptr<TStageFeatures>& stage);
+        const std::shared_ptr<IAllocation>& allocation, const std::shared_ptr<TStageFeatures>& stage,
+        const std::shared_ptr<TProcessAdmission>& admission);
 };
 
 }   // namespace NKikimr::NOlap::NGroupedMemoryManager

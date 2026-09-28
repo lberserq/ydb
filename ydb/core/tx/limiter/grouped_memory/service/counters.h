@@ -17,6 +17,7 @@ private:
 public:
     const NMonitoring::TDynamicCounters::TCounterPtr ValueHardLimit;
     const NMonitoring::TDynamicCounters::TCounterPtr ValueSoftLimit;
+    const NMonitoring::TDynamicCounters::TCounterPtr ValueSlotLimit;
 
     TStageCounters(const TCommonCountersOwner& owner, const TString& name)
         : TBase(owner, "stage", name)
@@ -28,7 +29,8 @@ public:
         , WaitingChunks(TBase::GetValue("Waiting/Count"))
         , AllocationFailCount(TBase::GetValue("AllocationFails/Count"))
         , ValueHardLimit(TBase::GetValue("Limit/Hard/Bytes"))
-        , ValueSoftLimit(TBase::GetValue("Limit/Soft/Bytes")) {
+        , ValueSoftLimit(TBase::GetValue("Limit/Soft/Bytes"))
+        , ValueSlotLimit(TBase::GetValue("Limit/Slot/Bytes")) {
     }
 
     void OnCannotAllocate() {
