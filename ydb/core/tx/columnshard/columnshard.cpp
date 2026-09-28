@@ -1,4 +1,5 @@
 #include "columnshard_impl.h"
+#include "columnshard_move_data_driver.h"
 
 #include "bg_tasks/manager/manager.h"
 #include "blobs_reader/actor.h"
@@ -15,6 +16,8 @@
 #include <ydb/core/protos/table_stats.pb.h>
 #include <ydb/core/tx/columnshard/bg_tasks/adapter/adapter.h>
 #include <ydb/core/tx/columnshard/blobs_action/abstract/storages_manager.h>
+#include <ydb/core/tx/columnshard/blobs_action/blob_manager_db.h>
+#include <ydb/core/tx/columnshard/blobs_action/bs/storage.h>
 #include <ydb/core/tx/columnshard/diagnostics/scan_diagnostics_actor.h>
 #include <ydb/core/tx/columnshard/engines/reader/tracing/data_source_probes.h>
 #include <ydb/core/tx/columnshard/engines/reader/tracing/probes.h>
@@ -647,6 +650,174 @@ void TColumnShard::ScheduleExecutorStatistics() {
             {"reportExecutorStatisticsPeriodMs", statistics.GetReportExecutorStatisticsPeriodMs()},
             {"scheduleDuration", scheduleDuration});
     }
+}
+
+std::optional<ui32> TColumnShard::FindLiveMoveDataGroup(const THashSet<ui32>& groups) const {
+    if (groups.empty() || !Info()) {
+        return std::nullopt;
+    }
+    for (const auto& channel : Info()->Channels) {
+        const auto* latest = channel.LatestEntry();
+        if (latest && groups.contains(latest->GroupID)) {
+            return latest->GroupID;
+        }
+    }
+    return std::nullopt;
+}
+
+void TColumnShard::Handle(TEvTablet::TEvMoveData::TPtr& ev, const TActorContext& ctx) {
+    if (!HasAppData() || !AppData()->FeatureFlags.GetEnableColumnshardMoveData()) {
+        TTabletExecutedFlat::Handle(ev);
+        return;
+    }
+
+    const auto& record = ev->Get()->Record;
+    THashSet<ui32> requested;
+    for (const auto groupId : record.GetGroups()) {
+        requested.emplace(groupId);
+    }
+    // Same contract as keyvalue and blob_depot: the caller reassigns channel history first, so a
+    // group that is still the latest entry would keep taking writes and the move could never converge.
+    if (const auto liveGroup = FindLiveMoveDataGroup(requested)) {
+        const TString reason = TStringBuilder() << "group " << *liveGroup << " is still the latest history entry at tablet " << TabletID();
+        LOG_S_WARN("TColumnShard::Handle TEvMoveData: " << reason);
+        ctx.Send(
+            ev->Sender, new TEvTablet::TEvMoveDataResponse(TabletID(), NKikimrTabletBase::TEvMoveDataResponse::ErrorGroupIdMismatch, reason));
+        return;
+    }
+    MoveDataState.HiveSender = ev->Sender;
+
+    if (MoveDataState.Active) {
+        // Hive retry or re-assignment.
+        // Reseed rather than re-handle: the driver merges the groups and restarts the actualizer.
+        AFL_VERIFY(!!MoveDataDriverId);
+        ctx.Send(MoveDataDriverId, new TEvPrivate::TEvMoveDataReseed(std::move(requested), ev->Sender));
+        return;
+    }
+
+    MoveDataState.TargetGroups.clear();
+    for (const auto groupId : record.GetGroups()) {
+        MoveDataState.TargetGroups.emplace(groupId);
+    }
+    if (MoveDataState.TargetGroups.empty()) {
+        LOG_S_INFO("TColumnShard::Handle TEvMoveData: empty group list, vacuum-only at tablet " << TabletID());
+        MoveDataState.Active = true;
+        MoveDataState.VacuumCompleted = false;
+        Counters.GetCSCounters().OnMoveDataStarted();
+        Executor()->StartMoveDataVacuumFromOwner();
+        StartMoveDataDriver(ctx);
+        return;
+    }
+    MoveDataState.Active = true;
+    MoveDataState.VacuumCompleted = false;
+    MoveDataState.CleanupWatermark.reset();
+
+    LOG_S_INFO(
+        "TColumnShard::Handle TEvMoveData: starting move for " << MoveDataState.TargetGroups.size() << " groups at tablet " << TabletID());
+
+    Counters.GetCSCounters().OnMoveDataStarted();
+    if (HasIndex()) {
+        MutableIndexAs<NOlap::TColumnEngineForLogs>().StartMoveData(MoveDataState.TargetGroups);
+    }
+    // Vacuum runs in parallel with rewriting; the response waits on the driver's gate check.
+    Executor()->StartMoveDataVacuumFromOwner();
+    StartMoveDataDriver(ctx);
+}
+
+void TColumnShard::StartMoveDataDriver(const TActorContext& ctx) {
+    if (!!MoveDataDriverId) {
+        return;
+    }
+    MoveDataDriverId = ctx.RegisterWithSameMailbox(new TMoveDataDriver(this));
+}
+
+void TColumnShard::StopMoveDataDriver(const TActorContext& ctx) {
+    if (!MoveDataDriverId) {
+        return;
+    }
+    ctx.Send(MoveDataDriverId, new TEvents::TEvPoison());
+    MoveDataDriverId = {};
+}
+
+void TColumnShard::MoveDataCompleted(const TActorContext& ctx) {
+    if (!MoveDataState.Active) {
+        return;
+    }
+    MoveDataState.VacuumCompleted = true;
+    // The driver owns the gate; hand it the news rather than deciding here.
+    if (!!MoveDataDriverId) {
+        ctx.Send(MoveDataDriverId, new TEvPrivate::TEvMoveDataPoke());
+    } else {
+        CheckMoveDataGate(ctx);
+    }
+}
+
+void TColumnShard::CheckMoveDataGate(const TActorContext& ctx) {
+    if (!MoveDataState.Active) {
+        return;
+    }
+
+    NOlap::NActualizer::TMoveDataQueueSizes queues;
+    if (HasIndex()) {
+        queues = GetIndexAs<NOlap::TColumnEngineForLogs>().GetMoveDataQueueSizes();
+    }
+    Counters.GetCSCounters().OnMoveDataQueues(queues.Pending, queues.ConfirmedToMove, queues.InFlight);
+    if (queues.Rejected > MoveDataState.ReportedRejections) {
+        Counters.GetCSCounters().OnMoveDataPortionsRejected(queues.Rejected - MoveDataState.ReportedRejections);
+        MoveDataState.ReportedRejections = queues.Rejected;
+    }
+    // Read running-cleanup state first: the boundary freeze below must include it.
+    const auto runningCleanupOldest = BackgroundController.GetActiveCleanupOldestRemove();
+    if (queues.GetTotal() != 0) {
+        MoveDataState.CleanupWatermark.reset();
+    } else if (!MoveDataState.CleanupWatermark) {
+        // Whoever retired a target portion sits in CleanupPortions, in the running cleanup, or is gone; include runningOldest so in-flight cleanup does not slip past.
+        const TInstant maxPending = HasIndex() ? GetIndexAs<NOlap::TColumnEngineForLogs>().GetMaxCleanupPortionInstant() : TInstant::Zero();
+        MoveDataState.CleanupWatermark = NOlap::NActualizer::FreezeCleanupWatermark(maxPending, runningCleanupOldest);
+    }
+    // A running cleanup holds its portions outside CleanupPortions, but only one reaching back to the watermark can hold target data.
+    const bool hasCleanupPortions =
+        !MoveDataState.CleanupWatermark || (runningCleanupOldest && *runningCleanupOldest <= *MoveDataState.CleanupWatermark) ||
+        (HasIndex() && GetIndexAs<NOlap::TColumnEngineForLogs>().HasCleanupPortionsAtOrBefore(*MoveDataState.CleanupWatermark));
+    if (!MoveDataState.VacuumCompleted) {
+        Counters.GetCSCounters().OnMoveDataGateBlockedByVacuum();
+        return;
+    }
+    if (queues.GetTotal() != 0) {
+        Counters.GetCSCounters().OnMoveDataGateBlockedByPortions();
+        if (queues.Uncommitted) {
+            LOG_S_INFO("TColumnShard::CheckMoveDataGate: "
+                       << queues.Uncommitted << " uncommitted writes hold blobs in the target groups, waiting for commit or abort at tablet "
+                       << TabletID());
+        }
+        return;
+    }
+    if (hasCleanupPortions) {
+        Counters.GetCSCounters().OnMoveDataGateBlockedByCleanup();
+        LOG_S_INFO("TColumnShard::CheckMoveDataGate: portions still awaiting cleanup, will re-check on next wakeup at tablet " << TabletID());
+        return;
+    }
+    if (!GetStoragesManager()->GetDefaultOperator()->HasCollectedBeforeCurrentGeneration()) {
+        Counters.GetCSCounters().OnMoveDataGateBlockedByFirstGCRound();
+        LOG_S_INFO(
+            "TColumnShard::CheckMoveDataGate: the first GC round of this incarnation has not committed a barrier yet at tablet " << TabletID());
+        return;
+    }
+    if (GetStoragesManager()->GetDefaultOperator()->HasBlobsForGroups(MoveDataState.TargetGroups)) {
+        Counters.GetCSCounters().OnMoveDataGateBlockedByGC();
+        LOG_S_INFO("TColumnShard::MoveDataCompleted: blobs still pending GC, will re-check on next wakeup at tablet " << TabletID());
+        return;
+    }
+    LOG_S_INFO("TColumnShard::CheckMoveDataGate: gate passed at tablet " << TabletID());
+
+    if (HasIndex()) {
+        MutableIndexAs<NOlap::TColumnEngineForLogs>().StopMoveData();
+    }
+    // The boot-time CutHistory scan finds drained intervals by itself, so nothing needs persisting before Success.
+    ctx.Send(MoveDataState.HiveSender, new TEvTablet::TEvMoveDataResponse(TabletID(), NKikimrTabletBase::TEvMoveDataResponse::Success));
+    Counters.GetCSCounters().OnMoveDataFinished();
+    MoveDataState = TMoveDataState{};
+    StopMoveDataDriver(ctx);
 }
 
 }   // namespace NKikimr::NColumnShard
