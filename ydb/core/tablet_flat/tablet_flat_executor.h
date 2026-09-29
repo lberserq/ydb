@@ -532,6 +532,9 @@ namespace NFlatExecutorSetup {
         // called in the tablet's context after a zone change it asked to be woken up for
         virtual void OnMemoryZone(NMemory::EMemoryZone) { /* default */ }
 
+        // keep the elastic part at or below shareBytes: a tablet that reports Reclaimable > 0 promises to honor it
+        virtual void OnMemoryLimit(ui64 /* shareBytes */) { /* default */ }
+
         virtual void OnLeaderUserAuxUpdate(TString) { /* default */ }
 
         virtual bool ReadOnlyLeaseEnabled();

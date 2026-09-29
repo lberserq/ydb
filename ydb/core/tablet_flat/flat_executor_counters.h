@@ -80,6 +80,7 @@ namespace NTabletFlatExecutor {
     XX(MEMORY_ADMISSION_RUNNING_BYTES, "MemoryAdmissionRunningBytes") \
     XX(MEMORY_ADMISSION_POSTPONED_BYTES, "MemoryAdmissionPostponedBytes") \
     XX(MEMORY_ADMISSION_POSTPONED_COUNT, "MemoryAdmissionPostponedCount") \
+    XX(TABLET_MEMORY_SHARE, "TabletMemoryShare") \
 
 // don't change order!
 #define FLAT_EXECUTOR_CUMULATIVE_COUNTERS_MAP(XX) \

@@ -17,6 +17,7 @@ enum class EMemoryConsumerKind {
     ColumnTablesPortionsMetaDataCache,
 
     Tablets, // sum of the tablet memory host slots, attributed but not budgeted
+    TabletsElastic, // sum of the tablets' elastic parts, what they report as Reclaimable
 };
 
 struct TConsumerReport {

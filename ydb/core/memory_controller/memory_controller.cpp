@@ -109,24 +109,31 @@ public:
     }
 };
 
-// Fed by the tablet memory host: the controller reads the sum of all tablet slots itself
+// Fed by the tablet memory host: the controller reads the sum of the tablets' parts of its kind itself
 class TTabletHostMemoryConsumer : public TMemoryConsumer {
 public:
-    TTabletHostMemoryConsumer()
-        : TMemoryConsumer(EMemoryConsumerKind::Tablets)
+    explicit TTabletHostMemoryConsumer(EMemoryConsumerKind kind)
+        : TMemoryConsumer(kind)
     {
     }
 
     ui64 GetConsumption() const override {
-        return TTabletMemoryHost::Instance().GetTotal().Used;
+        return GetTotal().Used;
     }
 
     ui64 GetDemand() const override {
-        return TTabletMemoryHost::Instance().GetTotal().Demand;
+        return GetTotal().Demand;
     }
 
     ui64 GetReclaimable() const override {
-        return TTabletMemoryHost::Instance().GetTotal().Reclaimable;
+        return GetTotal().Reclaimable;
+    }
+
+private:
+    TConsumerReport GetTotal() const {
+        return Kind == EMemoryConsumerKind::TabletsElastic
+            ? TTabletMemoryHost::Instance().GetElasticTotal()
+            : TTabletMemoryHost::Instance().GetTotal();
     }
 };
 
@@ -206,9 +213,22 @@ void WriteTabletsStats(NKikimrMemory::TMemoryStats& stats, const TConsumerState&
     stats.SetTabletsConsumption(consumer.Consumption);
 }
 
+void WriteTabletsElasticStats(NKikimrMemory::TMemoryStats& stats, const TConsumerState& consumer, bool, bool, ui64) {
+    stats.SetTabletsElasticConsumption(consumer.Consumption);
+}
+
 // The tablets carry no budget: their bytes are attributed, the node zone is what they get back
 ui64 GetTabletsLimitBytes(const NKikimrConfig::TMemoryControllerConfig&, ui64) {
     return 0;
+}
+
+// The elastic parts' bounds come from the tablets' reports each tick, not from the config
+ui64 GetTabletsElasticMinBytes(const NKikimrConfig::TMemoryControllerConfig&, ui64) {
+    return TTabletMemoryHost::Instance().GetElasticBounds().Min;
+}
+
+ui64 GetTabletsElasticMaxBytes(const NKikimrConfig::TMemoryControllerConfig&, ui64) {
+    return TTabletMemoryHost::Instance().GetElasticBounds().Max;
 }
 
 enum class ELimitDelivery {
@@ -342,6 +362,17 @@ constexpr TConsumerTraits ConsumerTraits[] = {
         .StatsSummed = false,
         .StatsWithLimit = false,
     },
+    {
+        .Kind = EMemoryConsumerKind::TabletsElastic,
+        .ElasticLimit = true,
+        .CanZeroLimit = false,
+        .GetMinBytes = &GetTabletsElasticMinBytes,
+        .GetMaxBytes = &GetTabletsElasticMaxBytes,
+        .LimitDelivery = ELimitDelivery::TabletHost,
+        .WriteStats = &WriteTabletsElasticStats,
+        .StatsSummed = false,
+        .StatsWithLimit = true,
+    },
 };
 
 constexpr bool ConsumerTraitsFollowEnumOrder() {
@@ -389,7 +420,8 @@ public:
         Become(&TThis::StateWork);
 
         if (AppData(ctx)->FeatureFlags.GetEnableTabletMemoryHost()) {
-            Consumers.emplace(EMemoryConsumerKind::Tablets, MakeIntrusive<TTabletHostMemoryConsumer>());
+            Consumers.emplace(EMemoryConsumerKind::Tablets, MakeIntrusive<TTabletHostMemoryConsumer>(EMemoryConsumerKind::Tablets));
+            Consumers.emplace(EMemoryConsumerKind::TabletsElastic, MakeIntrusive<TTabletHostMemoryConsumer>(EMemoryConsumerKind::TabletsElastic));
         }
 
         Send(NConsole::MakeConfigsDispatcherID(SelfId().NodeId()),
@@ -722,8 +754,12 @@ private:
                 NKikimr::NOlap::NStorageOptimizer::IOptimizerPlanner::SetPortionsCacheLimit(limitBytes);
                 break;
             case ELimitDelivery::TabletHost:
-                TTabletMemoryHost::Instance().SetNodeZone(NodeZone);
-                TTabletMemoryHost::Instance().UpdateCounters(Counters);
+                if (consumer.Kind == EMemoryConsumerKind::TabletsElastic) {
+                    TTabletMemoryHost::Instance().ApplyElasticLimit(limitBytes);
+                } else {
+                    TTabletMemoryHost::Instance().SetNodeZone(NodeZone);
+                    TTabletMemoryHost::Instance().UpdateCounters(Counters);
+                }
                 break;
         }
     }

@@ -4066,6 +4066,7 @@ void TExecutor::UpdateCounters(const TActorContext &ctx) {
                 Counters->Simple()[TExecutorCounters::MEMORY_ADMISSION_RUNNING_BYTES].Set(admission.RunningBytes);
                 Counters->Simple()[TExecutorCounters::MEMORY_ADMISSION_POSTPONED_BYTES].Set(admission.PostponedBytes);
                 Counters->Simple()[TExecutorCounters::MEMORY_ADMISSION_POSTPONED_COUNT].Set(admission.PostponedCount);
+                Counters->Simple()[TExecutorCounters::TABLET_MEMORY_SHARE].Set(TabletMemorySlot->GetShare().value_or(0));
             }
 
             // Runtime stats related to uncommitted changes
@@ -4445,8 +4446,12 @@ void TExecutor::Handle(NMemory::TEvMemTableCompact::TPtr &ev) {
     }
 }
 
+// One wake-up means "something changed": the tablet gets the zone and, once it has one, its share
 void TExecutor::Handle(NMemory::TEvMemoryZone::TPtr &) {
     Owner->OnMemoryZone(TabletMemorySlot->GetZone());
+    if (const auto share = TabletMemorySlot->GetShare()) {
+        Owner->OnMemoryLimit(*share);
+    }
 }
 
 void TExecutor::AllowBorrowedGarbageCompaction(ui32 tableId) {
