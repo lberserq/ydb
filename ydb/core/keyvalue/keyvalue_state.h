@@ -15,6 +15,7 @@
 #include <util/generic/set.h>
 #include <util/generic/hash_multi_map.h>
 #include <ydb/core/base/appdata.h>
+#include <ydb/core/base/tablet_memory_admission.h>
 #include <ydb/public/lib/base/msgbus.h>
 #include <ydb/core/tablet/tablet_counters.h>
 #include <ydb/core/tablet/tablet_metrics.h>
@@ -377,6 +378,9 @@ protected:
     TControlWrapper UsePerChannelReadQueues_Base;
     TMemorizableControlWrapper UsePerChannelReadQueues;
 
+    // admission of write and inline-read requests by the node memory zone
+    NMemory::TMemoryAdmission<TIntermediate> Admission;
+
     std::shared_ptr<TKeyValueStateLifetimeToken> LifetimeToken = std::make_shared<TKeyValueStateLifetimeToken>();
 
     bool RejectNonExistentStorageChannelEnabled(const TActorContext& ctx);
@@ -569,6 +573,14 @@ public:
     void OnPeriodicRefresh();
     void OnUpdateWeights(TChannelBalancer::TEvUpdateWeights::TPtr ev);
 
+    void SetMemorySlot(TIntrusivePtr<NMemory::TTabletMemorySlot> slot, TActorId executor);
+    // a zone change the tablet asked to be woken up for: the postponed requests are drained without waiting for completions
+    void OnMemoryZone();
+
+    NMemory::TMemoryAdmissionStats GetMemoryAdmissionStats() const {
+        return Admission.GetStats();
+    }
+
     void OnRequestComplete(ui64 requestUid, ui64 generation, ui64 step, const TActorContext &ctx,
         const TTabletStorageInfo *info, NMsgBusProxy::EResponseStatus status, const TRequestStat &stat,
         const TVector<ui32> &acquiredChannels);
@@ -755,6 +767,11 @@ public:
         const TTabletStorageInfo *info);
     void ProcessPostponedIntermediate(const TActorContext& ctx, THolder<TIntermediate> &&intermediate,
              const TTabletStorageInfo *info);
+
+    // write payloads plus the response estimate of an inline read
+    static ui64 GetBudgetCharge(const TIntermediate& intermediate);
+    // the admission start callback: the actor of an admitted write or inline read
+    void StartAdmittedIntermediate(THolder<TIntermediate>&& intermediate, bool postponed);
 
     bool ConvertRange(const NKikimrClient::TKeyValueRequest::TKeyRange& from, TKeyRange *to,
                       const TActorContext& ctx, THolder<TIntermediate>& intermediate, const char *cmd, ui32 index);

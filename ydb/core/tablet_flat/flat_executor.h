@@ -465,6 +465,7 @@ class TExecutor
     TAutoPtr<TScans> Scans;
     TAutoPtr<TMemory> Memory;
     TAutoPtr<NTable::IMemTableMemoryConsumersCollection> MemTableMemoryConsumersCollection;
+    TIntrusivePtr<NMemory::TTabletMemorySlot> TabletMemorySlot;
     TAutoPtr<TLogicSnap> LogicSnap;
     TAutoPtr<TLogicRedo> LogicRedo;
     TAutoPtr<TLogicAlter> LogicAlter;
@@ -723,6 +724,11 @@ public:
 
     void Handle(NMemory::TEvMemTableRegistered::TPtr &ev);
     void Handle(NMemory::TEvMemTableCompact::TPtr &ev);
+    void Handle(NMemory::TEvMemoryZone::TPtr &ev);
+
+    TIntrusivePtr<NMemory::TTabletMemorySlot> MemorySlot() const override {
+        return TabletMemorySlot;
+    }
 
     void AllowBorrowedGarbageCompaction(ui32 tableId) override;
 

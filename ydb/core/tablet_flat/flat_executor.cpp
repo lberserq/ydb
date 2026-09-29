@@ -195,6 +195,9 @@ void TExecutor::Registered(TActorSystem *sys, const TActorId&)
     Scans = new TScans(Logger.Get(), this, Emitter, Owner, OwnerActorId);
     Memory = new TMemory(Logger.Get(), this, Emitter, Sprintf(" at tablet %" PRIu64, Owner->TabletID()));
     MemTableMemoryConsumersCollection = new TMemTableMemoryConsumersCollection(NActors::TActivationContext::ActorSystem(), SelfId());
+    TabletMemorySlot = AppData()->FeatureFlags.GetEnableTabletMemoryHost()
+        ? NMemory::TTabletMemoryHost::Instance().RegisterConsumer(Owner->TabletType(), Owner->TabletID())
+        : NMemory::TTabletMemorySlot::Detached();
     auto& icb = *AppData()->Icb;
     if (static_cast<size_t>(Owner->TabletType()) < icb.LogFlushDelayOverrideUsec.size()) {
         TControlBoard::RegisterSharedControl(LogFlushDelayOverrideUsec, icb.LogFlushDelayOverrideUsec[static_cast<size_t>(Owner->TabletType())]);
@@ -234,6 +237,8 @@ void TExecutor::PassAway() {
 
     Scans->Drop();
     Owner = nullptr;
+    // The slot unlinks itself from the host, so the last report leaves the sums
+    TabletMemorySlot = NMemory::TTabletMemorySlot::Detached();
 
     Send(MakeSharedPageCacheId(), new NSharedCache::TEvUnregister());
 
@@ -4028,6 +4033,9 @@ void TExecutor::UpdateUsedTabletMemory() {
 }
 
 void TExecutor::UpdateCounters(const TActorContext &ctx) {
+    const NMemory::TConsumerReport memoryReport = Owner->GetMemoryReport();
+    TabletMemorySlot->SetReport(memoryReport);
+
     if (GcLogic && Counters) {
         if (const ui64 dropped = GcLogic->TakeSentinelDroppedMarks()) {
             Counters->Cumulative()[TExecutorCounters::GC_SENTINEL_DROPPED_MARKS].Increment(dropped);
@@ -4053,6 +4061,12 @@ void TExecutor::UpdateCounters(const TActorContext &ctx) {
                 Counters->Simple()[TExecutorCounters::DB_OTHER_BYTES].Set(dbCounters.Parts.OtherBytes);
                 Counters->Simple()[TExecutorCounters::DB_BYKEY_BYTES].Set(dbCounters.Parts.ByKeyBytes);
                 Counters->Simple()[TExecutorCounters::USED_TABLET_MEMORY].Set(UsedTabletMemory);
+                const NMemory::TMemoryAdmissionStats admission = Owner->GetMemoryAdmissionStats();
+                Counters->Simple()[TExecutorCounters::TABLET_MEMORY_USED].Set(memoryReport.Used);
+                Counters->Simple()[TExecutorCounters::MEMORY_ADMISSION_RUNNING_BYTES].Set(admission.RunningBytes);
+                Counters->Simple()[TExecutorCounters::MEMORY_ADMISSION_POSTPONED_BYTES].Set(admission.PostponedBytes);
+                Counters->Simple()[TExecutorCounters::MEMORY_ADMISSION_POSTPONED_COUNT].Set(admission.PostponedCount);
+                Counters->Simple()[TExecutorCounters::TABLET_MEMORY_SHARE].Set(TabletMemorySlot->GetShare().value_or(0));
             }
 
             // Runtime stats related to uncommitted changes
@@ -4432,6 +4446,14 @@ void TExecutor::Handle(NMemory::TEvMemTableCompact::TPtr &ev) {
     }
 }
 
+// One wake-up means "something changed": the tablet gets the zone and, once it has one, its share
+void TExecutor::Handle(NMemory::TEvMemoryZone::TPtr &) {
+    Owner->OnMemoryZone(TabletMemorySlot->GetZone());
+    if (const auto share = TabletMemorySlot->GetShare()) {
+        Owner->OnMemoryLimit(*share);
+    }
+}
+
 void TExecutor::AllowBorrowedGarbageCompaction(ui32 tableId) {
     if (CompactionLogic) {
         return CompactionLogic->AllowBorrowedGarbageCompaction(tableId);
@@ -4489,6 +4511,7 @@ STFUNC(TExecutor::StateWork) {
         HFunc(NBlockIO::TEvStat, Handle);
         hFunc(NMemory::TEvMemTableRegistered, Handle);
         hFunc(NMemory::TEvMemTableCompact, Handle);
+        hFunc(NMemory::TEvMemoryZone, Handle);
         hFunc(TEvTablet::TEvGcForStepAckResponse, Handle);
         hFunc(NBackup::TEvSnapshotCompleted, Handle);
         hFunc(NBackup::TEvChangelogFailed, Handle);
@@ -4517,6 +4540,7 @@ STFUNC(TExecutor::StateFollower) {
         HFunc(NOps::TEvScanStat, Handle);
         hFunc(NOps::TEvResult, Handle);
         HFunc(NBlockIO::TEvStat, Handle);
+        hFunc(NMemory::TEvMemoryZone, Handle);
     default:
         break;
     }

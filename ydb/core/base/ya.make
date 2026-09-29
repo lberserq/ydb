@@ -52,6 +52,9 @@ SRCS(
     logoblob.cpp
     logoblob.h
     memory_controller_iface.h
+    tablet_memory_admission.h
+    tablet_memory_host.cpp
+    tablet_memory_host.h
     mon_auth.cpp
     nameservice.h
     nodestate.h

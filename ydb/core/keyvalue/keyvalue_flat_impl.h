@@ -925,6 +925,7 @@ public:
     void InitSchemeComplete() {
         Become(&TThis::StateWork);
         State.SetTabletInfo(Info());
+        State.SetMemorySlot(Executor()->MemorySlot(), ExecutorID());
         State.OnStateWork();
         UpdateTabletYellow();
         while (!InitialEventsQueue.empty()) {
@@ -952,6 +953,19 @@ public:
 
     bool ReassignChannelsEnabled() const override {
         return true;
+    }
+
+    // memtable and pinned pages report under their own kinds; the state is the tablet's own
+    ui64 GetMemoryUsage() const override {
+        return State.GetStateBytes().Total();
+    }
+
+    NMemory::TMemoryAdmissionStats GetMemoryAdmissionStats() const override {
+        return State.GetMemoryAdmissionStats();
+    }
+
+    void OnMemoryZone(NMemory::EMemoryZone) override {
+        State.OnMemoryZone();
     }
 
     bool ValidateMoveDataGroups(const TSet<ui32>& moveDataGroups, const TActorId& sender) const {
