@@ -2045,6 +2045,56 @@ void TKeyValueState::OnUpdateWeights(TChannelBalancer::TEvUpdateWeights::TPtr ev
     WeightManager = std::move(ev->Get()->WeightManager);
 }
 
+// Called inside the tablet actor: the wake-up sends TEvMemoryZone to the executor through the actor system
+void TKeyValueState::SetMemorySlot(TIntrusivePtr<NMemory::TTabletMemorySlot> slot, TActorId executor) {
+    Admission = NMemory::TMemoryAdmission<TIntermediate>(std::move(slot),
+        [&sys = *TActivationContext::ActorSystem(), executor] {
+            sys.Send(new IEventHandle(executor, {}, new NMemory::TEvMemoryZone()));
+        },
+        [this](THolder<TIntermediate>&& intermediate, bool postponed) {
+            StartAdmittedIntermediate(std::move(intermediate), postponed);
+        });
+}
+
+void TKeyValueState::OnMemoryZone() {
+    Admission.OnZoneChanged();
+}
+
+ui64 TKeyValueState::GetBudgetCharge(const TIntermediate& intermediate) {
+    ui64 bytes = 0;
+    for (const TIntermediate::TWrite& write : intermediate.Writes) {
+        bytes += write.Data.size();
+    }
+    for (const TIntermediate::TCmd& command : intermediate.Commands) {
+        if (std::holds_alternative<TIntermediate::TWrite>(command)) {
+            bytes += std::get<TIntermediate::TWrite>(command).Data.size();
+        }
+    }
+    if (intermediate.Stat.RequestType == TRequestType::ReadOnlyInline) {
+        bytes += intermediate.TotalSize;
+    }
+    return bytes;
+}
+
+void TKeyValueState::StartAdmittedIntermediate(THolder<TIntermediate>&& intermediate, bool postponed) {
+    if (postponed) {
+        CountLatencyQueue(intermediate->Stat);
+    }
+    if (intermediate->Stat.RequestType == TRequestType::ReadOnlyInline) {
+        ++RoInlineIntermediatesInFlight;
+    }
+    const TActorContext& ctx = TActivationContext::AsActorContext();
+    switch (intermediate->EvType) {
+    case TEvKeyValue::TEvRead::EventType:
+    case TEvKeyValue::TEvReadRange::EventType:
+        RegisterReadRequestActor(ctx, std::move(intermediate), TabletInfo.Get(), ExecutorGeneration);
+        break;
+    default:
+        RegisterRequestActor(ctx, std::move(intermediate), TabletInfo.Get(), ExecutorGeneration);
+        break;
+    }
+}
+
 TVector<ui32> TKeyValueState::GetAcquiredChannels(const TIntermediate &intermediate) const {
     std::bitset<256> acquiredChannels;
 
@@ -2243,6 +2293,7 @@ void TKeyValueState::OnRequestComplete(ui64 requestUid, ui64 generation, ui64 st
     if (!releasedChannels.empty()) {
         ProcessPostponedChannels(releasedChannels, ctx, info);
     }
+    Admission.Release(requestUid);
 
     CmdTrimLeakedBlobsUids.erase(requestUid);
     CancelInFlight(requestUid);
@@ -3654,8 +3705,8 @@ void TKeyValueState::OnEvReadRequest(TEvKeyValue::TEvRead::TPtr &ev, const TActo
             YDB_LOG_DEBUG("Create storage inline read request,",
                 {"keyValue", TabletId},
                 {"marker", "KV49"});
-            RegisterReadRequestActor(ctx, std::move(intermediate), info, ExecutorGeneration);
-            ++RoInlineIntermediatesInFlight;
+            const ui64 charge = GetBudgetCharge(*intermediate);
+            Admission.Admit(intermediate->RequestUid, std::move(intermediate), charge);
         } else {
             if (TryStartOrPostponeIntermediate(intermediate, ctx)) {
                 YDB_LOG_DEBUG("Create storage read request, /",
@@ -3693,8 +3744,8 @@ void TKeyValueState::OnEvReadRangeRequest(TEvKeyValue::TEvReadRange::TPtr &ev, c
             YDB_LOG_DEBUG("Create storage inline read range request,",
                 {"keyValue", TabletId},
                 {"marker", "KV58"});
-            RegisterReadRequestActor(ctx, std::move(intermediate), info, ExecutorGeneration);
-            ++RoInlineIntermediatesInFlight;
+            const ui64 charge = GetBudgetCharge(*intermediate);
+            Admission.Admit(intermediate->RequestUid, std::move(intermediate), charge);
         } else {
             if (TryStartOrPostponeIntermediate(intermediate, ctx)) {
                 YDB_LOG_DEBUG("Create storage read range request, /",
@@ -3731,7 +3782,8 @@ void TKeyValueState::OnEvExecuteTransaction(TEvKeyValue::TEvExecuteTransaction::
         YDB_LOG_DEBUG("Create storage request for WO,",
             {"keyValue", TabletId},
             {"marker", "KV67"});
-        RegisterRequestActor(ctx, std::move(intermediate), info, ExecutorGeneration);
+        const ui64 charge = GetBudgetCharge(*intermediate);
+        Admission.Admit(intermediate->RequestUid, std::move(intermediate), charge);
 
         CountRequestTakeOffOrEnqueue(requestType);
     } else {
@@ -3834,13 +3886,14 @@ void TKeyValueState::OnEvRequest(TEvKeyValue::TEvRequest::TPtr &ev, const TActor
                 YDB_LOG_DEBUG("Create storage request for WO,",
                     {"keyValue", TabletId},
                     {"marker", "KV42"});
-                RegisterRequestActor(ctx, std::move(intermediate), info, ExecutorGeneration);
+                const ui64 charge = GetBudgetCharge(*intermediate);
+                Admission.Admit(intermediate->RequestUid, std::move(intermediate), charge);
             } else if (requestType == TRequestType::ReadOnlyInline) {
                 YDB_LOG_DEBUG("Create storage request for RO_INLINE,",
                     {"keyValue", TabletId},
                     {"marker", "KV45"});
-                RegisterRequestActor(ctx, std::move(intermediate), info, ExecutorGeneration);
-                ++RoInlineIntermediatesInFlight;
+                const ui64 charge = GetBudgetCharge(*intermediate);
+                Admission.Admit(intermediate->RequestUid, std::move(intermediate), charge);
             } else {
                 if (TryStartOrPostponeIntermediate(intermediate, ctx)) {
                     YDB_LOG_DEBUG("Create storage request for RO/RW, /",
