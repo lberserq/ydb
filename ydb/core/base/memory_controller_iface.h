@@ -15,6 +15,8 @@ enum class EMemoryConsumerKind {
     ColumnTablesColumnDataCache,
     ColumnTablesDeduplicationGroupedMemory,
     ColumnTablesPortionsMetaDataCache,
+
+    Tablets, // sum of the tablet memory host slots, attributed but not budgeted
 };
 
 struct TConsumerReport {
@@ -43,6 +45,8 @@ enum EEvMemory {
     EvMemTableUnregister,
 
     EvConsumerUnregister,
+
+    EvTabletMemoryZone,
 
     EvEnd
 };

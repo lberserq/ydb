@@ -3,10 +3,12 @@
 #include "consumer_collection.h"
 #include "memtable_collection.h"
 
+#include <ydb/core/base/appdata.h>
 #include <ydb/core/base/counters.h>
 #include <ydb/core/base/localdb.h>
 #include <ydb/core/base/memory_controller_iface.h>
 #include <ydb/core/base/memory_controller_iface.h_serialized.h>
+#include <ydb/core/base/tablet_memory_host.h>
 #include <ydb/core/cms/console/configs_dispatcher.h>
 #include <ydb/core/cms/console/console.h>
 #include <ydb/core/mon_alloc/stats.h>
@@ -74,11 +76,11 @@ public:
         return Used;
     }
 
-    ui64 GetDemand() const {
+    virtual ui64 GetDemand() const {
         return Demand;
     }
 
-    ui64 GetReclaimable() const {
+    virtual ui64 GetReclaimable() const {
         return Reclaimable;
     }
 
@@ -104,6 +106,27 @@ public:
 
     ui64 GetConsumption() const override {
         return NKikimr::NOlap::NStorageOptimizer::IOptimizerPlanner::GetNodePortionsConsumption();
+    }
+};
+
+// Fed by the tablet memory host: the controller reads the sum of all tablet slots itself
+class TTabletHostMemoryConsumer : public TMemoryConsumer {
+public:
+    TTabletHostMemoryConsumer()
+        : TMemoryConsumer(EMemoryConsumerKind::Tablets)
+    {
+    }
+
+    ui64 GetConsumption() const override {
+        return TTabletMemoryHost::Instance().GetTotal().Used;
+    }
+
+    ui64 GetDemand() const override {
+        return TTabletMemoryHost::Instance().GetTotal().Demand;
+    }
+
+    ui64 GetReclaimable() const override {
+        return TTabletMemoryHost::Instance().GetTotal().Reclaimable;
     }
 };
 
@@ -179,10 +202,20 @@ MEMORY_STATS_WRITER(QueryExecution)
 
 #undef MEMORY_STATS_WRITER
 
+void WriteTabletsStats(NKikimrMemory::TMemoryStats& stats, const TConsumerState& consumer, bool, bool, ui64) {
+    stats.SetTabletsConsumption(consumer.Consumption);
+}
+
+// The tablets carry no budget: their bytes are attributed, the node zone is what they get back
+ui64 GetTabletsLimitBytes(const NKikimrConfig::TMemoryControllerConfig&, ui64) {
+    return 0;
+}
+
 enum class ELimitDelivery {
     MemTableCompaction, // MC selects memtables and asks them to compact
     LimitShares, // every registrant of the kind is told its own ceiling
     PortionsCacheSetter,
+    TabletHost, // the tablet memory host fans the node zone out to the tablets
 };
 
 struct TConsumerTraits {
@@ -298,6 +331,17 @@ constexpr TConsumerTraits ConsumerTraits[] = {
         .StatsSummed = true,
         .StatsWithLimit = false,
     },
+    {
+        .Kind = EMemoryConsumerKind::Tablets,
+        .ElasticLimit = false,
+        .CanZeroLimit = false,
+        .GetMinBytes = &GetTabletsLimitBytes,
+        .GetMaxBytes = &GetTabletsLimitBytes,
+        .LimitDelivery = ELimitDelivery::TabletHost,
+        .WriteStats = &WriteTabletsStats,
+        .StatsSummed = false,
+        .StatsWithLimit = false,
+    },
 };
 
 constexpr bool ConsumerTraitsFollowEnumOrder() {
@@ -343,6 +387,10 @@ public:
 
     void Bootstrap(const TActorContext& ctx) {
         Become(&TThis::StateWork);
+
+        if (AppData(ctx)->FeatureFlags.GetEnableTabletMemoryHost()) {
+            Consumers.emplace(EMemoryConsumerKind::Tablets, MakeIntrusive<TTabletHostMemoryConsumer>());
+        }
 
         Send(NConsole::MakeConfigsDispatcherID(SelfId().NodeId()),
             new NConsole::TEvConfigsDispatcher::TEvSetConfigSubscriptionRequest({
@@ -437,6 +485,11 @@ private:
             resultingConsumersConsumption += GetResultingConsumption(consumer, coefficient);
         }
 
+        // The zone the tablets get: Green up to the target utilization, Yellow up to the soft limit, Red above it
+        NodeZone = processMemoryInfo.AllocatedMemory > softLimitBytes ? EMemoryZone::Red
+            : processMemoryInfo.AllocatedMemory > targetUtilizationBytes ? EMemoryZone::Yellow
+            : EMemoryZone::Green;
+
         YDB_LOG_INFO_CTX(ctx, "Periodic memory stats",
             {"anonRss", HumanReadableBytes(processMemoryInfo.AnonRss)},
             {"CGroupLimit", HumanReadableBytes(processMemoryInfo.CGroupLimit)},
@@ -453,7 +506,8 @@ private:
             {"externalConsumption", HumanReadableBytes(externalConsumption)},
             {"targetConsumersConsumption", HumanReadableBytes(targetConsumersConsumption)},
             {"resultingConsumersConsumption", HumanReadableBytes(resultingConsumersConsumption)},
-            {"coefficient", coefficient});
+            {"coefficient", coefficient},
+            {"tabletMemoryZone", static_cast<ui32>(NodeZone)});
 
         Counters->GetCounter("Stats/AnonRss")->Set(processMemoryInfo.AnonRss.value_or(0));
         Counters->GetCounter("Stats/CGroupLimit")->Set(processMemoryInfo.CGroupLimit.value_or(0));
@@ -472,6 +526,7 @@ private:
         Counters->GetCounter("Stats/TargetConsumersConsumption")->Set(targetConsumersConsumption);
         Counters->GetCounter("Stats/ResultingConsumersConsumption")->Set(resultingConsumersConsumption);
         Counters->GetCounter("Stats/Coefficient")->Set(coefficient * 1e9);
+        Counters->GetCounter("Stats/TabletMemoryZone")->Set(static_cast<ui32>(NodeZone));
         Counters->GetCounter("Stats/ArrowAllocatedMemory")->Set(arrow::default_memory_pool()->bytes_allocated());
         Counters->GetCounter("Stats/ArrowYqlAllocatedMemory")->Set(NYql::NUdf::GetYqlMemoryPool()->bytes_allocated());
 
@@ -666,6 +721,10 @@ private:
             case ELimitDelivery::PortionsCacheSetter:
                 NKikimr::NOlap::NStorageOptimizer::IOptimizerPlanner::SetPortionsCacheLimit(limitBytes);
                 break;
+            case ELimitDelivery::TabletHost:
+                TTabletMemoryHost::Instance().SetNodeZone(NodeZone);
+                TTabletMemoryHost::Instance().UpdateCounters(Counters);
+                break;
         }
     }
 
@@ -805,6 +864,7 @@ private:
     const TIntrusivePtr<::NMonitoring::TDynamicCounters> Counters;
     TMap<EMemoryConsumerKind, TConsumerCounters> ConsumerCounters;
     std::optional<TResourceBrokerConfig> CurrentResourceBrokerConfig;
+    EMemoryZone NodeZone = EMemoryZone::Green;
 };
 
 }

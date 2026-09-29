@@ -6,6 +6,7 @@
 
 #include <ydb/core/base/tablet.h>
 #include <ydb/core/base/blobstorage.h>
+#include <ydb/core/base/tablet_memory_admission.h>
 #include <ydb/library/actors/wilson/wilson_span.h>
 #include <ydb/library/wilson_ids/wilson.h>
 #include <library/cpp/lwtrace/shuttle.h>
@@ -519,6 +520,18 @@ namespace NFlatExecutorSetup {
         // memory usage excluding transactions and executor cache.
         virtual ui64 GetMemoryUsage() const { return 50 << 10; }
 
+        // the requests the tablet holds back or runs under its memory admission; zeros when it has none
+        virtual NMemory::TMemoryAdmissionStats GetMemoryAdmissionStats() const { return {}; }
+
+        // the tablet's own bytes for the memory controller; memtable and pinned pages report under other kinds
+        virtual NMemory::TConsumerReport GetMemoryReport() const {
+            const ui64 used = GetMemoryUsage() + GetMemoryAdmissionStats().HeldBytes();
+            return {.Used = used, .Demand = used, .Reclaimable = 0};
+        }
+
+        // called in the tablet's context after a zone change it asked to be woken up for
+        virtual void OnMemoryZone(NMemory::EMemoryZone) { /* default */ }
+
         virtual void OnLeaderUserAuxUpdate(TString) { /* default */ }
 
         virtual bool ReadOnlyLeaseEnabled();
@@ -577,6 +590,9 @@ namespace NFlatExecutorSetup {
         virtual void FollowerGcApplied(ui32 step, TDuration followerSyncDelay) = 0;
 
         virtual void Execute(TAutoPtr<ITransaction> transaction, const TActorContext &ctx) = 0;
+
+        // the tablet's slot in the tablet memory host; a detached slot when the host is off
+        virtual TIntrusivePtr<NMemory::TTabletMemorySlot> MemorySlot() const { return NMemory::TTabletMemorySlot::Detached(); }
 
         /**
          * Enqueue a transaction for execution
