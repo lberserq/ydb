@@ -59,6 +59,33 @@ bool CanCutHistoryInterval(
     return storage->CanCutHistory(pendingGenerations, interval.Channel, interval.From, interval.To);
 }
 
+void SendCutHistoryInterval(
+    const TColumnShard& owner, const TCSCounters& counters, const TCutHistoryScan& scan, const size_t index, const TActorContext& ctx) {
+    const auto& interval = scan.Intervals[index];
+    auto event = std::make_unique<TEvTablet::TEvCutTabletHistory>();
+    event->Record.SetTabletID(owner.TabletID());
+    event->Record.SetChannel(interval.Channel);
+    event->Record.SetFromGeneration(interval.From);
+    event->Record.SetGroupID(interval.Group);
+    counters.OnCutHistoryRequestSent(ctx.Now() - *scan.Finished);
+    ctx.Send(owner.LauncherID(), event.release(), IEventHandle::FlagTrackDelivery, index + 1);
+}
+
+// Requests saved while a GC round was in flight go out now, re-checked against the state the round left behind.
+void SendHeldCutHistoryIntervals(const TColumnShard& owner, const TCSCounters& counters, TCutHistoryScan& scan,
+    const NOlap::TPendingGCBlobGenerations& pendingGenerations, const TActorContext& ctx) {
+    for (size_t index = 0; index < scan.Intervals.size(); ++index) {
+        auto& interval = scan.Intervals[index];
+        if (!interval.HeldByGC) {
+            continue;
+        }
+        interval.HeldByGC = false;
+        if (CanCutHistoryInterval(owner, interval, pendingGenerations)) {
+            SendCutHistoryInterval(owner, counters, scan, index, ctx);
+        }
+    }
+}
+
 class TCutHistoryPreparationActor: public NActors::TActorBootstrapped<TCutHistoryPreparationActor> {
     const TActorId Owner;
     std::vector<std::pair<TInternalPathId, ui64>> Portions;
@@ -116,30 +143,17 @@ public:
             Self->CutHistoryScan.reset();
             return;
         }
-        const auto storage =
-            std::dynamic_pointer_cast<NOlap::NBlobOperations::NBlobStorage::TOperator>(Self->StoragesManager->GetDefaultOperator());
-        AFL_VERIFY(storage);
-        if (storage->HasGCInFlight()) {
-            return;
-        }
-        const auto pendingGenerations = storage->GetPendingGCBlobGenerations();
+        auto& scan = *Self->CutHistoryScan;
         for (const auto& request : ReadyToSendRequests) {
-            auto& scan = *Self->CutHistoryScan;
             const auto it = FindIf(scan.Intervals, [&](const auto& interval) {
                 return interval.Channel == request.GetChannel() && interval.From == request.GetFromGeneration() &&
                        interval.To == request.GetToGeneration() && interval.Group == request.GetGroupID();
             });
-            if (it == scan.Intervals.end() || !CanCutHistoryInterval(*Self, *it, pendingGenerations)) {
-                continue;
+            if (it != scan.Intervals.end()) {
+                it->HeldByGC = true;
             }
-            auto event = std::make_unique<TEvTablet::TEvCutTabletHistory>();
-            event->Record.SetTabletID(request.GetTabletID());
-            event->Record.SetChannel(request.GetChannel());
-            event->Record.SetFromGeneration(request.GetFromGeneration());
-            event->Record.SetGroupID(request.GetGroupID());
-            Self->Counters.GetCSCounters().OnCutHistoryRequestSent(ctx.Now() - *scan.Finished);
-            ctx.Send(Self->LauncherID(), event.release(), IEventHandle::FlagTrackDelivery, std::distance(scan.Intervals.begin(), it) + 1);
         }
+        Self->TryCutHistory(ctx);
     }
 };
 
@@ -321,12 +335,15 @@ void TColumnShard::TryCutHistory(const TActorContext& ctx) {
     }
     const auto storage = std::dynamic_pointer_cast<NOlap::NBlobOperations::NBlobStorage::TOperator>(StoragesManager->GetDefaultOperator());
     AFL_VERIFY(storage);
-    NOlap::TPendingGCBlobGenerations pendingGenerations;
-    if (!storage->HasGCInFlight() && AnyOf(CutHistoryScan->Intervals, [](const auto& interval) {
-            return !interval.Attempted && !interval.HasBlobs;
-        })) {
-        pendingGenerations = storage->GetPendingGCBlobGenerations();
+    // A small shard finishes its scan inside the boot GC round; attempting now would refuse everything for the whole generation.
+    if (storage->HasGCInFlight()) {
+        return;
     }
+    const bool hasWork = AnyOf(CutHistoryScan->Intervals, [](const auto& interval) {
+        return interval.HeldByGC || (!interval.Attempted && !interval.HasBlobs);
+    });
+    const auto pendingGenerations = hasWork ? storage->GetPendingGCBlobGenerations() : NOlap::TPendingGCBlobGenerations();
+    SendHeldCutHistoryIntervals(*this, Counters.GetCSCounters(), *CutHistoryScan, pendingGenerations, ctx);
     std::vector<NKikimrTxColumnShard::TCutHistoryRequest> requests;
     for (auto& interval : CutHistoryScan->Intervals) {
         if (interval.Attempted) {

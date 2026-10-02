@@ -23,6 +23,8 @@ struct TCutHistoryInterval {
     ui32 Group = 0;
     bool HasBlobs = false;
     bool Attempted = false;
+    // Saved while a GC round was in flight; sent once the round completes.
+    bool HeldByGC = false;
 };
 
 struct TCutHistoryScan {

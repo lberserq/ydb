@@ -421,6 +421,48 @@ Y_UNIT_TEST_SUITE(TColumnShardCutHistory) {
         UNIT_ASSERT_VALUES_EQUAL_C(cuts, 1u, "GC drained before the scan finishes must not require another reboot");
     }
 
+    Y_UNIT_TEST(ScanFinishedDuringTheBootGCRoundCutsAfterTheRound) {
+        TFixture f;
+        f.Controller->DisableBackground(EBackground::Compaction);
+        f.Schema(false, 2);
+        f.Write(1, 0, 1000);
+        f.Drive();
+        f.Restart(NewGroup);
+        f.Drive();
+        std::vector<TAutoPtr<IEventHandle>> heldGCResults;
+        bool holdGC = true;
+        ui32 cuts = 0;
+        auto observer = f.Runtime.AddObserver<IEventHandle>([&](IEventHandle::TPtr& ev) {
+            if (!ev->HasEvent()) {
+                return;
+            }
+            if (holdGC && dynamic_cast<TEvBlobStorage::TEvCollectGarbageResult*>(ev->GetBase())) {
+                heldGCResults.emplace_back(ev.Release());
+            } else if (const auto* cut = dynamic_cast<TEvTablet::TEvCutTabletHistory*>(ev->GetBase());
+                       cut && cut->Record.GetChannel() == FirstDataChannel && cut->Record.GetFromGeneration() == 0) {
+                UNIT_ASSERT_VALUES_EQUAL(cut->Record.GetGroupID(), OldGroup);
+                ++cuts;
+                ev.Reset();
+            }
+        });
+        f.Restart();
+        f.Drive();
+        const auto storage = std::dynamic_pointer_cast<NOlap::NBlobOperations::NBlobStorage::TOperator>(
+            f.Controller->GetTheOnlyShard()->GetStoragesManager()->GetDefaultOperator());
+        UNIT_ASSERT(storage);
+        UNIT_ASSERT_C(!heldGCResults.empty(), "the boot GC round must be in flight while the scan runs");
+        UNIT_ASSERT(storage->HasGCInFlight());
+        UNIT_ASSERT_VALUES_EQUAL(f.Samples("Scan"), 1u);
+        UNIT_ASSERT_VALUES_EQUAL_C(cuts, 0u, "nothing can be cut while the round is in flight");
+        holdGC = false;
+        for (auto& held : heldGCResults) {
+            f.Runtime.Send(held.Release(), 0, true);
+        }
+        f.Drive();
+        UNIT_ASSERT(!storage->HasGCInFlight());
+        UNIT_ASSERT_VALUES_EQUAL_C(cuts, 1u, "the attempt postponed by the boot GC round must resume when it completes");
+    }
+
     Y_UNIT_TEST(ColdCacheBatchingAndMetadataFailure) {
         constexpr ui64 portionCount = 7;
         TFixture f;

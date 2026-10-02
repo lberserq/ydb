@@ -607,7 +607,6 @@ private:
     void StartCutHistoryScan(const TActorContext& ctx);
     void AbortCutHistoryScan();
     void FinishCutHistoryBatch(const NOlap::TDataAccessorsResult& result);
-    void TryCutHistory(const TActorContext& ctx);
     void Handle(TEvPrivate::TEvContinueCutHistory::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvPrivate::TEvCutHistoryPortionsReady::TPtr& ev, const TActorContext& ctx);
     void SubmitMetadataRequest(const NOlap::TCSMetadataRequest& request);
@@ -636,6 +635,8 @@ private:
     ui64 NormalizeSmallBlobsCount(const ui64 rawCount);
 
 public:
+    // Also driven by the GC-finished transaction: an attempt postponed by an in-flight round resumes there.
+    void TryCutHistory(const TActorContext& ctx);
     ui64 TabletTxCounter = 0;
 
     std::shared_ptr<const TAtomicCounter> GetTabletActivity() const {
