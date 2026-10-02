@@ -6,8 +6,6 @@
 #include <util/generic/hash.h>
 #include <util/generic/ptr.h>
 
-#include <functional>
-
 namespace NKikimr::NMemory {
 
 struct TMemoryAdmissionStats {
@@ -22,17 +20,12 @@ struct TMemoryAdmissionStats {
 };
 
 // Gates the start of memory-charged items by the node zone: FIFO, no growth in Yellow, one at a time in Red
-template <class TItem>
+// The owner starts what the gate lets through: void StartAdmitted(THolder<TItem>&&, bool postponed)
+template <class TItem, class TOwner>
 class TMemoryAdmission {
 public:
-    using TZoneSource = std::function<EMemoryZone()>;
-    using TStart = std::function<void(THolder<TItem>&&, bool postponed)>;
-
-    TMemoryAdmission() = default;
-
-    TMemoryAdmission(TZoneSource zone, TStart start)
-        : Zone(std::move(zone))
-        , Start(std::move(start))
+    explicit TMemoryAdmission(TOwner& owner)
+        : Owner(owner)
     {
     }
 
@@ -59,8 +52,14 @@ public:
         Drain();
     }
 
-    // Called by the tablet from ITablet::OnMemoryZone
-    void OnZoneChanged() {
+    // Called by the tablet from ITablet::OnMemoryZone with the zone the executor delivered
+    void OnZoneChanged(EMemoryZone zone) {
+        if (zone == Zone) {
+            return;
+        }
+        Zone = zone;
+        // The watermark is the running bytes seen on entering the zone, so nothing may grow past it
+        Watermark = RunningBytes;
         Drain();
     }
 
@@ -80,17 +79,8 @@ private:
         THolder<TItem> Item;
     };
 
-    EMemoryZone GetZone() const {
-        return Zone ? Zone() : EMemoryZone::Green;
-    }
-
-    bool Admits(ui64 charge) {
-        const EMemoryZone zone = GetZone();
-        if (zone != LastZone) {
-            LastZone = zone;
-            Watermark = RunningBytes;
-        }
-        switch (zone) {
+    bool Admits(ui64 charge) const {
+        switch (Zone) {
             case EMemoryZone::Green:
                 return true;
             case EMemoryZone::Yellow:
@@ -105,7 +95,7 @@ private:
         RunningBytes += charge;
         ++RunningCount;
         Charges[uid] = charge;
-        Start(std::move(item), postponed);
+        Owner.StartAdmitted(std::move(item), postponed);
     }
 
     void Drain() {
@@ -123,10 +113,9 @@ private:
     }
 
 private:
-    TZoneSource Zone;
-    TStart Start;
+    TOwner& Owner;
 
-    EMemoryZone LastZone = EMemoryZone::Green;
+    EMemoryZone Zone = EMemoryZone::Green;
     ui64 Watermark = 0;
     ui64 RunningBytes = 0;
     ui64 RunningCount = 0;

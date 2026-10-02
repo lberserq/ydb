@@ -13,20 +13,21 @@ struct TRequest {
     ui64 Id = 0;
 };
 
-// Drives the admission with a zone the test sets and remembers what it let start
+// Stands in for the tablet that owns an admission: starts what it lets through and remembers it
 struct TFixture {
-    EMemoryZone Zone = EMemoryZone::Green;
     TVector<ui64> Started;
-    TMemoryAdmission<TRequest> Admission;
+    TMemoryAdmission<TRequest, TFixture> Admission{*this};
 
-    TFixture()
-        : Admission([this]() { return Zone; },
-                    [this](THolder<TRequest>&& request, bool) { Started.push_back(request->Id); })
-    {
+    void StartAdmitted(THolder<TRequest>&& request, bool) {
+        Started.push_back(request->Id);
     }
 
     void Admit(ui64 id, ui64 charge) {
         Admission.Admit(id, MakeHolder<TRequest>(TRequest{.Id = id}), charge);
+    }
+
+    void SetZone(EMemoryZone zone) {
+        Admission.OnZoneChanged(zone);
     }
 };
 
@@ -50,7 +51,7 @@ Y_UNIT_TEST(YellowForbidsGrowthAboveTheWatermark) {
     fixture.Admit(2, 100);
 
     // The watermark is the running bytes seen on entering the zone, so nothing may grow past it
-    fixture.Zone = EMemoryZone::Yellow;
+    fixture.SetZone(EMemoryZone::Yellow);
     fixture.Admit(3, 10);
     UNIT_ASSERT_VALUES_EQUAL(fixture.Started.size(), 2u);
     UNIT_ASSERT_VALUES_EQUAL(fixture.Admission.GetStats().PostponedCount, 1u);
@@ -65,7 +66,7 @@ Y_UNIT_TEST(YellowForbidsGrowthAboveTheWatermark) {
 
 Y_UNIT_TEST(RedRunsOneAtATime) {
     TFixture fixture;
-    fixture.Zone = EMemoryZone::Red;
+    fixture.SetZone(EMemoryZone::Red);
     fixture.Admit(1, 10);
     fixture.Admit(2, 10);
     fixture.Admit(3, 10);
@@ -79,33 +80,29 @@ Y_UNIT_TEST(RedRunsOneAtATime) {
     UNIT_ASSERT_VALUES_EQUAL(fixture.Admission.GetStats().PostponedCount, 1u);
 
     // A green zone the tablet is told about drains the rest
-    fixture.Zone = EMemoryZone::Green;
-    fixture.Admission.OnZoneChanged();
+    fixture.SetZone(EMemoryZone::Green);
     UNIT_ASSERT_VALUES_EQUAL(fixture.Started.size(), 3u);
     UNIT_ASSERT_VALUES_EQUAL(fixture.Admission.GetStats().HeldBytes(), 20u);
 }
 
 Y_UNIT_TEST(EmptyRunSetAlwaysAdmitsTheHead) {
     TFixture fixture;
-    fixture.Zone = EMemoryZone::Red;
+    fixture.SetZone(EMemoryZone::Red);
     fixture.Admit(1, 1_GB);
     UNIT_ASSERT_VALUES_EQUAL(fixture.Started.size(), 1u);
 
-    fixture.Zone = EMemoryZone::Yellow;
+    fixture.SetZone(EMemoryZone::Yellow);
     fixture.Admission.Release(1);
     fixture.Admit(2, 1_GB);
     UNIT_ASSERT_VALUES_EQUAL(fixture.Started.size(), 2u);
 }
 
-Y_UNIT_TEST(NoZoneSourceBehavesAsGreen) {
-    TVector<ui64> started;
-    TMemoryAdmission<TRequest> admission({}, [&started](THolder<TRequest>&& request, bool) {
-        started.push_back(request->Id);
-    });
+Y_UNIT_TEST(UntoldZoneBehavesAsGreen) {
+    TFixture fixture;
     for (int i = 1; i <= 3; ++i) {
-        admission.Admit(i, MakeHolder<TRequest>(TRequest{.Id = static_cast<ui64>(i)}), 1_GB);
+        fixture.Admit(i, 1_GB);
     }
-    UNIT_ASSERT_VALUES_EQUAL(started.size(), 3u);
+    UNIT_ASSERT_VALUES_EQUAL(fixture.Started.size(), 3u);
 }
 
 }
