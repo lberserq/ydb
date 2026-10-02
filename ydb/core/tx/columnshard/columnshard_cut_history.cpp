@@ -325,6 +325,12 @@ void TColumnShard::FinishCutHistoryBatch(const NOlap::TDataAccessorsResult& resu
     ScheduleCutHistoryContinuation(*ColumnShardConfig, TActivationContext::AsActorContext());
 }
 
+void TColumnShard::ResumePostponedCutHistory(const TActorContext& ctx) {
+    if (CutHistoryScan && CutHistoryScan->WaitingForGC) {
+        TryCutHistory(ctx);
+    }
+}
+
 void TColumnShard::TryCutHistory(const TActorContext& ctx) {
     if (!CutHistoryScan || !CutHistoryScan->Finished || CutHistoryScan->SavePending) {
         return;
@@ -337,8 +343,10 @@ void TColumnShard::TryCutHistory(const TActorContext& ctx) {
     AFL_VERIFY(storage);
     // A small shard finishes its scan inside the boot GC round; attempting now would refuse everything for the whole generation.
     if (storage->HasGCInFlight()) {
+        CutHistoryScan->WaitingForGC = true;
         return;
     }
+    CutHistoryScan->WaitingForGC = false;
     const bool hasWork = AnyOf(CutHistoryScan->Intervals, [](const auto& interval) {
         return interval.HeldByGC || (!interval.Attempted && !interval.HasBlobs);
     });

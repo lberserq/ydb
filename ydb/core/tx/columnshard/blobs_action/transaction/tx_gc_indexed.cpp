@@ -19,7 +19,7 @@ void TTxGarbageCollectionFinished::Complete(const TActorContext& ctx) {
         {"tx", "TxGarbageCollectionFinished"},
         {"event", "complete"});
     Action->OnCompleteTxAfterCleaning(*Self, Action);
-    Self->TryCutHistory(ctx);
+    Self->ResumePostponedCutHistory(ctx);
 }
 
 bool TTxGarbageCollectionStart::Execute(TTransactionContext& txc, const TActorContext& /*ctx*/) {

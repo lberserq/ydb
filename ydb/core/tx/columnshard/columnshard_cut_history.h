@@ -35,6 +35,8 @@ struct TCutHistoryScan {
     NActors::TActorId PreparationActor;
     bool SavePending = false;
     bool RetryDelivery = false;
+    // The one attempt of this generation was postponed by an in-flight GC round and resumes on its completion.
+    bool WaitingForGC = false;
     TInstant Started;
     std::optional<TInstant> Finished;
 };
