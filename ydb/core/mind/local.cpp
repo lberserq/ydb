@@ -210,7 +210,7 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
     }
 
     void UpdateTabletMemory(TTabletId tabletId, const TActorId &executor, TTabletTypes::EType tabletType,
-                            const NKikimrTabletBase::TMetrics &metrics) {
+                            const NKikimrTabletBase::TMetrics &metrics, const TActorContext &ctx) {
         if (!TabletMemoryHostEnabled) {
             return;
         }
@@ -227,8 +227,13 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
         if (update.IsEmpty()) {
             return;
         }
+        // A tablet that boots onto a node already under pressure learns the zone with its first report
+        const bool firstReport = !TabletMemoryHost.Has(tabletId);
         if (TabletMemoryHost.SetReport(tabletId, executor, tabletType, update)) {
             PublishTabletMemory();
+        }
+        if (firstReport && TabletMemoryZone != NMemory::EMemoryZone::Green) {
+            ctx.Send(executor, new NMemory::TEvMemoryZone(TabletMemoryZone));
         }
     }
 
@@ -718,7 +723,7 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
                     it->second.ResourceValues.AddGroupWriteIops()->CopyFrom(v);
                 }
             }
-            UpdateTabletMemory(tabletId, ev->Sender, it->second.TabletType, metrics);
+            UpdateTabletMemory(tabletId, ev->Sender, it->second.TabletType, metrics, ctx);
             auto after = it->second.ResourceValues.ByteSize();
             if (after == 0 && before == 0) {
                 return;
