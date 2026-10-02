@@ -423,9 +423,7 @@ Y_UNIT_TEST_SUITE(TColumnShardCutHistory) {
 
     Y_UNIT_TEST(ScanFinishedDuringTheBootGCRoundCutsAfterTheRound) {
         TFixture f;
-        f.Controller->DisableBackground(EBackground::Compaction);
         f.Schema(false, 2);
-        f.Write(1, 0, 1000);
         f.Drive();
         f.Restart(NewGroup);
         f.Drive();
