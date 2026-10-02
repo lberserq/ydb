@@ -6,7 +6,8 @@
 namespace NKikimr::NMemory {
 
 ui64 TTabletMemoryHost::ElasticDemandOf(const TConsumerReport& report) {
-    const ui64 state = report.Used - report.Reclaimable;
+    Y_DEBUG_ABORT_UNLESS(report.Reclaimable <= report.Used && report.Demand >= report.Used);
+    const ui64 state = report.Used - Min(report.Used, report.Reclaimable);
     return Max(report.Reclaimable, report.Demand - Min(report.Demand, state));
 }
 

@@ -12277,6 +12277,25 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         UNIT_ASSERT_VALUES_EQUAL(*env.Probe->LastShare, 4_MB);
     }
 
+    Y_UNIT_TEST(TestTabletMemoryZoneReachesTabletBootedUnderPressure) {
+        TTabletMemoryEnv env(true, {.Used = 40_MB, .Demand = 60_MB, .Reclaimable = 10_MB});
+        const TActorId registrant = env.Controller->Registrant;
+        UNIT_ASSERT(registrant);
+        env.Runtime.Send(new IEventHandle(registrant, TActorId(),
+            new NMemory::TEvConsumerLimit(NMemory::EMemoryConsumerKind::Tablets, 0, NMemory::EMemoryZone::Red)));
+        env.Runtime.SimulateSleep(TDuration::Seconds(1));
+        UNIT_ASSERT(env.Probe->LastZone);
+
+        // A restarted tablet is a new instance: nothing changed on the node, yet it must not stay Green
+        env.Probe->LastZone.reset();
+        const TActorId tablet = ResolveTablet(env.Runtime, env.TabletId);
+        env.Runtime.Send(new IEventHandle(tablet, TActorId(), new TEvents::TEvPoisonPill()));
+        MakeSureTabletIsUp(env.Runtime, env.TabletId, 0);
+        env.Runtime.SimulateSleep(TDuration::Seconds(60));
+        UNIT_ASSERT(env.Probe->LastZone);
+        UNIT_ASSERT_VALUES_EQUAL(static_cast<ui32>(*env.Probe->LastZone), static_cast<ui32>(NMemory::EMemoryZone::Red));
+    }
+
     Y_UNIT_TEST(TestTabletMemoryReportIsOffWithoutTheFlag) {
         TTabletMemoryEnv env(false, {.Used = 40_MB, .Demand = 60_MB, .Reclaimable = 10_MB});
 

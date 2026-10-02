@@ -58,6 +58,10 @@ public:
         return Slots.size();
     }
 
+    bool Has(TTabletKey tablet) const {
+        return Slots.contains(tablet);
+    }
+
     // What the registrar reports for the Tablets kind
     TConsumerReport GetReport() const {
         return {.Used = Sums.Total, .Demand = Sums.Total, .Reclaimable = 0};
