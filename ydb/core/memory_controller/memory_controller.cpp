@@ -153,33 +153,43 @@ using TLimitBytesGetter = ui64 (*)(const NKikimrConfig::TMemoryControllerConfig&
 // A stats writer adds one consumer's report to its fields of TMemoryStats
 using TStatsWriter = void (*)(NKikimrMemory::TMemoryStats& stats, const TConsumerState& consumer, bool summed, bool withLimit, ui64 limitBytes);
 
-#define MEMORY_STATS_WRITER(name) \
-    void Write##name##Stats(NKikimrMemory::TMemoryStats& stats, const TConsumerState& consumer, bool summed, bool withLimit, ui64 limitBytes) { \
+#define MEMORY_STATS_WRITER_SUMS(name) \
         if (!summed) { \
             Y_ASSERT(!stats.Has##name##Consumption()); \
-        } \
-        if (withLimit) { \
-            Y_ASSERT(!stats.Has##name##Limit()); \
         } \
         const ui64 base = summed ? stats.Get##name##Consumption() : 0; \
         const ui64 baseDemand = summed ? stats.Get##name##Demand() : 0; \
         const ui64 baseReclaimable = summed ? stats.Get##name##Reclaimable() : 0; \
         stats.Set##name##Consumption(base + consumer.Consumption); \
         stats.Set##name##Demand(baseDemand + consumer.Demand); \
-        stats.Set##name##Reclaimable(baseReclaimable + consumer.Reclaimable); \
+        stats.Set##name##Reclaimable(baseReclaimable + consumer.Reclaimable);
+
+#define MEMORY_STATS_WRITER(name) \
+    void Write##name##Stats(NKikimrMemory::TMemoryStats& stats, const TConsumerState& consumer, bool summed, bool withLimit, ui64 limitBytes) { \
+        MEMORY_STATS_WRITER_SUMS(name) \
         if (withLimit) { \
+            Y_ASSERT(!stats.Has##name##Limit()); \
             stats.Set##name##Limit(limitBytes); \
         } \
+    }
+
+// For a kind with no limit field of its own in TMemoryStats
+#define MEMORY_STATS_WRITER_NO_LIMIT(name) \
+    void Write##name##Stats(NKikimrMemory::TMemoryStats& stats, const TConsumerState& consumer, bool summed, bool withLimit, ui64) { \
+        Y_ASSERT(!withLimit); \
+        MEMORY_STATS_WRITER_SUMS(name) \
     }
 
 MEMORY_STATS_WRITER(MemTable)
 MEMORY_STATS_WRITER(SharedCache)
 MEMORY_STATS_WRITER(Compaction)
 MEMORY_STATS_WRITER(QueryExecution)
-MEMORY_STATS_WRITER(Tablets)
+MEMORY_STATS_WRITER_NO_LIMIT(Tablets)
 MEMORY_STATS_WRITER(TabletsElastic)
 
+#undef MEMORY_STATS_WRITER_NO_LIMIT
 #undef MEMORY_STATS_WRITER
+#undef MEMORY_STATS_WRITER_SUMS
 
 // The tablets carry no budget of their own: their bytes are attributed, the node zone is what they get back
 ui64 GetZeroLimitBytes(const NKikimrConfig::TMemoryControllerConfig&, ui64) {
@@ -491,7 +501,7 @@ private:
             {"targetConsumersConsumption", HumanReadableBytes(targetConsumersConsumption)},
             {"resultingConsumersConsumption", HumanReadableBytes(resultingConsumersConsumption)},
             {"coefficient", coefficient},
-            {"tabletMemoryZone", NodeZone});
+            {"tabletMemoryZone", ToString(NodeZone)});
 
         Counters->GetCounter("Stats/AnonRss")->Set(processMemoryInfo.AnonRss.value_or(0));
         Counters->GetCounter("Stats/CGroupLimit")->Set(processMemoryInfo.CGroupLimit.value_or(0));
@@ -510,7 +520,7 @@ private:
         Counters->GetCounter("Stats/TargetConsumersConsumption")->Set(targetConsumersConsumption);
         Counters->GetCounter("Stats/ResultingConsumersConsumption")->Set(resultingConsumersConsumption);
         Counters->GetCounter("Stats/Coefficient")->Set(coefficient * 1e9);
-        Counters->GetCounter("Stats/TabletMemoryZone")->Set(static_cast<ui32>(NodeZone));
+        Counters->GetCounter("Stats/TabletMemoryZone")->Set(static_cast<std::underlying_type_t<EMemoryZone>>(NodeZone));
         Counters->GetCounter("Stats/ArrowAllocatedMemory")->Set(arrow::default_memory_pool()->bytes_allocated());
         Counters->GetCounter("Stats/ArrowYqlAllocatedMemory")->Set(NYql::NUdf::GetYqlMemoryPool()->bytes_allocated());
 
@@ -815,12 +825,15 @@ private:
     }
 
     TConsumerState BuildConsumerState(EMemoryConsumerKind kind, const TConsumerCollection& collection, ui64 hardLimitBytes) const {
-        const TConsumerReport total = collection.GetTotal();
+        TConsumerReport total = collection.GetTotal();
         TConsumerState result(kind, total);
-        SetLimitBounds(result, hardLimitBytes);
-        if (GetConsumerTraits(kind).BoundsFromRegistrants) {
+        const auto& traits = GetConsumerTraits(kind);
+        if (traits.BoundsFromRegistrants) {
             result.MinBytes = 0;
             result.MaxBytes = total.Demand;
+            result.CanZeroLimit = traits.CanZeroLimit;
+        } else {
+            SetLimitBounds(result, hardLimitBytes);
         }
         return result;
     }

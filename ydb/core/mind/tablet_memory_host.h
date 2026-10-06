@@ -2,6 +2,7 @@
 
 #include <ydb/core/base/memory_controller_iface.h>
 #include <ydb/core/base/tablet_types.h>
+#include <ydb/core/protos/tablet.pb.h>
 #include <ydb/core/util/tuples.h>
 
 #include <ydb/library/actors/core/actorid.h>
@@ -40,10 +41,19 @@ public:
         bool IsEmpty() const {
             return !Used && !Demand && !Reclaimable;
         }
+
+        // Picks the memory fields the tablet actually reported out of a metrics tick
+        static TReportUpdate FromMetrics(const NKikimrTabletBase::TMetrics& metrics);
     };
 
-    // Merges the update into the tablet's last report; true when the sums changed
-    bool SetReport(TTabletKey tablet, TActorId executor, TTabletTypes::EType tabletType, const TReportUpdate& update);
+    // What one SetReport changed
+    struct TSetReportResult {
+        bool SumsChanged = false;
+        bool NewSlot = false; // the tablet had no slot before this report
+    };
+
+    // Merges the update into the tablet's last report
+    TSetReportResult SetReport(TTabletKey tablet, TActorId executor, TTabletTypes::EType tabletType, const TReportUpdate& update);
 
     // Drops the tablet's slot, so its last report leaves the sums; true when it had one
     bool Forget(TTabletKey tablet);
@@ -56,10 +66,6 @@ public:
 
     size_t GetSlotsCount() const {
         return Slots.size();
-    }
-
-    bool Has(TTabletKey tablet) const {
-        return Slots.contains(tablet);
     }
 
     // What the registrar reports for the Tablets kind

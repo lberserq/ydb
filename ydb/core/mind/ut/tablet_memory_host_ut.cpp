@@ -23,7 +23,11 @@ Y_UNIT_TEST_SUITE(TTabletMemoryHost) {
 
 Y_UNIT_TEST(SplitsTheReportIntoStateAndElasticPart) {
     TTabletMemoryHost host;
-    UNIT_ASSERT(host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, Report(100, 160, 40)));
+    const auto first = host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, Report(100, 160, 40));
+    UNIT_ASSERT(first.SumsChanged);
+    UNIT_ASSERT(first.NewSlot);
+    // The same tablet reporting again is not a new slot
+    UNIT_ASSERT(!host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, Report(100, 160, 40)).NewSlot);
 
     UNIT_ASSERT_VALUES_EQUAL(host.GetSums().Total, 60u);
     UNIT_ASSERT_VALUES_EQUAL(host.GetSums().Elastic, 40u);
@@ -128,6 +132,24 @@ Y_UNIT_TEST(PerTypeSensorsFollowTheSlots) {
     host.UpdateCounters(counters);
     UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(dataShard + "Used")->Val(), 200);
     UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(dataShard + "Reclaimable")->Val(), 0);
+}
+
+Y_UNIT_TEST(PerTypeSensorsFallToZeroWhenTheLastTabletOfATypeLeaves) {
+    TTabletMemoryHost host;
+    host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, Report(100, 120, 20));
+    host.SetReport({2, 0}, MakeExecutor(2), TTabletTypes::KeyValue, Report(50, 50, 10));
+
+    auto counters = MakeIntrusive<::NMonitoring::TDynamicCounters>();
+    host.UpdateCounters(counters);
+    const TString keyValue = TStringBuilder() << "TabletMemory/" << TTabletTypes::TypeToStr(TTabletTypes::KeyValue) << "/";
+    UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(keyValue + "Used")->Val(), 50);
+
+    // The row of a type that lost its last tablet stays, so the sensors are published as 0 instead of freezing
+    UNIT_ASSERT(host.Forget({2, 0}));
+    host.UpdateCounters(counters);
+    UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(keyValue + "Used")->Val(), 0);
+    UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(keyValue + "Demand")->Val(), 0);
+    UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(keyValue + "Reclaimable")->Val(), 0);
 }
 
 Y_UNIT_TEST(ClearDropsEverything) {
