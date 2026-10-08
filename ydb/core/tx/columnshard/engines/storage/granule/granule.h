@@ -177,10 +177,6 @@ public:
         return ActualizationIndex->CollectMetadataRequests(Portions);
     }
 
-    std::vector<TCSMetadataRequest> CollectMoveDataMetadataRequests() {
-        return ActualizationIndex->CollectMoveDataMetadataRequests(Portions, InsertedPortionsById);
-    }
-
     TInsertWriteId BuildNextInsertWriteId() {
         return (TInsertWriteId)AtomicIncrement(LastInsertWriteId);
     }
@@ -274,9 +270,12 @@ public:
         ActualizationIndex->RefreshScheme(context);
     }
 
-    void StartMoveData(const THashSet<ui32>& targetGroups) {
-        NActualizer::TAddExternalContext context(HasAppData() ? AppDataVerified().TimeProvider->Now() : TInstant::Now(), Portions);
-        ActualizationIndex->StartMoveData(targetGroups, context, InsertedPortionsById);
+    void StartMoveData() {
+        ActualizationIndex->StartMoveData();
+    }
+
+    void AddPortionToMove(const TPortionInfo& portion) {
+        ActualizationIndex->AddPortionToMove(portion);
     }
 
     void StopMoveData() {

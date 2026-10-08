@@ -9,10 +9,13 @@
 #include <ydb/core/tx/columnshard/columnshard_private_events.h>
 #include <ydb/core/tx/columnshard/engines/changes/cleanup_portions.h>
 #include <ydb/core/tx/columnshard/engines/changes/ttl.h>
+#include <ydb/core/tx/columnshard/engines/column_engine_logs.h>
 #include <ydb/core/tx/columnshard/engines/storage/indexes/max/meta.h>
 #include <ydb/core/tx/columnshard/hooks/testing/controller.h>
 #include <ydb/core/tx/columnshard/test_helper/columnshard_ut_common.h>
 #include <ydb/core/tx/columnshard/test_helper/controllers.h>
+
+#include <ydb/library/testlib/helpers.h>
 
 #include <library/cpp/testing/unittest/registar.h>
 #include <util/generic/algorithm.h>
@@ -422,6 +425,140 @@ Y_UNIT_TEST_SUITE(TColumnShardMoveDataE2E) {
         const auto response = f.DriveGateWithWrite(150, 2, 1000, 1001);
         UNIT_ASSERT_C(response, "an uncommitted write outside the moved group held the answer back");
         f.AssertDrainedSuccess(response);
+    }
+
+    Y_UNIT_TEST(SuccessIgnoresCleanupOfRejectedSeededPortion) {
+        TMoveDataFixture f;
+        f.Controller->DisableBackground(EBackground::TTL);
+        f.Write(1, 0, 1000);
+        f.Controller->WaitCompactions(TDuration::Seconds(10));
+        f.ReassignPastWrittenData();
+        f.Controller->DisableBackground(EBackground::Compaction);
+        const auto writeIds = f.WriteUncommitted(100, 5000, 5010, 7);
+        f.ProposeLockCommit(3, writeIds, 7);
+
+        // Keep the session alive after the target portions have been rewritten and cleaned up.
+        f.Controller->DisableBackground(EBackground::GC);
+        f.StartMove();
+        UNIT_ASSERT(!f.DriveGateWithWrite(150, 2, 1000, 1001));
+        const auto queues = f.Controller->GetTheOnlyShard()->GetIndexAs<NOlap::TColumnEngineForLogs>().GetMoveDataQueueSizes();
+        UNIT_ASSERT_VALUES_EQUAL(queues.GetTotal(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(queues.Retired, 0);
+        const auto counters =
+            GetServiceCounters(f.Runtime.GetDynamicCounters(0), "tablets")->GetSubgroup("subsystem", "columnshard")->GetSubgroup("module_id",
+                "CS");
+        UNIT_ASSERT_GT(counters->GetCounter("Deriviative/MoveData/Portions/Rejected/Count", true)->Val(), 0);
+
+        std::vector<TAutoPtr<IEventHandle>> heldCleanups;
+        auto observer = f.Runtime.AddObserver<IEventHandle>([&](IEventHandle::TPtr& ev) {
+            const auto* writeIndex = AsWriteIndex(ev);
+            const auto cleanup =
+                writeIndex ? std::dynamic_pointer_cast<NOlap::TCleanupPortionsColumnEngineChanges>(writeIndex->IndexChanges) : nullptr;
+            if (cleanup && AnyOf(cleanup->GetPortionsToDrop(), [](const auto& portion) {
+                    return portion->IsAborted();
+                })) {
+                UNIT_ASSERT_C(AllOf(cleanup->GetPortionsToDrop(), [](const auto& portion) {
+                    return portion->IsAborted();
+                }), "the held cleanup must contain only the rejected write in the new group");
+                heldCleanups.emplace_back(ev.Release());
+            }
+        });
+        f.CancelProposedCommit(3);
+        UNIT_ASSERT(!f.DriveGateWithWrite(150, 4, 6000, 6001, [&] {
+            return !heldCleanups.empty();
+        }));
+        UNIT_ASSERT_C(!heldCleanups.empty(), "the rejected portion did not reach cleanup");
+
+        f.Controller->EnableBackground(EBackground::GC);
+        const auto response = f.DriveGate(150);
+        UNIT_ASSERT_C(response, "cleanup of a seeded portion rejected by the group filter held the move back");
+        f.AssertDrainedSuccess(response);
+        for (auto& ev : heldCleanups) {
+            f.Runtime.Send(ev.Release());
+        }
+        UNIT_ASSERT_VALUES_EQUAL(f.ReadRows(), 1001);
+    }
+
+    Y_UNIT_TEST_TWIN(RetiredPortionOutsideTargetDoesNotBlock, retireBeforeScan) {
+        TMoveDataFixture f;
+        f.Controller->DisableBackground(EBackground::TTL);
+        f.Write(1, 0, 1000);
+        f.Controller->WaitCompactions(TDuration::Seconds(10));
+        f.ReassignPastWrittenData();
+        f.Controller->DisableBackground(EBackground::Compaction);
+        f.StartMove();
+        auto response = f.DriveGateWithWrite(150, 2, 1000, 1001);
+        UNIT_ASSERT(response);
+        f.AssertDrainedSuccess(response);
+
+        const auto writeIds = f.WriteUncommitted(100, 5000, 5010, 7);
+        f.ProposeLockCommit(3, writeIds, 7);
+        f.Controller->DisableBackground(EBackground::Cleanup);
+        std::vector<TAutoPtr<IEventHandle>> heldMetadata;
+        bool holdMetadata = !retireBeforeScan;
+        auto observer = f.Runtime.AddObserver<IEventHandle>([&](IEventHandle::TPtr& ev) {
+            if (holdMetadata && ev->HasEvent() && dynamic_cast<const TEvPrivate::TEvMoveDataMetadataResult*>(ev->GetBase())) {
+                heldMetadata.emplace_back(ev.Release());
+            }
+        });
+        if constexpr (retireBeforeScan) {
+            f.CancelProposedCommit(3);
+            f.DriveGate(10);
+            f.StartMove();
+        } else {
+            f.StartMove();
+            UNIT_ASSERT(!f.DriveGate(60, {}, [&] {
+                return !heldMetadata.empty();
+            }));
+            UNIT_ASSERT_C(!heldMetadata.empty(), "no metadata batch was held before classification");
+            f.CancelProposedCommit(3);
+            UNIT_ASSERT(!f.DriveGate(10));
+            holdMetadata = false;
+            for (auto& ev : heldMetadata) {
+                f.Runtime.Send(ev.Release());
+            }
+        }
+        response = f.DriveGate(150);
+        UNIT_ASSERT_C(response, "retirement before metadata classification made an unrelated portion block completion");
+        f.AssertDrainedSuccess(response);
+    }
+
+    Y_UNIT_TEST(IncompleteMetadataBatchIsRetriedBeforeSuccess) {
+        TMoveDataFixture f;
+        f.Controller->DisableBackground(EBackground::TTL);
+        f.Write(1, 0, 1000);
+        f.Controller->WaitCompactions(TDuration::Seconds(10));
+        f.ReassignPastWrittenData();
+        bool injected = false;
+        ui32 replies = 0;
+        auto observer = f.Runtime.AddObserver<IEventHandle>([&](IEventHandle::TPtr& ev) {
+            const auto* result = ev->HasEvent() ? dynamic_cast<const TEvPrivate::TEvMoveDataMetadataResult*>(ev->GetBase()) : nullptr;
+            if (!result) {
+                return;
+            }
+            ++replies;
+            if (!injected) {
+                injected = true;
+                const auto recipient = ev->GetRecipientRewrite();
+                const auto sender = ev->Sender;
+                const ui64 requestId = result->RequestId;
+                ev.Reset(new IEventHandle(recipient, sender,
+                    new TEvPrivate::TEvMoveDataMetadataResult(
+                        requestId, NOlap::NResourceBroker::NSubscribe::TResourceContainer<NOlap::TDataAccessorsResult>::BuildForTest({}))));
+            }
+        });
+        f.StartMove();
+        // The retry delays the rewrite; advance the read snapshot only after that rewrite retires its input.
+        UNIT_ASSERT(!f.DriveGate(150, {}, [&] {
+            return f.Controller->GetTheOnlyShard()->GetIndexAs<NOlap::TColumnEngineForLogs>().GetMoveDataQueueSizes().Retired != 0;
+        }));
+        UNIT_ASSERT(injected);
+        UNIT_ASSERT_GT(replies, 1);
+        UNIT_ASSERT_GT(f.Controller->GetTheOnlyShard()->GetIndexAs<NOlap::TColumnEngineForLogs>().GetMoveDataQueueSizes().Retired, 0);
+        const auto response = f.DriveGateWithWrite(150, 2, 1000, 1001);
+        UNIT_ASSERT_C(response, "the retried metadata batch did not drain the old group");
+        f.AssertDrainedSuccess(response);
+        UNIT_ASSERT_VALUES_EQUAL(f.ReadRows(), 1000);
     }
 
     // A running cleanup has taken its portions out of CleanupPortions but not yet queued their blobs for GC.

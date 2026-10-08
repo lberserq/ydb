@@ -355,8 +355,6 @@ class TColumnShard: public TActor<TColumnShard>, public NTabletFlatExecutor::TTa
     // Takes the sizes the driver already walked the index for, so a gate check adds no walk of its own.
     void CheckMoveDataGate(const TActorContext& ctx, const NOlap::NActualizer::TMoveDataQueueSizes& queues);
     NOlap::NActualizer::TMoveDataQueueSizes GetMoveDataQueueSizes() const;
-    // Driver-side: stops and starts the actualizer for the current target set, clearing TargetsChanged.
-    void RestartMoveDataActualizer();
     void SetupMoveDataRewrites();
     void StartMoveDataDriver(const TActorContext& ctx);
     void StopMoveDataDriver(const TActorContext& ctx);
@@ -562,7 +560,7 @@ private:
 
     // Number of metadata-accessor requests this tablet has in flight; gates SetupMetadata.
     std::shared_ptr<TAtomicCounter> MetadataRequestsInFlight = std::make_shared<TAtomicCounter>();
-    // The move's own count: it gates SetupMoveDataMetadata without queueing behind tiering's requests.
+    // Resource subscriptions for the driver's metadata batches are independent of tiering requests.
     std::shared_ptr<TAtomicCounter> MoveDataMetadataRequestsInFlight = std::make_shared<TAtomicCounter>();
 
     // In-flight forced-compaction requests (ALTER TABLE ... COMPACT). Kept in memory only, mirroring
@@ -637,8 +635,6 @@ private:
     void Handle(TEvPrivate::TEvFindEmptyHistoryIntervalsPortionsReady::TPtr& ev, const TActorContext& ctx);
     void SubmitMetadataRequest(const NOlap::TCSMetadataRequest& request);
     void SetupMetadata();
-    // Re-arms only the move's accessor requests, gated by their own in-flight count so they never queue behind tiering's.
-    void SetupMoveDataMetadata();
     void StartMetadataRequests(std::vector<NOlap::TCSMetadataRequest>&& requests,
         const NOlap::NResourceBroker::NSubscribe::TTaskContext& taskContext, const std::shared_ptr<TAtomicCounter>& inFlight);
     bool SetupTtl();

@@ -148,15 +148,6 @@ public:
         return OptimizerRuntimeSettings;
     }
 
-    std::vector<TCSMetadataRequest> CollectMoveDataMetadataRequests() {
-        std::vector<TCSMetadataRequest> result;
-        for (auto&& i : Tables) {
-            auto r = i.second->CollectMoveDataMetadataRequests();
-            result.insert(result.end(), r.begin(), r.end());
-        }
-        return result;
-    }
-
     std::vector<TCSMetadataRequest> CollectMetadataRequests() {
         std::vector<TCSMetadataRequest> result;
         for (auto&& i : Tables) {
