@@ -8,7 +8,7 @@
 
 namespace NKikimr::NOlap::NActualizer {
 
-void TMoveDataActualizer::RemoveFromActiveQueue(ui64 portionId) {
+void TMoveDataActualizer::RemoveFromActiveQueue(ui64 portionId) noexcept {
     auto it = PortionAddress.find(portionId);
     if (it == PortionAddress.end()) {
         return;
@@ -115,7 +115,7 @@ void TMoveDataActualizer::DoExtractTasks(
 }
 
 TMoveDataQueueSizes TMoveDataActualizer::GetMoveDataQueueSizes(
-    const THashMap<ui64, TPortionInfo::TPtr>& portions, const THashMap<ui64, std::shared_ptr<TWrittenPortionInfo>>& uncommitted) {
+    const THashMap<ui64, TPortionInfo::TPtr>& portions, const THashMap<ui64, std::shared_ptr<TWrittenPortionInfo>>& uncommitted) noexcept {
     for (auto it = RetiredPortionIds.begin(); it != RetiredPortionIds.end();) {
         if (portions.contains(*it) || uncommitted.contains(*it)) {
             ++it;

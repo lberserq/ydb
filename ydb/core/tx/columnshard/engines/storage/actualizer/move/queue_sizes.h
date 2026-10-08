@@ -17,11 +17,11 @@ struct TMoveDataQueueSizes {
     // Not a queue: deliberately outside GetTotal(), it explains where a drained queue went.
     ui64 Rejected = 0;
 
-    ui64 GetTotal() const {
+    ui64 GetTotal() const noexcept {
         return Pending + ConfirmedToMove + InFlight + Uncommitted;
     }
 
-    TMoveDataQueueSizes& operator+=(const TMoveDataQueueSizes& item) {
+    TMoveDataQueueSizes& operator+=(const TMoveDataQueueSizes& item) noexcept {
         Pending += item.Pending;
         ConfirmedToMove += item.ConfirmedToMove;
         InFlight += item.InFlight;

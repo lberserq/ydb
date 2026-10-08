@@ -2,13 +2,13 @@
 
 #include "columnshard_private_events.h"
 
+#include <ydb/core/tx/columnshard/data_accessor/request.h>
 #include <ydb/core/tx/columnshard/engines/storage/actualizer/move/queue_sizes.h>
 
 #include <ydb/library/actors/core/actor_bootstrapped.h>
 #include <ydb/library/actors/core/hfunc.h>
 
 #include <deque>
-#include <functional>
 
 namespace NKikimr::NColumnShard {
 
@@ -18,7 +18,6 @@ class TColumnShard;
 class TMoveDataMetadataScan {
 public:
     using TPortionAddress = std::pair<NOlap::TInternalPathId, ui64>;
-    using TPortionLookup = std::function<NOlap::TPortionInfo::TPtr(const TPortionAddress&)>;
 
 private:
     std::deque<TPortionAddress> Candidates;
@@ -31,15 +30,37 @@ public:
         Candidates.push_back(address);
     }
 
-    ui64 GetPendingCount() const {
+    ui64 GetPendingCount() const noexcept {
         return Candidates.size() + Pending.size();
     }
 
+    template <class TPortionLookup>
     std::shared_ptr<NOlap::TDataAccessorsRequest> BuildRequest(
-        const NOlap::ISnapshotSchema::TPtr& schema, ui64 memorySoftLimit, const TPortionLookup& lookup);
-    std::vector<TPortionAddress> TakePendingPortions();
+        const NOlap::ISnapshotSchema::TPtr& schema, const ui64 memorySoftLimit, TPortionLookup&& lookup) {
+        AFL_VERIFY(Pending.empty());
+        auto request = std::make_shared<NOlap::TDataAccessorsRequest>(NOlap::NGeneralCache::TPortionsMetadataCachePolicy::EConsumer::MOVE_DATA);
+        ui64 memory = 0;
+        while (!Candidates.empty()) {
+            const auto address = Candidates.front();
+            Candidates.pop_front();
+            const auto portion = lookup(address);
+            if (!portion) {
+                continue;
+            }
+            Pending.emplace_back(address);
+            request->AddPortion(portion);
+            // Match resource admission and estimate each portion only once.
+            memory += portion->PredictAccessorsMemory(schema);
+            if (memory >= memorySoftLimit) {
+                break;
+            }
+        }
+        return request;
+    }
 
-    static bool HasBlobInGroups(const std::vector<NOlap::TUnifiedBlobId>& blobIds, const THashSet<ui32>& groups);
+    std::vector<TPortionAddress> TakePendingPortions() noexcept;
+
+    static bool HasBlobInGroups(const std::vector<NOlap::TUnifiedBlobId>& blobIds, const THashSet<ui32>& groups) noexcept;
 };
 
 // Stateless v1: no persistence; on restart Hive re-sends TEvMoveData.
@@ -73,7 +94,7 @@ private:
         ctx.Schedule(Cadence, new TEvPrivate::TEvMoveDataWakeup());
     }
 
-    bool IsOwnerAlive() const {
+    bool IsOwnerAlive() const noexcept {
         return TabletActivity->Val() != 0;
     }
 

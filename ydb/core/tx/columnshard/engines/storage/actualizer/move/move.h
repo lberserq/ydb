@@ -28,7 +28,7 @@ private:
     // Selected writes waiting for commit or abort before they can be rewritten or cleaned up.
     THashSet<ui64> UncommittedPortionIds;
 
-    void RemoveFromActiveQueue(ui64 portionId);
+    void RemoveFromActiveQueue(ui64 portionId) noexcept;
     void QueueSelectedPortion(const TPortionInfo& info);
 
 protected:
@@ -43,9 +43,9 @@ public:
 
     // Drop selected retired ids absent from both granule maps; ids still present there await cleanup.
     TMoveDataQueueSizes GetMoveDataQueueSizes(
-        const THashMap<ui64, TPortionInfo::TPtr>& portions, const THashMap<ui64, std::shared_ptr<TWrittenPortionInfo>>& uncommitted);
+        const THashMap<ui64, TPortionInfo::TPtr>& portions, const THashMap<ui64, std::shared_ptr<TWrittenPortionInfo>>& uncommitted) noexcept;
 
-    explicit TMoveDataActualizer(const TVersionedIndex& versionedIndex)
+    explicit TMoveDataActualizer(const TVersionedIndex& versionedIndex) noexcept
         : VersionedIndex(versionedIndex)
     {
     }

@@ -96,7 +96,7 @@ public:
     TActorId Launcher;
 
     // A non-empty schemaTxBody replaces the default standalone table of Table.Schema.
-    explicit TMoveDataFixture(const bool moveDataEnabled = true, const TString& schemaTxBody = {})
+    explicit TMoveDataFixture(const bool moveDataEnabled = true, const TString& schemaTxBody = {}, const bool initializeSchema = true)
         : Controller(SetupRuntime(moveDataEnabled))
     {
         // Without a real mediator the rewrite plan-step never ages, so set staleness to zero.
@@ -105,7 +105,10 @@ public:
         Launcher = Runtime.AllocateEdgeActor();
         TabletActorId = BootTablet(Runtime, MakeTabletInfo(TabletId, { { 0, OldGroup } }), Launcher);
         Sender = Runtime.AllocateEdgeActor();
-        ReadStep = schemaTxBody.empty() ? SetupSchema(Runtime, Sender, TableId, Table) : SetupSchema(Runtime, Sender, schemaTxBody, SchemaTxId);
+        if (initializeSchema) {
+            ReadStep =
+                schemaTxBody.empty() ? SetupSchema(Runtime, Sender, TableId, Table) : SetupSchema(Runtime, Sender, schemaTxBody, SchemaTxId);
+        }
     }
 
     // The write id doubles as the tx id.
@@ -279,6 +282,23 @@ void RunMoveDataToCompletion(const bool moveDataEnabled) {
 
 // Whole chain: TEvMoveData -> selection -> accessor metadata -> rewrite -> response.
 Y_UNIT_TEST_SUITE(TColumnShardMoveDataE2E) {
+    Y_UNIT_TEST(MoveDataStartedWithoutIndexCompletesAfterSchemaInitialization) {
+        TMoveDataFixture f(/*moveDataEnabled=*/true, {}, /*initializeSchema=*/false);
+        UNIT_ASSERT(!f.Controller->GetTheOnlyShard()->HasIndex());
+        // An unused group has nothing to evacuate, even before the tablet receives its first schema.
+        f.StartMove({ MidGroup });
+        auto response = f.DriveGate(10);
+        UNIT_ASSERT(!f.Controller->GetTheOnlyShard()->HasIndex());
+        // Background GC starts once a schema exists; the earlier driver turns must tolerate its absence.
+        TestTableDescription table;
+        Y_UNUSED(SetupSchema(f.Runtime, f.Sender, TableId, table));
+        if (!response) {
+            response = f.DriveGate(150);
+        }
+        UNIT_ASSERT_C(response, "MoveData did not finish after schema initialization");
+        f.AssertDrainedSuccess(response);
+    }
+
     Y_UNIT_TEST(MoveDataRewritesPortionsAndAnswersHive) {
         RunMoveDataToCompletion(/*moveDataEnabled=*/true);
     }

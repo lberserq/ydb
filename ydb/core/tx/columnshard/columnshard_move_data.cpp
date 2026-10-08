@@ -6,8 +6,6 @@
 #include <ydb/core/tx/columnshard/data_accessor/request.h>
 #include <ydb/core/tx/columnshard/engines/portions/written.h>
 
-#include <util/generic/size_literals.h>
-
 #define YDB_LOG_THIS_FILE_COMPONENT NKikimrServices::TX_COLUMNSHARD
 
 namespace NKikimr::NColumnShard {
@@ -23,7 +21,7 @@ THashSet<ui32> RequestedGroups(const NKikimrTabletBase::TEvMoveData& record) {
 }
 
 // Same contract as keyvalue and blob_depot: a group that is still the latest entry keeps taking writes, so the move could never converge.
-std::optional<ui32> FindLiveGroup(const TTabletStorageInfo& info, const THashSet<ui32>& groups) {
+std::optional<ui32> FindLiveGroup(const TTabletStorageInfo& info, const THashSet<ui32>& groups) noexcept {
     if (groups.empty()) {
         return std::nullopt;
     }
@@ -60,12 +58,12 @@ class TMoveDataMetadataResultProcessor: public NOlap::IMetadataAccessorResultPro
         TActivationContext::Send(Driver, std::make_unique<TEvPrivate::TEvMoveDataMetadataResult>(RequestId, std::move(result)));
     }
 
-    bool DoIsMoveData() const override {
+    bool DoIsMoveData() const noexcept override {
         return true;
     }
 
 public:
-    TMoveDataMetadataResultProcessor(const TActorId driver, const ui64 requestId)
+    TMoveDataMetadataResultProcessor(const TActorId driver, const ui64 requestId) noexcept
         : Driver(driver)
         , RequestId(requestId)
     {
@@ -97,43 +95,20 @@ void TMoveDataMetadataScan::AddCandidate(const NOlap::TPortionInfo& portion, con
     Candidates.emplace_back(portion.GetPathId(), portion.GetPortionId());
 }
 
-std::shared_ptr<NOlap::TDataAccessorsRequest> TMoveDataMetadataScan::BuildRequest(
-    const NOlap::ISnapshotSchema::TPtr& schema, const ui64 memorySoftLimit, const TPortionLookup& lookup) {
-    AFL_VERIFY(Pending.empty());
-    auto request = std::make_shared<NOlap::TDataAccessorsRequest>(NOlap::NGeneralCache::TPortionsMetadataCachePolicy::EConsumer::MOVE_DATA);
-    ui64 memory = 0;
-    while (!Candidates.empty()) {
-        const auto address = Candidates.front();
-        Candidates.pop_front();
-        const auto portion = lookup(address);
-        if (!portion) {
-            continue;
-        }
-        Pending.emplace_back(address);
-        request->AddPortion(portion);
-        // Match resource admission and estimate each portion only once.
-        memory += portion->PredictAccessorsMemory(schema);
-        if (memory >= memorySoftLimit) {
-            break;
-        }
-    }
-    return request;
-}
-
-std::vector<TMoveDataMetadataScan::TPortionAddress> TMoveDataMetadataScan::TakePendingPortions() {
+std::vector<TMoveDataMetadataScan::TPortionAddress> TMoveDataMetadataScan::TakePendingPortions() noexcept {
     std::vector<TPortionAddress> result;
     result.swap(Pending);
     return result;
 }
 
-bool TMoveDataMetadataScan::HasBlobInGroups(const std::vector<NOlap::TUnifiedBlobId>& blobIds, const THashSet<ui32>& groups) {
-    return AnyOf(blobIds, [&groups](const NOlap::TUnifiedBlobId& blobId) {
+bool TMoveDataMetadataScan::HasBlobInGroups(const std::vector<NOlap::TUnifiedBlobId>& blobIds, const THashSet<ui32>& groups) noexcept {
+    return AnyOf(blobIds, [&groups](const NOlap::TUnifiedBlobId& blobId) noexcept {
         return groups.contains(blobId.GetDsGroup());
     });
 }
 
 void TColumnShard::Handle(TEvTablet::TEvMoveData::TPtr& ev, const TActorContext& ctx) {
-    if (!HasAppData() || !AppData()->FeatureFlags.GetEnableColumnshardMoveData()) {
+    if (!AppData()->FeatureFlags.GetEnableColumnshardMoveData()) {
         TTabletExecutedFlat::Handle(ev);
         return;
     }
@@ -217,14 +192,8 @@ NOlap::NActualizer::TMoveDataQueueSizes TColumnShard::GetMoveDataQueueSizes() co
 }
 
 void TColumnShard::CheckMoveDataGate(const TActorContext& ctx, const NOlap::NActualizer::TMoveDataQueueSizes& queues) {
-    if (!MoveDataState.Active) {
-        return;
-    }
+    // The driver checked session activity and applied target changes in this same mailbox turn.
     Counters.GetCSCounters().OnMoveDataGateChecked();
-    if (MoveDataState.TargetsChanged) {
-        Counters.GetCSCounters().OnMoveDataGateBlockedByReseed();
-        return;
-    }
 
     Counters.GetCSCounters().OnMoveDataQueues(queues.Pending, queues.ConfirmedToMove, queues.InFlight, queues.Uncommitted, queues.Retired);
     if (queues.Rejected > MoveDataState.ReportedRejections) {
@@ -257,7 +226,7 @@ void TColumnShard::CheckMoveDataGate(const TActorContext& ctx, const NOlap::NAct
     if (defaultOperator->HasBlobsForGroups(MoveDataState.TargetGroups)) {
         // Same wait either way, but a shared or borrowed link is not ours to collect, so it gets its own sensor.
         const auto& sharedBlobs = defaultOperator->GetSharedBlobs();
-        if (sharedBlobs && sharedBlobs->HasBlobsForGroups(MoveDataState.TargetGroups)) {
+        if (sharedBlobs->HasBlobsForGroups(MoveDataState.TargetGroups)) {
             Counters.GetCSCounters().OnMoveDataGateBlockedByShared();
             YDB_LOG_INFO("MoveData gate waits for shared blobs", {"tabletId", TabletID()});
         } else {
@@ -282,10 +251,7 @@ void TMoveDataDriver::SubmitMetadataBatch(const TActorContext& ctx) {
     if (PendingRequestId || !MetadataScan.GetPendingCount() || ctx.Now() < RetryMetadataAfter) {
         return;
     }
-    if (!Self->HasIndex()) {
-        MetadataScan = TMoveDataMetadataScan();
-        return;
-    }
+    // Pending candidates were captured from this index, which lives until tablet shutdown.
     auto& index = Self->MutableIndexAs<NOlap::TColumnEngineForLogs>();
     auto request = MetadataScan.BuildRequest(index.GetVersionedIndex().GetLastSchema(),
         NYDBTest::TControllers::GetColumnShardController()->GetMetadataRequestSoftMemoryLimit(),
@@ -303,10 +269,8 @@ void TMoveDataDriver::SubmitMetadataBatch(const TActorContext& ctx) {
 }
 
 void TColumnShard::SetupMoveDataRewrites() {
-    if (!MoveDataState.Active || !HasIndex()) {
-        return;
-    }
-    const ui64 memoryUsageLimit = HasAppData() ? AppDataVerified().ColumnShardConfig.GetTieringsMemoryLimit() : 512_MB;
+    // The active driver calls this only when the index has selected portions ready to rewrite.
+    const ui64 memoryUsageLimit = AppDataVerified().ColumnShardConfig.GetTieringsMemoryLimit();
     std::vector<std::shared_ptr<NOlap::TTTLColumnEngineChanges>> indexChanges = TablesManager.MutablePrimaryIndex().StartTtl(
         {}, DataLocksManager, memoryUsageLimit, NOlap::NActualizer::EActualizationScope::MoveDataOnly);
     if (indexChanges.empty()) {
@@ -358,11 +322,9 @@ void TMoveDataDriver::Handle(TEvPrivate::TEvMoveDataMetadataResult::TPtr& ev, co
     PendingRequestId = 0;
     bool retry = false;
     const auto& result = ev->Get()->Result.GetValue();
+    auto& index = Self->MutableIndexAs<NOlap::TColumnEngineForLogs>();
     for (const auto& address : MetadataScan.TakePendingPortions()) {
-        if (!Self->HasIndex()) {
-            continue;
-        }
-        const auto granule = Self->GetIndexAs<NOlap::TColumnEngineForLogs>().GetGranuleOptional(address.first);
+        const auto granule = index.GetGranuleOptional(address.first);
         const auto portion = granule ? granule->GetPortionOptional(address.second, false) : nullptr;
         // Absence follows cleanup Complete, which has published the old blobs to the GC queues.
         if (!portion) {
