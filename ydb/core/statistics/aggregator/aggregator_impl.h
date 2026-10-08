@@ -95,6 +95,11 @@ private:
     void OnDetach(const TActorContext& ctx) override;
     void OnTabletDead(TEvTablet::TEvTabletDead::TPtr& ev, const TActorContext& ctx) override;
     void OnActivateExecutor(const TActorContext& ctx) override;
+
+    bool IsExecutorGCChannel(ui32 channel) const override {
+        return channel != 0;
+    }
+
     void DefaultSignalTabletActive(const TActorContext& ctx) override;
     bool OnRenderAppHtmlPage(NMon::TEvRemoteHttpInfo::TPtr ev, const TActorContext &ctx) override;
     void SubscribeForConfigChanges(const TActorContext& ctx);

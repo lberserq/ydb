@@ -47,3 +47,7 @@ RECURSE(
     tx_allocator_client
     tx_proxy
 )
+
+RECURSE_FOR_TESTS(
+    ut_unused_executor_channels
+)
