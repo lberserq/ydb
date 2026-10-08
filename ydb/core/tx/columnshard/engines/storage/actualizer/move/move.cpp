@@ -213,8 +213,11 @@ std::vector<TCSMetadataRequest> TMoveDataActualizer::BuildMoveDataMetadataReques
         return {};
     }
     const ui64 batchMemorySoftLimit = NYDBTest::TControllers::GetColumnShardController()->GetMetadataRequestSoftMemoryLimit();
+    // Match StartMetadataRequests admission, including portions written under an older schema.
+    const auto schema = VersionedIndex.GetLastSchema();
     std::vector<TCSMetadataRequest> requests;
     std::shared_ptr<TDataAccessorsRequest> currentRequest;
+    ui64 currentRequestMemory = 0;
 
     for (auto portionId : PendingPortionIds) {
         TPortionInfo::TPtr portion;
@@ -230,9 +233,11 @@ std::vector<TCSMetadataRequest> TMoveDataActualizer::BuildMoveDataMetadataReques
             currentRequest = std::make_shared<TDataAccessorsRequest>(NGeneralCache::TPortionsMetadataCachePolicy::EConsumer::MOVE_DATA);
         }
         currentRequest->AddPortion(portion);
-        if (currentRequest->PredictAccessorsMemory(portion->GetSchema(VersionedIndex)) >= batchMemorySoftLimit) {
+        currentRequestMemory += portion->PredictAccessorsMemory(schema);
+        if (currentRequestMemory >= batchMemorySoftLimit) {
             requests.emplace_back(currentRequest, std::make_shared<TMoveDataActualizationReply>(self));
             currentRequest.reset();
+            currentRequestMemory = 0;
         }
     }
     if (currentRequest) {
@@ -242,14 +247,18 @@ std::vector<TCSMetadataRequest> TMoveDataActualizer::BuildMoveDataMetadataReques
 }
 
 TMoveDataQueueSizes TMoveDataActualizer::GetMoveDataQueueSizes(
-    const THashMap<ui64, TPortionInfo::TPtr>& portions, const THashMap<ui64, std::shared_ptr<TWrittenPortionInfo>>& uncommitted) const {
-    const ui64 retired = CountIf(RetiredPortionIds, [&](const ui64 portionId) {
-        return portions.contains(portionId) || uncommitted.contains(portionId);
-    });
+    const THashMap<ui64, TPortionInfo::TPtr>& portions, const THashMap<ui64, std::shared_ptr<TWrittenPortionInfo>>& uncommitted) {
+    for (auto it = RetiredPortionIds.begin(); it != RetiredPortionIds.end();) {
+        if (portions.contains(*it) || uncommitted.contains(*it)) {
+            ++it;
+        } else {
+            RetiredPortionIds.erase(it++);
+        }
+    }
     return TMoveDataQueueSizes{ .Pending = PendingPortionIds.size(), .ConfirmedToMove = PortionAddress.size(),
         .InFlight = InFlightPortionIds.size(),
         .Uncommitted = UncommittedOnTarget.size(),
-        .Retired = retired,
+        .Retired = RetiredPortionIds.size(),
         .Rejected = RejectedPortions };
 }
 

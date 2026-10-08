@@ -18,6 +18,8 @@ namespace NKikimr::NOlap::NActualizer {
 
 // Rewrites portions out of the given BS groups; the filter needs a loaded accessor for BlobIds.
 class TMoveDataActualizer: public IActualizer {
+    friend struct TMoveDataActualizerTestAccess;
+
 private:
     const THashSet<ui32> TargetGroups;
     const TVersionedIndex& VersionedIndex;
@@ -58,9 +60,9 @@ public:
     std::vector<TCSMetadataRequest> BuildMoveDataMetadataRequests(const THashMap<ui64, TPortionInfo::TPtr>& portions,
         const THashMap<ui64, std::shared_ptr<TWrittenPortionInfo>>& uncommitted, const std::shared_ptr<TMoveDataActualizer>& self);
 
-    // Retired is counted against the granule's maps: a retired id still present there awaits cleanup.
+    // Drop retired ids absent from both granule maps; ids still present there await cleanup.
     TMoveDataQueueSizes GetMoveDataQueueSizes(
-        const THashMap<ui64, TPortionInfo::TPtr>& portions, const THashMap<ui64, std::shared_ptr<TWrittenPortionInfo>>& uncommitted) const;
+        const THashMap<ui64, TPortionInfo::TPtr>& portions, const THashMap<ui64, std::shared_ptr<TWrittenPortionInfo>>& uncommitted);
 
     // Once, right after construction: a new target set gets a new actualizer.
     void Seed(const TAddExternalContext& externalContext, const THashMap<ui64, std::shared_ptr<TWrittenPortionInfo>>& uncommitted);
