@@ -12379,12 +12379,16 @@ Y_UNIT_TEST_SUITE(THiveTest) {
             new NMemory::TEvConsumerLimit(NMemory::EMemoryConsumerKind::TabletsElastic, 10_MB, NMemory::EMemoryZone::Green)));
         env.Runtime.SimulateSleep(TDuration::Seconds(1));
         ui32 feedback = 0;
+        const auto recipient = env.Runtime.AllocateEdgeActor();
         const auto observer = env.Runtime.AddObserver<NMemory::TEvMemoryZone>([&](auto& event) {
             if (event->Get()->Share || event->Get()->ClearShare) {
                 ++feedback;
             }
+            // Edge mailbox events are observed again until consumed by the test.
+            if (event->Recipient == recipient) {
+                event.Reset();
+            }
         });
-        const auto recipient = env.Runtime.AllocateEdgeActor();
         for (ui32 i = 0; i != 100; ++i) {
             env.Runtime.Send(new IEventHandle(env.Controller->Registrant, recipient,
                 new TEvLocal::TEvTabletMetrics(env.TabletId, 0, {}, recipient,
