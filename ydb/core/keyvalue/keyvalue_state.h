@@ -315,6 +315,7 @@ protected:
     THashSet<ui64> CmdTrimLeakedBlobsUids;
     std::list<THolder<TIntermediate>> CmdTrimLeakedBlobsPostponed;
     THashMap<ui64, decltype(CmdTrimLeakedBlobsPostponed)::iterator> PostponedTrimByUid;
+    ui64 PostponedTrimBytes = 0;
     THashMap<ui64, TInstant> RequestInputTime;
     ui64 NextRequestUid = 1;
     TIntrusivePtr<TCollectOperation> CollectOperation;
@@ -590,6 +591,10 @@ public:
     void PublishAdmissionCounters();
     void AdmitIntermediate(THolder<TIntermediate>&& intermediate);
     void StartAdmitted(THolder<TIntermediate>&& intermediate, NMemory::EAdmitSource source);
+
+    ui64 GetMemoryWaitingForGC() const {
+        return PostponedTrimBytes;
+    }
 
     NMemory::TMemoryAdmissionStats GetMemoryAdmissionStats() const {
         return Admission.GetStats();

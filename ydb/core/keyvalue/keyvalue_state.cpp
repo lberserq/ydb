@@ -2095,6 +2095,7 @@ void TKeyValueState::PostponeTrim(THolder<TIntermediate>&& intermediate) {
         AddAdmissionDeadline(*intermediate);
     }
     const ui64 uid = intermediate->RequestUid;
+    PostponedTrimBytes += GetBudgetCharge(*intermediate);
     CmdTrimLeakedBlobsPostponed.push_back(std::move(intermediate));
     PostponedTrimByUid.emplace(uid, std::prev(CmdTrimLeakedBlobsPostponed.end()));
 }
@@ -2128,6 +2129,7 @@ void TKeyValueState::OnAdmissionDeadline() {
         if (!item) {
             const auto trim = PostponedTrimByUid.find(uid);
             if (trim != PostponedTrimByUid.end()) {
+                PostponedTrimBytes -= GetBudgetCharge(**trim->second);
                 item.emplace(std::move(*trim->second));
                 CmdTrimLeakedBlobsPostponed.erase(trim->second);
                 PostponedTrimByUid.erase(trim);
@@ -2166,12 +2168,27 @@ ui64 TKeyValueState::GetBudgetCharge(const TIntermediate& intermediate) {
 
 void TKeyValueState::StartAdmittedIntermediate(THolder<TIntermediate>&& intermediate, NMemory::EAdmitSource source) {
     const bool alreadyStarted = intermediate->MemoryAdmissionStarted;
+    const bool expired = intermediate->Deadline != TInstant::Max() &&
+        intermediate->Deadline <= TAppData::TimeProvider->Now();
+    if (source == NMemory::EAdmitSource::FromQueue) {
+        intermediate->WaitedInMemoryAdmission = true;
+        if (expired && AppData(TActivationContext::AsActorContext())->FeatureFlags.GetEnableTabletMemoryHost()) {
+            intermediate->AdmissionTimedOut = true;
+        }
+    }
+    if (!alreadyStarted && intermediate->TrimLeakedBlobs && IsCollectEventSent &&
+        !intermediate->AdmissionTimedOut && !expired) {
+        // GC-ineligible work yields the admission slot and rejoins after GC completes.
+        // Its resident payload remains charged in the owner's GC waiting ledger.
+        const ui64 uid = intermediate->RequestUid;
+        PostponeTrim(std::move(intermediate));
+        Admission.Release(uid);
+        PublishAdmissionCounters();
+        return;
+    }
     intermediate->MemoryAdmissionStarted = true;
     RemoveAdmissionDeadline(intermediate->RequestUid);
-    if (intermediate->Deadline != TInstant::Max() && intermediate->Deadline <= TAppData::TimeProvider->Now()) {
-        intermediate->AdmissionTimedOut = true;
-    }
-    if (!alreadyStarted && source == NMemory::EAdmitSource::FromQueue) {
+    if (!alreadyStarted && intermediate->WaitedInMemoryAdmission) {
         CountLatencyQueue(intermediate->Stat);
     }
     if (!alreadyStarted && intermediate->Stat.RequestType == TRequestType::ReadOnlyInline) {
@@ -3753,10 +3770,9 @@ void TKeyValueState::RegisterReadRequestActor(const TActorContext &ctx, THolder<
 void TKeyValueState::RegisterRequestActor(const TActorContext &ctx, THolder<TIntermediate> &&intermediate,
         const TTabletStorageInfo *info, ui32 tabletGeneration)
 {
-    if (intermediate->Deadline != TInstant::Max() && intermediate->Deadline <= TAppData::TimeProvider->Now()) {
-        intermediate->AdmissionTimedOut = true;
-    }
-    if (intermediate->TrimLeakedBlobs && !intermediate->AdmissionTimedOut) {
+    const bool expired = intermediate->Deadline != TInstant::Max() &&
+        intermediate->Deadline <= TAppData::TimeProvider->Now();
+    if (intermediate->TrimLeakedBlobs && !intermediate->AdmissionTimedOut && !expired) {
         if (IsCollectEventSent) {
             PostponeTrim(std::move(intermediate));
             return;
@@ -3826,9 +3842,14 @@ void TKeyValueState::ProcessPostponedTrims(const TActorContext& ctx, const TTabl
         CmdTrimLeakedBlobsPostponed.clear();
         PostponedTrimByUid.clear();
         for (auto& interm : postponed) {
+            PostponedTrimBytes -= GetBudgetCharge(*interm);
             RemoveAdmissionDeadline(interm->RequestUid);
             const auto requestType = interm->Stat.RequestType;
-            if (!interm->MemoryAdmissionStarted &&
+            if (AppData(ctx)->FeatureFlags.GetEnableTabletMemoryHost() &&
+                interm->Deadline != TInstant::Max() && interm->Deadline <= TAppData::TimeProvider->Now()) {
+                interm->AdmissionTimedOut = true;
+                StartAdmittedIntermediate(std::move(interm), NMemory::EAdmitSource::FromQueue);
+            } else if (!interm->MemoryAdmissionStarted &&
                 (requestType == TRequestType::WriteOnly || requestType == TRequestType::ReadOnlyInline)) {
                 AdmitIntermediate(std::move(interm));
             } else {

@@ -4395,7 +4395,7 @@ Y_UNIT_TEST(TestAdmittedTrimStillExpiresWhileGCIsStalled) {
     tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
     UNIT_ASSERT(!held.empty());
     SetTabletMemoryZone(tc, tabletActor, NMemory::EMemoryZone::Green);
-    UNIT_ASSERT_VALUES_EQUAL(GetTabletState(tc, tabletActor).GetMemoryAdmissionStats().RunningCount, 2u);
+    UNIT_ASSERT_VALUES_EQUAL(GetTabletState(tc, tabletActor).GetMemoryAdmissionStats().RunningCount, 1u);
     const auto reply = ReceiveKeyValueResponse(tc);
     UNIT_ASSERT_VALUES_EQUAL(reply.GetCookie(), 123u);
     UNIT_ASSERT_VALUES_EQUAL(reply.GetStatus(), NMsgBusProxy::MSTATUS_TIMEOUT);
@@ -4407,6 +4407,111 @@ Y_UNIT_TEST(TestAdmittedTrimStillExpiresWhileGCIsStalled) {
     }
     puts.ReleaseAll(tc);
     ExpectWriteOk(tc);
+}
+
+Y_UNIT_TEST(TestGCBlockedTrimYieldsRedSlotAndRetainsPayloadCharge) {
+    std::optional<TActorId> tabletActor;
+    TTestContext tc;
+    TFinalizer finalizer(tc);
+    bool activeZone = false;
+    tc.Prepare(INITIAL_TEST_DISPATCH_NAME, TrackTabletActorWithMemoryHost(tabletActor), activeZone);
+    tc.Runtime->SetScheduledLimit(10000);
+    ExecuteWrite(tc, {{"m0", TString(30, 'z')}, {"trash", TString(30, 't')}, {"advance", TString(30, 'd')}},
+        0, NKeyValue::MainStorageChannelInPublicApi, NKikimrKeyValue::Priorities::PRIORITY_REALTIME);
+    ExecuteDeleteRange(tc, "advance", EBorderKind::Include, "advance", EBorderKind::Include, 0);
+    tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+    SetTabletMemoryZone(tc, tabletActor, NMemory::EMemoryZone::Red);
+    THeldPuts puts(tc);
+    SendMainWrite(tc, "a", 10);
+    auto trim = MakeWriteRequest(123, "trim-write", TString(100, 'x'), NKikimrClient::TKeyValueRequest::MAIN);
+    trim->Record.MutableCmdTrimLeakedBlobs()->SetMaxItemsToTrim(100); // No deadline.
+    SendRequestEvent(std::move(trim), tc);
+    tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+    TDeque<TEvBlobStorage::TEvCollectGarbageResult::TPtr> held;
+    auto observer = tc.Runtime->AddObserver<TEvBlobStorage::TEvCollectGarbageResult>([&](auto& event) {
+        held.emplace_back(std::move(event));
+    });
+    auto request = MakeReadRequest(321, {"m0"});
+    auto* range = request->Record.AddCmdDeleteRange()->MutableRange();
+    range->SetFrom("trash");
+    range->SetTo("trash");
+    range->SetIncludeFrom(true);
+    range->SetIncludeTo(true);
+    SendRequestEvent(std::move(request), tc);
+    UNIT_ASSERT_VALUES_EQUAL(ReceiveKeyValueResponse(tc).GetCookie(), 321u);
+    tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+    UNIT_ASSERT(!held.empty());
+    SendMainWrite(tc, "b", 20);
+    puts.ReleaseAll(tc);
+    ExpectWriteOk(tc);
+    auto& state = GetTabletState(tc, tabletActor);
+    UNIT_ASSERT_VALUES_EQUAL(state.GetMemoryAdmissionStats().RunningCount, 1u);
+    UNIT_ASSERT_VALUES_EQUAL(state.GetMemoryAdmissionStats().RunningBytes, 20u);
+    UNIT_ASSERT_VALUES_EQUAL(state.GetMemoryWaitingForGC(), 100u);
+    UNIT_ASSERT_VALUES_EQUAL(puts.Held.size(), 1u); // The eligible write passed the GC-blocked trim.
+    puts.ReleaseAll(tc);
+    ExpectWriteOk(tc);
+    UNIT_ASSERT_VALUES_EQUAL(state.GetMemoryAdmissionStats().RunningCount, 0u);
+    UNIT_ASSERT_VALUES_EQUAL(state.GetMemoryWaitingForGC(), 100u);
+    auto* tablet = dynamic_cast<NKeyValue::TKeyValueFlat*>(tc.Runtime->FindActor(*tabletActor));
+    UNIT_ASSERT_VALUES_EQUAL(tablet->GetMemoryReport().Used, state.GetStateBytes().Total() + 100u);
+    observer.Remove();
+    for (auto& event : held) {
+        tc.Runtime->Send(event.Release(), 0, true);
+    }
+    tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+    puts.ReleaseAll(tc);
+    const auto reply = ReceiveKeyValueResponse(tc);
+    UNIT_ASSERT_VALUES_EQUAL(reply.GetCookie(), 123u);
+    UNIT_ASSERT_VALUES_EQUAL(reply.GetStatus(), NMsgBusProxy::MSTATUS_OK);
+    tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+    UNIT_ASSERT_VALUES_EQUAL(state.GetMemoryWaitingForGC(), 0u);
+    UNIT_ASSERT_VALUES_EQUAL(state.GetMemoryAdmissionStats().HeldBytes(), 0u);
+}
+
+class TAdmitPreparedExpiredRequest : public TActorBootstrapped<TAdmitPreparedExpiredRequest> {
+public:
+    TAdmitPreparedExpiredRequest(NKeyValue::TKeyValueState& state, TActorId tablet, TActorId edge)
+        : State(state), Tablet(tablet), Edge(edge)
+    {}
+
+    void Bootstrap() {
+        auto item = MakeHolder<NKeyValue::TIntermediate>(Edge, Tablet, 0, 0,
+            NKeyValue::TRequestType::WriteOnly, NWilson::TTraceId());
+        item->RequestUid = 100000;
+        item->EvType = TEvKeyValue::TEvRequest::EventType;
+        item->Deadline = TAppData::TimeProvider->Now(); // Models expiry after the input deadline check.
+        item->Cookie = 123;
+        item->HasCookie = true;
+        State.CountRequestIncoming(NKeyValue::TRequestType::WriteOnly);
+        State.CountRequestTakeOffOrEnqueue(NKeyValue::TRequestType::WriteOnly);
+        State.AdmitIntermediate(std::move(item));
+        PassAway();
+    }
+private:
+    NKeyValue::TKeyValueState& State;
+    const TActorId Tablet;
+    const TActorId Edge;
+};
+
+Y_UNIT_TEST(TestImmediateExpiryRetainsStorageDeadlineDiagnostics) {
+    for (bool enabled : {false, true}) {
+        std::optional<TActorId> tabletActor;
+        TTestContext tc;
+        TFinalizer finalizer(tc);
+        bool activeZone = false;
+        tc.Prepare(INITIAL_TEST_DISPATCH_NAME, enabled
+            ? TrackTabletActorWithMemoryHost(tabletActor) : TrackTabletActor(tabletActor), activeZone);
+        ExecuteWrite(tc, {{"m0", TString(30, 'z')}}, 0, NKeyValue::MainStorageChannelInPublicApi,
+            NKikimrKeyValue::Priorities::PRIORITY_REALTIME);
+        tc.Runtime->Register(new TAdmitPreparedExpiredRequest(GetTabletState(tc, tabletActor), *tabletActor, tc.Edge));
+        const auto reply = ReceiveKeyValueResponse(tc);
+        UNIT_ASSERT_VALUES_EQUAL(reply.GetCookie(), 123u);
+        UNIT_ASSERT_VALUES_EQUAL(reply.GetStatus(), NMsgBusProxy::MSTATUS_TIMEOUT);
+        UNIT_ASSERT_C(reply.GetErrorReason().Contains("Marker# KV311"), reply.GetErrorReason());
+        tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+        UNIT_ASSERT_VALUES_EQUAL(GetTabletState(tc, tabletActor).GetMemoryAdmissionStats().RunningCount, 0u);
+    }
 }
 
 Y_UNIT_TEST(TestQueuedTrimDoesNotBlockGC) {

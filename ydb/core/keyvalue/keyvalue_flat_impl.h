@@ -961,7 +961,7 @@ public:
 
     // Owner attribution excludes executor memory and is used only with the host flag enabled.
     NMemory::TConsumerReport GetMemoryReport() const override {
-        const ui64 used = State.GetStateBytes().Total() + State.GetMemoryAdmissionStats().HeldBytes();
+        const ui64 used = State.GetStateBytes().Total() + State.GetMemoryAdmissionStats().HeldBytes() + State.GetMemoryWaitingForGC();
         return {.Used = used, .Demand = used, .Reclaimable = 0};
     }
 

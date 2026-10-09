@@ -516,7 +516,7 @@ public:
 
     void Bootstrap(const TActorContext &ctx) {
         if (IntermediateResults->AdmissionTimedOut) {
-            ReplyErrorAndDie(ctx, "Request expired in memory admission queue", NMsgBusProxy::MSTATUS_TIMEOUT);
+            ReplyErrorAndDie(ctx, "Request expired while waiting for memory admission or GC", NMsgBusProxy::MSTATUS_TIMEOUT);
             return;
         }
         // Check parameters and send requests
