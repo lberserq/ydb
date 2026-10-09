@@ -90,6 +90,15 @@ TVector<TTabletMemoryHost::TTabletShare> TTabletMemoryHost::ApplyElasticLimit(ui
         if (demand) {
             share = static_cast<ui64>((static_cast<unsigned __int128>(limitBytes) * demand) / Sums.ElasticDemand);
         }
+        // Retain the last sent allocation when suppressing growth, so small increases
+        // accumulate. Reductions and withdrawals must reach the owner to keep the
+        // sum of delivered allocations within the computed budget.
+        constexpr ui64 SignificantShareIncrease = 1 << 20;
+        if (slot.ShareDelivered && slot.Share && *slot.Share && share && *share > *slot.Share &&
+            *share - *slot.Share < Min(SignificantShareIncrease, Max<ui64>(1, *slot.Share / 100)))
+        {
+            continue;
+        }
         if (share != slot.Share || (share && !slot.ShareDelivered)) {
             slot.Share = share;
             slot.ShareDelivered = true;

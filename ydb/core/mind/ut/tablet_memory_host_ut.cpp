@@ -177,6 +177,91 @@ Y_UNIT_TEST(AnEmptyCacheReceivesBudgetToRecover) {
     UNIT_ASSERT(host.ApplyElasticLimit(100).empty());
 }
 
+Y_UNIT_TEST(TinyEligibilityOscillationsDoNotRepeatTheFullFanout) {
+    constexpr ui64 megabyte = 1 << 20;
+    constexpr ui64 limit = 128 * megabyte;
+    TTabletMemoryHost host;
+    for (ui32 i = 1; i <= 8; ++i) {
+        host.SetReport({i, 0}, MakeExecutor(i), TTabletTypes::DataShard, Report(megabyte, 2 * megabyte, 0));
+    }
+    host.SetReport({9, 0}, MakeExecutor(9), TTabletTypes::DataShard, Report(100, 100, 0));
+    TMap<TActorId, ui64> delivered;
+    const auto apply = [&](ui64 budget) {
+        auto changes = host.ApplyElasticLimit(budget);
+        for (const auto& change : changes) {
+            delivered[change.Executor] = change.Bytes.value_or(0);
+        }
+        ui64 total = 0;
+        for (const auto& [executor, bytes] : delivered) {
+            total += bytes;
+        }
+        UNIT_ASSERT_C(total <= budget, "delivered allocations exceed the budget");
+        return changes;
+    };
+    UNIT_ASSERT_VALUES_EQUAL(apply(limit).size(), 8u);
+    for (ui32 i = 0; i != 64; ++i) {
+        host.SetReport({9, 0}, MakeExecutor(9), TTabletTypes::DataShard, Report(100, 101, 0));
+        const auto grants = apply(limit);
+        // The first entry requires eight small reductions. Later cycles only
+        // grant/revoke the entrant; suppressed growth retains the reduced shares.
+        UNIT_ASSERT_VALUES_EQUAL(grants.size(), i == 0 ? 9u : 1u);
+        host.SetReport({9, 0}, MakeExecutor(9), TTabletTypes::DataShard, Report(100, 100, 0));
+        const auto withdrawals = apply(limit);
+        UNIT_ASSERT_VALUES_EQUAL(withdrawals.size(), 1u);
+        UNIT_ASSERT_VALUES_EQUAL(withdrawals.front().Executor, MakeExecutor(9));
+        UNIT_ASSERT(!withdrawals.front().Bytes);
+    }
+    // Even a tiny reduction is mandatory for each allocated tablet.
+    UNIT_ASSERT_VALUES_EQUAL(apply(limit - 32).size(), 8u);
+}
+
+Y_UNIT_TEST(ShareGrowthAccumulatesAgainstTheLastDelivery) {
+    constexpr ui64 megabyte = 1 << 20;
+    TTabletMemoryHost host;
+    host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, Report(100, 200, 0));
+    const auto initial = host.ApplyElasticLimit(128 * megabyte);
+    UNIT_ASSERT_VALUES_EQUAL(initial.size(), 1u);
+    UNIT_ASSERT(initial.front().Bytes);
+    UNIT_ASSERT_VALUES_EQUAL(*initial.front().Bytes, 128 * megabyte);
+    UNIT_ASSERT(host.ApplyElasticLimit(128 * megabyte + megabyte / 2).empty());
+    UNIT_ASSERT(host.ApplyElasticLimit(128 * megabyte + megabyte / 4).empty());
+    const auto growth = host.ApplyElasticLimit(129 * megabyte);
+    UNIT_ASSERT_VALUES_EQUAL(growth.size(), 1u);
+    UNIT_ASSERT(growth.front().Bytes);
+    UNIT_ASSERT_VALUES_EQUAL(*growth.front().Bytes, 129 * megabyte);
+    const auto reduction = host.ApplyElasticLimit(129 * megabyte - 1);
+    UNIT_ASSERT_VALUES_EQUAL(reduction.size(), 1u);
+    UNIT_ASSERT(reduction.front().Bytes);
+    UNIT_ASSERT_VALUES_EQUAL(*reduction.front().Bytes, 129 * megabyte - 1);
+    UNIT_ASSERT(host.ApplyElasticLimit(129 * megabyte).empty());
+    // A replacement must receive an allocation even if growth was suppressed.
+    host.SetReport({1, 0}, MakeExecutor(2), TTabletTypes::DataShard, Report(100, 200, 0));
+    const auto replay = host.ApplyElasticLimit(129 * megabyte);
+    UNIT_ASSERT_VALUES_EQUAL(replay.size(), 1u);
+    UNIT_ASSERT_VALUES_EQUAL(replay.front().Executor, MakeExecutor(2));
+    UNIT_ASSERT(replay.front().Bytes);
+    UNIT_ASSERT_VALUES_EQUAL(*replay.front().Bytes, 129 * megabyte);
+}
+
+Y_UNIT_TEST(SmallAllocationsCanRecoverBelowTheAbsoluteGrowthThreshold) {
+    TTabletMemoryHost host;
+    host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, Report(100, 200, 0));
+    const auto expect = [&](ui64 budget, ui64 value) {
+        const auto shares = host.ApplyElasticLimit(budget);
+        UNIT_ASSERT_VALUES_EQUAL(shares.size(), 1u);
+        UNIT_ASSERT(shares.front().Bytes);
+        UNIT_ASSERT_VALUES_EQUAL(*shares.front().Bytes, value);
+    };
+    expect(0, 0);
+    expect(1, 1);
+    expect(2, 2);
+    expect(1 << 19, 1 << 19); // A meaningful relative increase below 1 MiB.
+    UNIT_ASSERT(host.ApplyElasticLimit((1 << 19) + 1).empty());
+    expect((1 << 19) - 1, (1 << 19) - 1);
+    expect(0, 0);
+    expect(1, 1);
+}
+
 Y_UNIT_TEST(PerTypeSensorsFollowTheSlots) {
     TTabletMemoryHost host;
     host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, Report(100, 120, 20));
