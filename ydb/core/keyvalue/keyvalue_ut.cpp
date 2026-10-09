@@ -4252,11 +4252,11 @@ Y_UNIT_TEST(TestMemoryAdmissionQueuedRequestsExpire) {
         if (newApi && inlineRead) {
             const auto reply = ReceiveResponse<TEvKeyValue::TEvReadResponse>(tc);
             UNIT_ASSERT_VALUES_EQUAL(reply.cookie(), 123u);
-            UNIT_ASSERT_VALUES_EQUAL(reply.status(), NKikimrKeyValue::Statuses::RSTATUS_TIMEOUT);
+            UNIT_ASSERT_VALUES_EQUAL(static_cast<int>(reply.status()), static_cast<int>(NKikimrKeyValue::Statuses::RSTATUS_TIMEOUT));
         } else if (newApi) {
             const auto reply = ReceiveResponse<TEvKeyValue::TEvExecuteTransactionResponse>(tc);
             UNIT_ASSERT_VALUES_EQUAL(reply.cookie(), 123u);
-            UNIT_ASSERT_VALUES_EQUAL(reply.status(), NKikimrKeyValue::Statuses::RSTATUS_TIMEOUT);
+            UNIT_ASSERT_VALUES_EQUAL(static_cast<int>(reply.status()), static_cast<int>(NKikimrKeyValue::Statuses::RSTATUS_TIMEOUT));
         } else {
             const auto reply = ReceiveKeyValueResponse(tc);
             UNIT_ASSERT_VALUES_EQUAL(reply.GetCookie(), 123u);
