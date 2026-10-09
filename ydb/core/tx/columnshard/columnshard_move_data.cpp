@@ -109,6 +109,8 @@ bool TMoveDataMetadataScan::HasBlobInGroups(const std::vector<NOlap::TUnifiedBlo
 
 void TColumnShard::Handle(TEvTablet::TEvMoveData::TPtr& ev, const TActorContext& ctx) {
     if (!AppData()->FeatureFlags.GetEnableColumnshardMoveData()) {
+        // Preserve executor-only MoveData semantics while the feature is disabled:
+        // Success covers the executor vacuum, not evacuation of ColumnShard portion blobs.
         TTabletExecutedFlat::Handle(ev);
         return;
     }
@@ -235,7 +237,7 @@ void TMoveDataDriver::CheckMoveDataGate(const TActorContext& ctx, const NOlap::N
     if (!BlobsWait) {
         counters.OnMoveDataBlobsChecked();
         if (defaultOperator->HasBlobsForGroups(state.TargetGroups)) {
-            // Keep the shared/borrowed gate as well as the queues and in-flight GC gate.
+            // Shared or borrowed references and pending GC both prevent completion.
             BlobsWait = defaultOperator->GetSharedBlobs()->HasBlobsForGroups(state.TargetGroups) ? EBlobsWait::Shared : EBlobsWait::GC;
         }
     }
@@ -254,7 +256,7 @@ void TMoveDataDriver::CheckMoveDataGate(const TActorContext& ctx, const NOlap::N
     if (Self->HasIndex()) {
         Self->MutableIndexAs<NOlap::TColumnEngineForLogs>().StopMoveData();
     }
-    // The boot-time CutHistory scan finds drained intervals by itself, so nothing needs persisting before Success.
+    // Hive restarts the tablet after Success; the boot-time CutHistory scan checks drained intervals.
     for (const auto& subscriber : state.Subscribers) {
         ctx.Send(subscriber, new TEvTablet::TEvMoveDataResponse(Self->TabletID(), NKikimrTabletBase::TEvMoveDataResponse::Success));
     }

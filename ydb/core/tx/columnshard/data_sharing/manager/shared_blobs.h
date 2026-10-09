@@ -129,6 +129,8 @@ public:
 
     void RemoveSharedBlobsDB(NTabletFlatExecutor::TTransactionContext& txc, const TTabletsByBlob& blobIds);
 
+    // The enclosing transaction must call TColumnShard::ResumePostponedMoveData in Complete
+    // after applying its in-memory changes, to invalidate the cached shared-blob gate.
     void RemoveSharedBlobs(const TTabletsByBlob& blobIds) {
         for (auto i = blobIds.GetIterator(); i.IsValid(); ++i) {
             AFL_VERIFY(SharedBlobIds.Remove(i.GetTabletId(), i.GetBlobId()));
@@ -164,6 +166,8 @@ public:
     void CASBorrowedBlobsDB(NTabletFlatExecutor::TTransactionContext& txc, const TTabletId tabletIdFrom, const TTabletId tabletIdTo,
         const THashSet<TUnifiedBlobId>& blobIds);
 
+    // The enclosing transaction must call TColumnShard::ResumePostponedMoveData in Complete
+    // after applying its in-memory changes, to invalidate the cached shared-blob gate.
     void CASBorrowedBlobs(const TTabletId tabletIdFrom, const TTabletId tabletIdTo, const THashSet<TUnifiedBlobId>& blobIds);
 
     [[nodiscard]] bool UpsertSharedBlobOnLoad(const TUnifiedBlobId& blobId, const TTabletId tabletId) {
@@ -181,6 +185,8 @@ public:
     }
 
     void OnTransactionExecuteAfterCleaning(const TBlobsCategories& removeTask, NTable::TDatabase& db);
+    // The enclosing transaction must call TColumnShard::ResumePostponedMoveData in Complete
+    // after applying its in-memory changes, to invalidate the cached shared-blob gate.
     void OnTransactionCompleteAfterCleaning(const TBlobsCategories& removeTask);
 };
 

@@ -89,14 +89,14 @@ private:
         GC,
         Shared,
     };
-    // Only cache a blocked check. GC and shared-link transaction completions invalidate it;
-    // an empty check must lead to Success in the same mailbox turn.
+    // Blocked blob checks stay cached until a GC/shared-link commit notification or target-set restart.
+    // Empty checks lead to Success in the same mailbox turn and are never cached.
     std::optional<EBlobsWait> BlobsWait;
     ui64 NextRequestId = 0;
     ui64 PendingRequestId = 0;
     ui64 RejectedPortions = 0;
     TInstant RetryMetadataAfter;
-    // Periodic fallback interval; pokes run a turn sooner.
+    // Retry metadata and portion progress periodically; blob-wait invalidation is event-driven.
     static constexpr TDuration Cadence = TDuration::Seconds(5);
 
     void ScheduleWakeup(const TActorContext& ctx) {
