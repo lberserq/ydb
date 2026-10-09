@@ -42,14 +42,13 @@ public:
             return !Used && !Demand && !Reclaimable;
         }
 
-        // Picks the memory fields the tablet actually reported out of a metrics tick
-        static TReportUpdate FromMetrics(const NKikimrTabletBase::TMetrics& metrics);
     };
 
     // What one SetReport changed
     struct TSetReportResult {
         bool SumsChanged = false;
         bool NewSlot = false; // the tablet had no slot before this report
+        bool ExecutorChanged = false;
     };
 
     // Merges the update into the tablet's last report
@@ -92,7 +91,7 @@ private:
         TActorId Executor;
         TTabletTypes::EType TabletType = TTabletTypes::TypeInvalid;
         TConsumerReport Report;
-        ui64 Share = 0;
+        std::optional<ui64> Share;
     };
 
     static ui64 ElasticDemandOf(const TConsumerReport& report);

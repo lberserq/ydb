@@ -48,6 +48,7 @@ public:
     // Keep the report together: legacy writers may update Memory independently.
     // An engaged optional includes reports whose values are all zero.
     std::optional<NMemory::TConsumerReport> MemoryReport;
+    std::optional<NMemory::TConsumerReport> TabletMemoryReport;
     TDecayingAverageValue<ui64, DurationPer15Seconds, DurationPerSecond> Network;
     TGaugeValue<ui64> StorageSystem;
     TGaugeValue<ui64> StorageUser;
@@ -66,7 +67,7 @@ public:
 
 class TResourceMetricsSendState {
 public:
-    TResourceMetricsSendState(ui64 tabletId, ui32 followerId, const TActorId& launcher);
+    TResourceMetricsSendState(ui64 tabletId, ui32 followerId, const TActorId& launcher, const TActorId& executor = {});
     bool FillChanged(TResourceMetricsValues& src, NKikimrTabletBase::TMetrics& metrics, TInstant now = TInstant::Now(), bool forceAll = false);
     bool TryUpdate(TResourceMetricsValues& src, const TActorContext& ctx);
 
@@ -81,6 +82,8 @@ protected:
     const ui64 TabletId;
     const ui32 FollowerId;
     const TActorId Launcher;
+    const TActorId Executor;
+    std::optional<NMemory::TConsumerReport> LastTabletMemoryReport;
     std::optional<ui32> LevelCPU;
     std::optional<ui32> LevelMemory;
     std::optional<ui32> LevelMemoryDemand;
@@ -97,8 +100,8 @@ protected:
 
 class TResourceMetrics : public TResourceMetricsValues, public TResourceMetricsSendState {
 public:
-    TResourceMetrics(ui64 tabletId, ui32 followerId, const TActorId& launcher)
-        : TResourceMetricsSendState(tabletId, followerId, launcher) {}
+    TResourceMetrics(ui64 tabletId, ui32 followerId, const TActorId& launcher, const TActorId& executor = {})
+        : TResourceMetricsSendState(tabletId, followerId, launcher, executor) {}
 
     bool FillChanged(NKikimrTabletBase::TMetrics& metrics, TInstant now = TInstant::Now(), bool forceAll = false) {
         return TResourceMetricsSendState::FillChanged(*this, metrics, now, forceAll);
