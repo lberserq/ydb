@@ -29,7 +29,7 @@ TTabletMemoryHost::TSetReportResult TTabletMemoryHost::SetReport(TTabletKey tabl
     auto& slot = it->second;
     const bool executorChanged = !newSlot && slot.Executor != executor;
     if (executorChanged) {
-        slot.Share.reset();
+        slot.ShareDelivered = false;
     }
     if (slot.TabletType != tabletType && slot.TabletType != TTabletTypes::TypeInvalid) {
         AddDelta(slot.TabletType, slot.Report, {});
@@ -52,10 +52,11 @@ TTabletMemoryHost::TSetReportResult TTabletMemoryHost::SetReport(TTabletKey tabl
     report.Demand = Max(report.Demand, report.Used);
     report.Reclaimable = Min(report.Reclaimable, report.Used);
 
+    const bool sharesChanged = newSlot || executorChanged || ElasticDemandOf(slot.Report) != ElasticDemandOf(report);
     const TSums before = Sums;
     AddDelta(tabletType, slot.Report, report);
     slot.Report = report;
-    return {.SumsChanged = before != Sums, .NewSlot = newSlot, .ExecutorChanged = executorChanged};
+    return {.SumsChanged = before != Sums, .NewSlot = newSlot, .ExecutorChanged = executorChanged, .SharesChanged = sharesChanged};
 }
 
 bool TTabletMemoryHost::Forget(TTabletKey tablet) {
@@ -78,13 +79,14 @@ void TTabletMemoryHost::Clear() {
 TVector<TTabletMemoryHost::TTabletShare> TTabletMemoryHost::ApplyElasticLimit(ui64 limitBytes) {
     TVector<TTabletShare> changed;
     for (auto& [tablet, slot] : Slots) {
-        if (!slot.Report.Reclaimable && !slot.Share) {
-            continue;
+        const ui64 demand = ElasticDemandOf(slot.Report);
+        std::optional<ui64> share;
+        if (demand) {
+            share = static_cast<ui64>((static_cast<unsigned __int128>(limitBytes) * demand) / Sums.ElasticDemand);
         }
-        const ui64 share = slot.Report.Reclaimable ? static_cast<ui64>(
-            (static_cast<unsigned __int128>(limitBytes) * slot.Report.Reclaimable) / Sums.Elastic) : 0;
-        if (share != slot.Share) {
+        if (share != slot.Share || (share && !slot.ShareDelivered)) {
             slot.Share = share;
+            slot.ShareDelivered = true;
             changed.push_back({.Executor = slot.Executor, .Bytes = share});
         }
     }

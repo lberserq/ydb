@@ -29,7 +29,7 @@ public:
 
     struct TTabletShare {
         TActorId Executor;
-        ui64 Bytes = 0;
+        std::optional<ui64> Bytes; // nullopt withdraws a previous allocation
     };
 
     // The fields one metrics tick carried; what it left out keeps the value of the tablet's last report
@@ -49,6 +49,7 @@ public:
         bool SumsChanged = false;
         bool NewSlot = false; // the tablet had no slot before this report
         bool ExecutorChanged = false;
+        bool SharesChanged = false;
     };
 
     // Merges the update into the tablet's last report
@@ -77,7 +78,7 @@ public:
         return {.Used = Sums.Elastic, .Demand = Max(Sums.ElasticDemand, Sums.Elastic), .Reclaimable = Sums.Elastic};
     }
 
-    // Splits the elastic limit proportionally to Reclaimable and returns the tablets whose share changed
+    // Splits the elastic limit proportionally to elastic demand and returns the tablets whose share changed
     TVector<TTabletShare> ApplyElasticLimit(ui64 limitBytes);
 
     // Every tablet that has a slot, for the zone fan-out
@@ -92,6 +93,7 @@ private:
         TTabletTypes::EType TabletType = TTabletTypes::TypeInvalid;
         TConsumerReport Report;
         std::optional<ui64> Share;
+        bool ShareDelivered = false;
     };
 
     static ui64 ElasticDemandOf(const TConsumerReport& report);

@@ -96,7 +96,7 @@ Y_UNIT_TEST(ElasticLimitIsSplitByReclaimable) {
     UNIT_ASSERT_VALUES_EQUAL(shares.size(), 2u);
     TMap<TActorId, ui64> byExecutor;
     for (const auto& share : shares) {
-        byExecutor[share.Executor] = share.Bytes;
+        byExecutor[share.Executor] = *share.Bytes;
     }
     UNIT_ASSERT_VALUES_EQUAL(byExecutor[MakeExecutor(1)], 30u);
     UNIT_ASSERT_VALUES_EQUAL(byExecutor[MakeExecutor(2)], 10u);
@@ -111,7 +111,7 @@ Y_UNIT_TEST(ElasticLimitIsSplitByReclaimable) {
     shares = host.ApplyElasticLimit(20);
     UNIT_ASSERT_VALUES_EQUAL(shares.size(), 2u);
     for (const auto& share : shares) {
-        UNIT_ASSERT_VALUES_EQUAL(share.Bytes, 0u);
+        UNIT_ASSERT(!share.Bytes);
     }
 }
 
@@ -121,7 +121,7 @@ Y_UNIT_TEST(InitialZeroElasticLimitIsDelivered) {
     const auto shares = host.ApplyElasticLimit(0);
     UNIT_ASSERT_VALUES_EQUAL(shares.size(), 1u);
     UNIT_ASSERT_VALUES_EQUAL(shares.front().Executor, MakeExecutor(1));
-    UNIT_ASSERT_VALUES_EQUAL(shares.front().Bytes, 0u);
+    UNIT_ASSERT(shares.front().Bytes && *shares.front().Bytes == 0u);
     UNIT_ASSERT(host.ApplyElasticLimit(0).empty());
 }
 
@@ -134,7 +134,7 @@ Y_UNIT_TEST(ZeroReclaimableRevokesOnlyThatTabletsPreviousShare) {
     const auto shares = host.ApplyElasticLimit(40);
     UNIT_ASSERT_VALUES_EQUAL(shares.size(), 1u);
     UNIT_ASSERT_VALUES_EQUAL(shares.front().Executor, MakeExecutor(1));
-    UNIT_ASSERT_VALUES_EQUAL(shares.front().Bytes, 0u);
+    UNIT_ASSERT(!shares.front().Bytes);
     UNIT_ASSERT(host.ApplyElasticLimit(40).empty());
 }
 
@@ -149,7 +149,7 @@ Y_UNIT_TEST(ReplacingExecutorReplaysItsShare) {
     const auto shares = host.ApplyElasticLimit(0);
     UNIT_ASSERT_VALUES_EQUAL(shares.size(), 1u);
     UNIT_ASSERT_VALUES_EQUAL(shares.front().Executor, MakeExecutor(2));
-    UNIT_ASSERT_VALUES_EQUAL(shares.front().Bytes, 0u);
+    UNIT_ASSERT(shares.front().Bytes && *shares.front().Bytes == 0u);
 }
 
 Y_UNIT_TEST(ElasticSharesDoNotExceedTheLimit) {
@@ -158,7 +158,23 @@ Y_UNIT_TEST(ElasticSharesDoNotExceedTheLimit) {
     host.SetReport({2, 0}, MakeExecutor(2), TTabletTypes::DataShard, Report(100, 100, 7));
     const auto shares = host.ApplyElasticLimit(Max<ui64>());
     UNIT_ASSERT_VALUES_EQUAL(shares.size(), 2u);
-    UNIT_ASSERT(shares[0].Bytes <= Max<ui64>() - shares[1].Bytes);
+    UNIT_ASSERT(*shares[0].Bytes <= Max<ui64>() - *shares[1].Bytes);
+}
+
+Y_UNIT_TEST(AnEmptyCacheReceivesBudgetToRecover) {
+    TTabletMemoryHost host;
+    host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, Report(100, 200, 0));
+    host.SetReport({2, 0}, MakeExecutor(2), TTabletTypes::DataShard, Report(100, 100, 100));
+    const auto shares = host.ApplyElasticLimit(100);
+    UNIT_ASSERT_VALUES_EQUAL(shares.size(), 2u);
+    for (const auto& share : shares) {
+        UNIT_ASSERT(share.Bytes && *share.Bytes == 50u);
+    }
+    // Changing non-elastic state while preserving elastic demand needs no redistribution.
+    const auto update = host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, Report(200, 300, 0));
+    UNIT_ASSERT(update.SumsChanged);
+    UNIT_ASSERT(!update.SharesChanged);
+    UNIT_ASSERT(host.ApplyElasticLimit(100).empty());
 }
 
 Y_UNIT_TEST(PerTypeSensorsFollowTheSlots) {
