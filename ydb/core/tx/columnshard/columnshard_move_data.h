@@ -66,6 +66,7 @@ public:
 // Stateless v1: no persistence; on restart Hive re-sends TEvMoveData.
 struct TMoveDataState {
     // Coalesced requests share the target union; every distinct subscriber receives its completion.
+    // Earlier subscribers also wait for groups added by later requests.
     THashSet<TActorId> Subscribers;
     THashSet<ui32> TargetGroups;
     bool Active = false;

@@ -564,9 +564,24 @@ Y_UNIT_TEST_SUITE(TColumnShardMoveDataE2E) {
         };
         UNIT_ASSERT_C(!takeSecondResponse(), "the second sender received Success while GC was disabled");
 
+        // Refusing a live group must neither subscribe this sender nor change the active target union.
+        const auto refusedSender = f.Runtime.AllocateEdgeActor();
+        f.Runtime.SendToPipe(TabletId, refusedSender, new TEvTablet::TEvMoveData({ NewGroup }), 0, GetPipeConfigWithRetries());
+        const auto takeRefusedResponse = [&]() {
+            return f.Runtime.GrabEdgeEventIf<TEvTablet::TEvMoveDataResponse>(refusedSender, [](const TEvTablet::TEvMoveDataResponse::TPtr&) {
+                return true;
+            }, TDuration::MilliSeconds(100));
+        };
+        UNIT_ASSERT_C(!f.DriveGate(10), "the original sender received a response while GC was disabled after refusing another request");
+        const auto refusedResponse = takeRefusedResponse();
+        UNIT_ASSERT_C(refusedResponse, "the sender requesting a live group got no refusal");
+        UNIT_ASSERT_VALUES_EQUAL(static_cast<int>(refusedResponse->Get()->Record.GetStatus()),
+            static_cast<int>(NKikimrTabletBase::TEvMoveDataResponse::ErrorGroupIdMismatch));
+        UNIT_ASSERT_C(!takeSecondResponse(), "the second sender received a response while GC was disabled after refusing another request");
+
         f.Controller->EnableBackground(EBackground::GC);
         const auto firstResponse = f.DriveGateWithWrite(200, 4, 3000, 3001);
-        UNIT_ASSERT_C(firstResponse, "the second sender replaced the original subscriber");
+        UNIT_ASSERT_C(firstResponse, "original sender got no response");
         f.AssertDrainedSuccess(firstResponse);
         const auto secondResponse = takeSecondResponse();
         UNIT_ASSERT_C(secondResponse, "the second subscriber received no response");
@@ -574,6 +589,7 @@ Y_UNIT_TEST_SUITE(TColumnShardMoveDataE2E) {
         UNIT_ASSERT_VALUES_EQUAL_C(LivePortionBlobs(*f.MidGroupProxy, TabletId).size(), 0u, "answered before both requested groups drained");
         UNIT_ASSERT_C(!f.DriveGate(2), "the repeated request produced a duplicate reply");
         UNIT_ASSERT_C(!takeSecondResponse(), "the second subscriber received a duplicate reply");
+        UNIT_ASSERT_C(!takeRefusedResponse(), "the refused sender was subscribed to the active session");
     }
 
     // An uncommitted write cannot be rewritten, yet its blobs sit in the old group until it commits and moves.
