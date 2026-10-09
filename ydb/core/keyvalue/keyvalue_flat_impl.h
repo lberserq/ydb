@@ -959,9 +959,10 @@ public:
         return true;
     }
 
-    // memtable and pinned pages report under their own kinds; the state is the tablet's own
-    ui64 GetMemoryUsage() const override {
-        return State.GetStateBytes().Total();
+    // Owner attribution excludes executor memory and is used only with the host flag enabled.
+    NMemory::TConsumerReport GetMemoryReport() const override {
+        const ui64 used = State.GetStateBytes().Total() + State.GetMemoryAdmissionStats().HeldBytes();
+        return {.Used = used, .Demand = used, .Reclaimable = 0};
     }
 
     NMemory::TMemoryAdmissionStats GetMemoryAdmissionStats() const override {
