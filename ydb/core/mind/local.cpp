@@ -201,7 +201,7 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
         ctx.Send(memoryController, new NMemory::TEvConsumerUnregister(NMemory::EMemoryConsumerKind::TabletsElastic));
         MemoryHost.TabletsConsumer.Reset();
         MemoryHost.TabletsElasticConsumer.Reset();
-        MemoryHost.Host.Clear();
+        MemoryHost.Host.Clear(MemoryHost.Counters);
     }
 
     void PublishTabletMemory() {
@@ -287,10 +287,10 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
     void Handle(NMemory::TEvConsumerLimit::TPtr &ev, const TActorContext &ctx) {
         const auto *msg = ev->Get();
         ApplyNodeMemoryZone(msg->Zone, ctx);
-        MemoryHost.Host.UpdateCounters(MemoryHost.Counters);
         if (msg->Kind != NMemory::EMemoryConsumerKind::TabletsElastic) {
             return;
         }
+        MemoryHost.Host.UpdateCounters(MemoryHost.Counters);
         if (MemoryHost.ElasticLimit != msg->LimitBytes) {
             MemoryHost.ElasticLimit = msg->LimitBytes;
             ScheduleTabletMemoryShares(ctx);
@@ -705,22 +705,20 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
         const TTabletId tabletId(msg->TabletId, msg->FollowerId);
         auto it = OnlineTablets.find(tabletId);
         if (it != OnlineTablets.end()) {
+            // Executor and user-tablet actors may both send metrics. The stable system
+            // tablet identifies the incarnation even while an old instance stops gracefully.
+            if (TabletMemoryHostEnabled && msg->SystemTablet && msg->SystemTablet != it->second.Tablet) {
+                return;
+            }
             const auto& metrics(msg->ResourceValues);
-            auto before = it->second.ResourceValues.ByteSize();
+            const bool hiveMetrics = metrics.HasCPU() || metrics.HasMemory() || metrics.HasNetwork() ||
+                metrics.HasStorage() || metrics.GroupReadThroughputSize() || metrics.GroupWriteThroughputSize() ||
+                metrics.GroupReadIopsSize() || metrics.GroupWriteIopsSize();
             if (metrics.HasCPU()) {
                 it->second.ResourceValues.SetCPU(metrics.GetCPU());
             }
             if (metrics.HasMemory()) {
                 it->second.ResourceValues.SetMemory(metrics.GetMemory());
-            }
-            if (metrics.HasTabletMemoryUsed()) {
-                it->second.ResourceValues.SetTabletMemoryUsed(metrics.GetTabletMemoryUsed());
-            }
-            if (metrics.HasMemoryDemand()) {
-                it->second.ResourceValues.SetMemoryDemand(metrics.GetMemoryDemand());
-            }
-            if (metrics.HasMemoryReclaimable()) {
-                it->second.ResourceValues.SetMemoryReclaimable(metrics.GetMemoryReclaimable());
             }
             if (metrics.HasNetwork()) {
                 it->second.ResourceValues.SetNetwork(metrics.GetNetwork());
@@ -753,8 +751,8 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
                 }
             }
             UpdateTabletMemory(tabletId, msg->Executor, it->second.TabletType, msg->TabletMemoryReport, ctx);
-            auto after = it->second.ResourceValues.ByteSize();
-            if (after == 0 && before == 0) {
+            // Owner-only updates must not dirty cached placement metrics awaiting a Hive ack.
+            if (!hiveMetrics) {
                 return;
             }
             auto uit = UpdatedTabletMetrics.find(tabletId);

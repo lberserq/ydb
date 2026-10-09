@@ -58,7 +58,7 @@ public:
     // Drops the tablet's slot, so its last report leaves the sums; true when it had one
     bool Forget(TTabletKey tablet);
 
-    void Clear();
+    void Clear(const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters = {});
 
     const TSums& GetSums() const {
         return Sums;

@@ -85,7 +85,7 @@ Y_UNIT_TEST(FollowersAndLeadersKeepSeparateSlots) {
     UNIT_ASSERT_VALUES_EQUAL(host.GetSums().Total, 150u);
 }
 
-Y_UNIT_TEST(ElasticLimitIsSplitByReclaimable) {
+Y_UNIT_TEST(ElasticLimitWithEqualUsedAndDemand) {
     TTabletMemoryHost host;
     host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, Report(100, 100, 30));
     host.SetReport({2, 0}, MakeExecutor(2), TTabletTypes::DataShard, Report(100, 100, 10));
@@ -212,6 +212,19 @@ Y_UNIT_TEST(PerTypeSensorsFallToZeroWhenTheLastTabletOfATypeLeaves) {
     UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(keyValue + "Used")->Val(), 0);
     UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(keyValue + "Demand")->Val(), 0);
     UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(keyValue + "Reclaimable")->Val(), 0);
+}
+
+Y_UNIT_TEST(ClearResetsPublishedTypeGauges) {
+    TTabletMemoryHost host;
+    auto counters = MakeIntrusive<::NMonitoring::TDynamicCounters>();
+    host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::KeyValue, Report(100, 120, 20));
+    host.UpdateCounters(counters);
+    const TString prefix = TStringBuilder() << "TabletMemory/" << TTabletTypes::TypeToStr(TTabletTypes::KeyValue) << "/";
+    UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(prefix + "Used")->Val(), 100u);
+    host.Clear(counters);
+    UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(prefix + "Used")->Val(), 0u);
+    UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(prefix + "Demand")->Val(), 0u);
+    UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(prefix + "Reclaimable")->Val(), 0u);
 }
 
 Y_UNIT_TEST(ClearDropsEverything) {

@@ -12277,10 +12277,10 @@ Y_UNIT_TEST_SUITE(THiveTest) {
 
         // Placement accounting stays legacy; owner bytes have a separate snapshot.
         UNIT_ASSERT_C(last.HasMemory(), "no Memory in the metrics Hive received");
-        UNIT_ASSERT_VALUES_EQUAL(last.GetTabletMemoryUsed(), 40_MB);
+        UNIT_ASSERT(!last.HasTabletMemoryUsed());
         UNIT_ASSERT_LT(last.GetMemory(), 40_MB);
-        UNIT_ASSERT_VALUES_EQUAL(last.GetMemoryReclaimable(), 10_MB);
-        UNIT_ASSERT_VALUES_EQUAL(last.GetMemoryDemand(), 60_MB);
+        UNIT_ASSERT(!last.HasMemoryReclaimable());
+        UNIT_ASSERT(!last.HasMemoryDemand());
 
         // MC receives owner bytes only, without executor-owned memtables or pinned pages.
         UNIT_ASSERT(env.Controller->Tablets && env.Controller->TabletsElastic);
@@ -12329,6 +12329,85 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         env.Runtime.SimulateSleep(TDuration::Seconds(1));
         UNIT_ASSERT(env.Probe->LastZone);
         UNIT_ASSERT_VALUES_EQUAL(static_cast<ui32>(*env.Probe->LastZone), static_cast<ui32>(NMemory::EMemoryZone::Red));
+    }
+
+    Y_UNIT_TEST(TestTabletMemoryOwnerUpdatesDoNotDirtyHiveMetrics) {
+        TTabletMemoryEnv env(true, {.Used = 40_MB, .Demand = 60_MB, .Reclaimable = 10_MB});
+        auto* tablet = dynamic_cast<TMemoryProbeTablet*>(env.Runtime.FindActor(env.Probe->TabletActor));
+        UNIT_ASSERT(tablet);
+        const auto executor = tablet->ExecutorID();
+        const auto systemTablet = tablet->Tablet();
+        const auto sender = env.Runtime.AllocateEdgeActor();
+        const auto isolate = env.Runtime.AddObserver<TEvLocal::TEvTabletMetrics>([&](auto& event) {
+            if (event->Get()->TabletId == env.TabletId && event->Sender != sender) {
+                event.Reset();
+            }
+        });
+        TVector<TEvLocal::TEvTabletMetricsAck::TPtr> acks;
+        auto holdAck = env.Runtime.AddObserver<TEvLocal::TEvTabletMetricsAck>([&](auto& event) {
+            acks.push_back(std::move(event));
+        });
+        NKikimrTabletBase::TMetrics placement;
+        placement.SetCPU(1000000);
+        env.Runtime.Send(new IEventHandle(env.Controller->Registrant, sender,
+            new TEvLocal::TEvTabletMetrics(env.TabletId, 0, placement, executor, std::nullopt, systemTablet)));
+        env.Runtime.SimulateSleep(TDuration::Seconds(6));
+        UNIT_ASSERT(!acks.empty());
+        const auto before = env.MetricsOfTablet().size();
+        NKikimrTabletBase::TMetrics ownerFields;
+        ownerFields.SetTabletMemoryUsed(42_MB);
+        ownerFields.SetMemoryDemand(62_MB);
+        ownerFields.SetMemoryReclaimable(10_MB);
+        env.Runtime.Send(new IEventHandle(env.Controller->Registrant, sender,
+            new TEvLocal::TEvTabletMetrics(env.TabletId, 0, ownerFields, executor,
+                NMemory::TConsumerReport{.Used = 42_MB, .Demand = 62_MB, .Reclaimable = 10_MB}, systemTablet)));
+        env.Runtime.SimulateSleep(TDuration::Seconds(1));
+        UNIT_ASSERT_VALUES_EQUAL(env.Controller->Tablets->Last.Used, 32_MB);
+        holdAck.Remove();
+        for (auto& event : acks) {
+            env.Runtime.Send(event.Release(), 0, true);
+        }
+        env.Runtime.SimulateSleep(TDuration::Seconds(6));
+        const auto metrics = env.MetricsOfTablet();
+        UNIT_ASSERT_VALUES_EQUAL(metrics.size(), before);
+        for (const auto& record : metrics) {
+            UNIT_ASSERT(!record.HasTabletMemoryUsed());
+            UNIT_ASSERT(!record.HasMemoryDemand());
+            UNIT_ASSERT(!record.HasMemoryReclaimable());
+        }
+    }
+
+    Y_UNIT_TEST(TestTabletMemoryRejectsPreviousSystemTabletIncarnation) {
+        TTabletMemoryEnv env(true, {.Used = 40_MB, .Demand = 60_MB, .Reclaimable = 10_MB});
+        auto* oldTablet = dynamic_cast<TMemoryProbeTablet*>(env.Runtime.FindActor(env.Probe->TabletActor));
+        UNIT_ASSERT(oldTablet);
+        const auto oldSystem = oldTablet->Tablet();
+        const auto oldExecutor = oldTablet->ExecutorID();
+        env.Runtime.Send(new IEventHandle(oldSystem, TActorId(), new TEvents::TEvPoisonPill()));
+        MakeSureTabletIsUp(env.Runtime, env.TabletId, 0);
+        env.Runtime.SimulateSleep(TDuration::Seconds(60));
+        auto* current = dynamic_cast<TMemoryProbeTablet*>(env.Runtime.FindActor(env.Probe->TabletActor));
+        UNIT_ASSERT(current);
+        UNIT_ASSERT_VALUES_UNEQUAL(current->Tablet(), oldSystem);
+        const auto sender = env.Runtime.AllocateEdgeActor();
+        const auto isolate = env.Runtime.AddObserver<TEvLocal::TEvTabletMetrics>([&](auto& event) {
+            if (event->Get()->TabletId == env.TabletId && event->Sender != sender) {
+                event.Reset();
+            }
+        });
+        NKikimrTabletBase::TMetrics placement;
+        placement.SetMemory(999_MB);
+        env.Runtime.Send(new IEventHandle(env.Controller->Registrant, sender,
+            new TEvLocal::TEvTabletMetrics(env.TabletId, 0, placement, oldExecutor,
+                NMemory::TConsumerReport{.Used = 500_MB, .Demand = 520_MB, .Reclaimable = 10_MB}, oldSystem)));
+        env.Runtime.SimulateSleep(TDuration::Seconds(1));
+        UNIT_ASSERT_VALUES_EQUAL(env.Controller->Tablets->Last.Used, 30_MB);
+        env.Probe->LastZone.reset();
+        env.Runtime.Send(new IEventHandle(env.Controller->Registrant, TActorId(),
+            new NMemory::TEvConsumerLimit(NMemory::EMemoryConsumerKind::Tablets, 0, NMemory::EMemoryZone::Yellow)));
+        env.Runtime.SimulateSleep(TDuration::Seconds(1));
+        UNIT_ASSERT(env.Probe->LastZone);
+        UNIT_ASSERT_EQUAL(*env.Probe->LastZone, NMemory::EMemoryZone::Yellow);
     }
 
     Y_UNIT_TEST(TestTabletMemoryZeroShareIsDeliveredAndRevoked) {

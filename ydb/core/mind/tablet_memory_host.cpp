@@ -70,8 +70,14 @@ bool TTabletMemoryHost::Forget(TTabletKey tablet) {
     return before != Sums;
 }
 
-void TTabletMemoryHost::Clear() {
+void TTabletMemoryHost::Clear(const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters) {
     Slots.clear();
+    if (counters) {
+        for (auto& [type, report] : PerType) {
+            report = {};
+        }
+        UpdateCounters(counters);
+    }
     PerType.clear();
     Sums = {};
 }
