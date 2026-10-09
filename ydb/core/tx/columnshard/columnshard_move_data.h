@@ -65,7 +65,8 @@ public:
 
 // Stateless v1: no persistence; on restart Hive re-sends TEvMoveData.
 struct TMoveDataState {
-    TActorId HiveSender;
+    // Coalesced requests share the target union; every distinct subscriber receives its completion.
+    THashSet<TActorId> Subscribers;
     THashSet<ui32> TargetGroups;
     bool Active = false;
     // Set by the executor's MoveDataCompleted(): vacuum done, the blob gates still pending.

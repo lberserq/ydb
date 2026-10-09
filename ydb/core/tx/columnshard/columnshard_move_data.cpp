@@ -117,7 +117,7 @@ void TColumnShard::Handle(TEvTablet::TEvMoveData::TPtr& ev, const TActorContext&
         RefuseMoveData(ev->Sender, TabletID(), *liveGroup, ctx);
         return;
     }
-    MoveDataState.HiveSender = ev->Sender;
+    MoveDataState.Subscribers.emplace(ev->Sender);
     const bool changed = MergeTargetGroups(MoveDataState, requested);
     // Before Active is set, so an active session always has a driver to hand the gate to.
     StartMoveDataDriver(ctx);
@@ -241,7 +241,9 @@ void TColumnShard::CheckMoveDataGate(const TActorContext& ctx, const NOlap::NAct
         MutableIndexAs<NOlap::TColumnEngineForLogs>().StopMoveData();
     }
     // The boot-time CutHistory scan finds drained intervals by itself, so nothing needs persisting before Success.
-    ctx.Send(MoveDataState.HiveSender, new TEvTablet::TEvMoveDataResponse(TabletID(), NKikimrTabletBase::TEvMoveDataResponse::Success));
+    for (const auto& subscriber : MoveDataState.Subscribers) {
+        ctx.Send(subscriber, new TEvTablet::TEvMoveDataResponse(TabletID(), NKikimrTabletBase::TEvMoveDataResponse::Success));
+    }
     Counters.GetCSCounters().OnMoveDataFinished();
     MoveDataState = TMoveDataState{};
     StopMoveDataDriver(ctx);

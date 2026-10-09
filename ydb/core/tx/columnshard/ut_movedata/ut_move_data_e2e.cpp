@@ -392,6 +392,45 @@ Y_UNIT_TEST_SUITE(TColumnShardMoveDataE2E) {
         UNIT_ASSERT_VALUES_EQUAL(f.ReadRows(), 2001);
     }
 
+    Y_UNIT_TEST_TWIN(OverlappingRequestsReplyToEverySender, expandGroups) {
+        TMoveDataFixture f;
+        f.Controller->DisableBackground(EBackground::TTL);
+        f.Write(1, 0, 1000);
+        f.Controller->WaitCompactions(TDuration::Seconds(10));
+        f.Controller->DisableBackground(EBackground::Compaction);
+        f.ReassignPastWrittenData(*f.OldGroupProxy, *f.MidGroupProxy);
+        f.Write(2, 1000, 2000);
+        f.ReassignPastWrittenData(*f.MidGroupProxy, *f.NewGroupProxy);
+
+        const auto secondSender = f.Runtime.AllocateEdgeActor();
+        const std::vector<ui32> firstGroups = expandGroups ? std::vector<ui32>{ OldGroup } : std::vector<ui32>{ OldGroup, MidGroup };
+        f.Controller->DisableBackground(EBackground::GC);
+        f.StartMove(firstGroups);
+        UNIT_ASSERT_C(!f.DriveGateWithWrite(60, 3, 2000, 2001), "the first request completed before GC was enabled");
+
+        // A retry from the same subscriber needs one reply; another live subscriber must not replace it.
+        f.StartMove(firstGroups);
+        f.Runtime.SendToPipe(TabletId, secondSender, new TEvTablet::TEvMoveData({ OldGroup, MidGroup }), 0, GetPipeConfigWithRetries());
+        UNIT_ASSERT_C(!f.DriveGate(10), "the original sender received Success while GC was disabled");
+        const auto takeSecondResponse = [&]() {
+            return f.Runtime.GrabEdgeEventIf<TEvTablet::TEvMoveDataResponse>(secondSender, [](const TEvTablet::TEvMoveDataResponse::TPtr&) {
+                return true;
+            }, TDuration::MilliSeconds(100));
+        };
+        UNIT_ASSERT_C(!takeSecondResponse(), "the second sender received Success while GC was disabled");
+
+        f.Controller->EnableBackground(EBackground::GC);
+        const auto firstResponse = f.DriveGateWithWrite(200, 4, 3000, 3001);
+        UNIT_ASSERT_C(firstResponse, "the second sender replaced the original subscriber");
+        f.AssertDrainedSuccess(firstResponse);
+        const auto secondResponse = takeSecondResponse();
+        UNIT_ASSERT_C(secondResponse, "the second subscriber received no response");
+        f.AssertDrainedSuccess(secondResponse);
+        UNIT_ASSERT_VALUES_EQUAL_C(LivePortionBlobs(*f.MidGroupProxy, TabletId).size(), 0u, "answered before both requested groups drained");
+        UNIT_ASSERT_C(!f.DriveGate(2), "the repeated request produced a duplicate reply");
+        UNIT_ASSERT_C(!takeSecondResponse(), "the second subscriber received a duplicate reply");
+    }
+
     // An uncommitted write cannot be rewritten, yet its blobs sit in the old group until it commits and moves.
     Y_UNIT_TEST(SuccessWaitsForUncommittedWriteToCommit) {
         TMoveDataFixture f;
