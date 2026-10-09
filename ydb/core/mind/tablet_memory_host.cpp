@@ -23,24 +23,14 @@ void TTabletMemoryHost::AddDelta(TTabletTypes::EType tabletType, const TConsumer
     Sums.ElasticDemand = Sums.ElasticDemand - ElasticDemandOf(before) + ElasticDemandOf(after);
 }
 
-TTabletMemoryHost::TReportUpdate TTabletMemoryHost::TReportUpdate::FromMetrics(const NKikimrTabletBase::TMetrics& metrics) {
-    TReportUpdate update;
-    if (metrics.HasMemory()) {
-        update.Used = metrics.GetMemory();
-    }
-    if (metrics.HasMemoryDemand()) {
-        update.Demand = metrics.GetMemoryDemand();
-    }
-    if (metrics.HasMemoryReclaimable()) {
-        update.Reclaimable = metrics.GetMemoryReclaimable();
-    }
-    return update;
-}
-
 TTabletMemoryHost::TSetReportResult TTabletMemoryHost::SetReport(TTabletKey tablet, TActorId executor,
         TTabletTypes::EType tabletType, const TReportUpdate& update) {
     const auto [it, newSlot] = Slots.try_emplace(tablet);
     auto& slot = it->second;
+    const bool executorChanged = !newSlot && slot.Executor != executor;
+    if (executorChanged) {
+        slot.Share.reset();
+    }
     if (slot.TabletType != tabletType && slot.TabletType != TTabletTypes::TypeInvalid) {
         AddDelta(slot.TabletType, slot.Report, {});
         slot.Report = {};
@@ -65,7 +55,7 @@ TTabletMemoryHost::TSetReportResult TTabletMemoryHost::SetReport(TTabletKey tabl
     const TSums before = Sums;
     AddDelta(tabletType, slot.Report, report);
     slot.Report = report;
-    return {.SumsChanged = before != Sums, .NewSlot = newSlot};
+    return {.SumsChanged = before != Sums, .NewSlot = newSlot, .ExecutorChanged = executorChanged};
 }
 
 bool TTabletMemoryHost::Forget(TTabletKey tablet) {
@@ -87,22 +77,12 @@ void TTabletMemoryHost::Clear() {
 
 TVector<TTabletMemoryHost::TTabletShare> TTabletMemoryHost::ApplyElasticLimit(ui64 limitBytes) {
     TVector<TTabletShare> changed;
-    if (!Sums.Elastic) {
-        for (auto& [tablet, slot] : Slots) {
-            if (slot.Share) {
-                slot.Share = 0;
-                changed.push_back({.Executor = slot.Executor, .Bytes = 0});
-            }
-        }
-        return changed;
-    }
     for (auto& [tablet, slot] : Slots) {
-        if (!slot.Report.Reclaimable) {
+        if (!slot.Report.Reclaimable && !slot.Share) {
             continue;
         }
-        // A double keeps the product in range; the rounding error is bytes on a limit of gigabytes
-        const ui64 share = Min(limitBytes, static_cast<ui64>(
-            limitBytes * (static_cast<double>(slot.Report.Reclaimable) / static_cast<double>(Sums.Elastic))));
+        const ui64 share = slot.Report.Reclaimable ? static_cast<ui64>(
+            (static_cast<unsigned __int128>(limitBytes) * slot.Report.Reclaimable) / Sums.Elastic) : 0;
         if (share != slot.Share) {
             slot.Share = share;
             changed.push_back({.Executor = slot.Executor, .Bytes = share});

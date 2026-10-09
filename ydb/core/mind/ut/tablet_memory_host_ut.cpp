@@ -115,6 +115,52 @@ Y_UNIT_TEST(ElasticLimitIsSplitByReclaimable) {
     }
 }
 
+Y_UNIT_TEST(InitialZeroElasticLimitIsDelivered) {
+    TTabletMemoryHost host;
+    host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, Report(100, 100, 40));
+    const auto shares = host.ApplyElasticLimit(0);
+    UNIT_ASSERT_VALUES_EQUAL(shares.size(), 1u);
+    UNIT_ASSERT_VALUES_EQUAL(shares.front().Executor, MakeExecutor(1));
+    UNIT_ASSERT_VALUES_EQUAL(shares.front().Bytes, 0u);
+    UNIT_ASSERT(host.ApplyElasticLimit(0).empty());
+}
+
+Y_UNIT_TEST(ZeroReclaimableRevokesOnlyThatTabletsPreviousShare) {
+    TTabletMemoryHost host;
+    host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, Report(100, 100, 40));
+    host.SetReport({2, 0}, MakeExecutor(2), TTabletTypes::DataShard, Report(100, 100, 40));
+    UNIT_ASSERT_VALUES_EQUAL(host.ApplyElasticLimit(80).size(), 2u);
+    host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, Report(100, 100, 0));
+    const auto shares = host.ApplyElasticLimit(40);
+    UNIT_ASSERT_VALUES_EQUAL(shares.size(), 1u);
+    UNIT_ASSERT_VALUES_EQUAL(shares.front().Executor, MakeExecutor(1));
+    UNIT_ASSERT_VALUES_EQUAL(shares.front().Bytes, 0u);
+    UNIT_ASSERT(host.ApplyElasticLimit(40).empty());
+}
+
+Y_UNIT_TEST(ReplacingExecutorReplaysItsShare) {
+    TTabletMemoryHost host;
+    host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, Report(100, 100, 40));
+    UNIT_ASSERT_VALUES_EQUAL(host.ApplyElasticLimit(0).size(), 1u);
+    const auto change = host.SetReport({1, 0}, MakeExecutor(2), TTabletTypes::DataShard, Report(100, 100, 40));
+    UNIT_ASSERT(!change.NewSlot);
+    UNIT_ASSERT(!change.SumsChanged);
+    UNIT_ASSERT(change.ExecutorChanged);
+    const auto shares = host.ApplyElasticLimit(0);
+    UNIT_ASSERT_VALUES_EQUAL(shares.size(), 1u);
+    UNIT_ASSERT_VALUES_EQUAL(shares.front().Executor, MakeExecutor(2));
+    UNIT_ASSERT_VALUES_EQUAL(shares.front().Bytes, 0u);
+}
+
+Y_UNIT_TEST(ElasticSharesDoNotExceedTheLimit) {
+    TTabletMemoryHost host;
+    host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, Report(100, 100, 3));
+    host.SetReport({2, 0}, MakeExecutor(2), TTabletTypes::DataShard, Report(100, 100, 7));
+    const auto shares = host.ApplyElasticLimit(Max<ui64>());
+    UNIT_ASSERT_VALUES_EQUAL(shares.size(), 2u);
+    UNIT_ASSERT(shares[0].Bytes <= Max<ui64>() - shares[1].Bytes);
+}
+
 Y_UNIT_TEST(PerTypeSensorsFollowTheSlots) {
     TTabletMemoryHost host;
     host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, Report(100, 120, 20));

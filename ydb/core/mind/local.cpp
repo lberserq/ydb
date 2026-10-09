@@ -146,6 +146,7 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
         TIntrusivePtr<NMemory::IMemoryConsumer> TabletsConsumer;
         TIntrusivePtr<NMemory::IMemoryConsumer> TabletsElasticConsumer;
         NMemory::EMemoryZone NodeMemoryZone = NMemory::EMemoryZone::Green;
+        std::optional<ui64> ElasticLimit;
     };
 
     bool TabletMemoryHostEnabled = false;
@@ -216,21 +217,29 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
     }
 
     void UpdateTabletMemory(TTabletId tabletId, const TActorId &executor, TTabletTypes::EType tabletType,
-                            const NKikimrTabletBase::TMetrics &metrics, const TActorContext &ctx) {
-        if (!TabletMemoryHostEnabled) {
+                            const std::optional<NMemory::TConsumerReport>& report, const TActorContext &ctx) {
+        if (!TabletMemoryHostEnabled || !executor || !report) {
             return;
         }
-        const auto update = NMemory::TTabletMemoryHost::TReportUpdate::FromMetrics(metrics);
-        if (update.IsEmpty()) {
-            return;
-        }
+        const NMemory::TTabletMemoryHost::TReportUpdate update{
+            .Used = report->Used, .Demand = report->Demand, .Reclaimable = report->Reclaimable};
         const auto result = MemoryHost.Host.SetReport(tabletId, executor, tabletType, update);
         if (result.SumsChanged) {
             PublishTabletMemory();
         }
         // A tablet that boots onto a node already under pressure learns the zone with its first report
-        if (result.NewSlot && MemoryHost.NodeMemoryZone != NMemory::EMemoryZone::Green) {
+        if (result.NewSlot || result.ExecutorChanged) {
             ctx.Send(executor, new NMemory::TEvMemoryZone(MemoryHost.NodeMemoryZone));
+        }
+        if (MemoryHost.ElasticLimit && (result.SumsChanged || result.NewSlot || result.ExecutorChanged)) {
+            ApplyTabletElasticLimit(*MemoryHost.ElasticLimit, ctx);
+        }
+    }
+
+    void ApplyTabletElasticLimit(ui64 limitBytes, const TActorContext& ctx) {
+        MemoryHost.ElasticLimit = limitBytes;
+        for (const auto& share : MemoryHost.Host.ApplyElasticLimit(limitBytes)) {
+            ctx.Send(share.Executor, new NMemory::TEvMemoryZone(MemoryHost.NodeMemoryZone, share.Bytes));
         }
     }
 
@@ -267,9 +276,7 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
         if (msg->Kind != NMemory::EMemoryConsumerKind::TabletsElastic) {
             return;
         }
-        for (const auto& share : MemoryHost.Host.ApplyElasticLimit(msg->LimitBytes)) {
-            ctx.Send(share.Executor, new NMemory::TEvMemoryZone(MemoryHost.NodeMemoryZone, share.Bytes));
-        }
+        ApplyTabletElasticLimit(msg->LimitBytes, ctx);
     }
 
     void Die(const TActorContext &ctx) override {
@@ -724,7 +731,7 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
                     it->second.ResourceValues.AddGroupWriteIops()->CopyFrom(v);
                 }
             }
-            UpdateTabletMemory(tabletId, ev->Sender, it->second.TabletType, metrics, ctx);
+            UpdateTabletMemory(tabletId, msg->Executor, it->second.TabletType, msg->TabletMemoryReport, ctx);
             auto after = it->second.ResourceValues.ByteSize();
             if (after == 0 && before == 0) {
                 return;

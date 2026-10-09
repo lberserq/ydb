@@ -468,7 +468,7 @@ void TExecutor::ActivateFollower(const TActorContext &ctx) {
 
     Y_ENSURE(!CompactionLogic);
 
-    ResourceMetrics = MakeHolder<NMetrics::TResourceMetrics>(Owner->TabletID(), FollowerId, Launcher);
+    ResourceMetrics = MakeHolder<NMetrics::TResourceMetrics>(Owner->TabletID(), FollowerId, Launcher, SelfId());
 
     PendingBlobQueue.Config.TabletID = Owner->TabletID();
     PendingBlobQueue.Config.Generation = Generation();
@@ -519,7 +519,7 @@ void TExecutor::Active(const TActorContext &ctx) {
     VacuumLogic = MakeHolder<TVacuumLogic>(static_cast<NActors::IActorOps*>(this), this, Owner, Logger.Get(), GcLogic.Get());
     LogicRedo->InstallCounters(Counters.Get(), AppTxCounters);
 
-    ResourceMetrics = MakeHolder<NMetrics::TResourceMetrics>(Owner->TabletID(), 0, Launcher);
+    ResourceMetrics = MakeHolder<NMetrics::TResourceMetrics>(Owner->TabletID(), 0, Launcher, SelfId());
 
     PendingBlobQueue.Config.TabletID = Owner->TabletID();
     PendingBlobQueue.Config.Generation = Generation();
@@ -4276,6 +4276,8 @@ void TExecutor::UpdateCounters(const TActorContext &ctx) {
                     ResourceMetrics->SetMemoryReport(memorySize,
                         memorySize + (OwnerMemoryReport.Demand - OwnerMemoryReport.Used),
                         OwnerMemoryReport.Reclaimable);
+                    // Owner bytes only: memtables, shared pages and RB reservations have their own MC attribution.
+                    ResourceMetrics->TabletMemoryReport = OwnerMemoryReport;
                 } else {
                     auto limit = Memory->Profile->GetStaticTabletTxMemoryLimit();
                     memorySize = limit ? (UsedTabletMemory + limit) : (UsedTabletMemory + memory.Static);
@@ -4568,6 +4570,9 @@ void TExecutor::Handle(NMemory::TEvMemTableCompact::TPtr &ev) {
 
 // One event means "something changed": the tablet gets the zone and, once it has one, its share
 void TExecutor::Handle(NMemory::TEvMemoryZone::TPtr &ev) {
+    if (!TabletMemoryHostEnabled) {
+        return;
+    }
     const auto *msg = ev->Get();
     const bool zoneChanged = MemoryZone != msg->Zone;
     MemoryZone = msg->Zone;
