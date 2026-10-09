@@ -12367,7 +12367,8 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         for (auto& event : acks) {
             env.Runtime.Send(event.Release(), 0, true);
         }
-        env.Runtime.SimulateSleep(TDuration::Seconds(6));
+        // A held ack increases the batch delay; cover its 60-second scheduling ceiling.
+        env.Runtime.SimulateSleep(TDuration::Seconds(61));
         const auto metrics = env.MetricsOfTablet();
         UNIT_ASSERT_VALUES_EQUAL(metrics.size(), before);
         for (const auto& record : metrics) {
