@@ -3851,6 +3851,9 @@ void TKeyValueState::ProcessPostponedTrims(const TActorContext& ctx, const TTabl
                 StartAdmittedIntermediate(std::move(interm), NMemory::EAdmitSource::FromQueue);
             } else if (!interm->MemoryAdmissionStarted &&
                 (requestType == TRequestType::WriteOnly || requestType == TRequestType::ReadOnlyInline)) {
+                // One GC has finished. Reserve this trim's turn while it rejoins
+                // admission, so another GC cannot repeatedly postpone it.
+                CmdTrimLeakedBlobsUids.insert(interm->RequestUid);
                 AdmitIntermediate(std::move(interm));
             } else {
                 RegisterRequestActor(ctx, std::move(interm), info, ExecutorGeneration);

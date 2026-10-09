@@ -4469,6 +4469,111 @@ Y_UNIT_TEST(TestGCBlockedTrimYieldsRedSlotAndRetainsPayloadCharge) {
     UNIT_ASSERT_VALUES_EQUAL(state.GetMemoryAdmissionStats().HeldBytes(), 0u);
 }
 
+Y_UNIT_TEST(TestGCDeferredTrimKeepsItsTurnUntilStartOrExpiry) {
+    for (bool expires : {false, true}) {
+        std::optional<TActorId> tabletActor;
+        TTestContext tc;
+        TFinalizer finalizer(tc);
+        bool activeZone = false;
+        tc.Prepare(INITIAL_TEST_DISPATCH_NAME, TrackTabletActorWithMemoryHost(tabletActor), activeZone);
+        tc.Runtime->SetScheduledLimit(10000);
+        ExecuteWrite(tc, {{"m0", TString(30, 'z')}, {"trash", TString(30, 't')},
+            {"trash2", TString(30, 'u')}, {"advance", TString(30, 'd')}},
+            0, NKeyValue::MainStorageChannelInPublicApi, NKikimrKeyValue::Priorities::PRIORITY_REALTIME);
+        ExecuteDeleteRange(tc, "advance", EBorderKind::Include, "advance", EBorderKind::Include, 0);
+        tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+        tc.Runtime->EnableScheduleForActor(*tabletActor);
+        SetTabletMemoryZone(tc, tabletActor, NMemory::EMemoryZone::Red);
+        THeldPuts puts(tc);
+        SendMainWrite(tc, "a", 10);
+        auto trim = MakeWriteRequest(123, "trim-write", TString(100, 'x'), NKikimrClient::TKeyValueRequest::MAIN);
+        trim->Record.MutableCmdTrimLeakedBlobs()->SetMaxItemsToTrim(100);
+        if (expires) {
+            trim->Record.SetDeadlineInstantMs((tc.Runtime->GetCurrentTime() + TDuration::Seconds(3)).MilliSeconds());
+        }
+        SendRequestEvent(std::move(trim), tc);
+        tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+        TDeque<TEvBlobStorage::TEvCollectGarbageResult::TPtr> held;
+        auto observer = tc.Runtime->AddObserver<TEvBlobStorage::TEvCollectGarbageResult>([&](auto& event) {
+            held.emplace_back(std::move(event));
+        });
+        const auto deleteWithRead = [&](const TString& key, ui64 cookie) {
+            auto request = MakeReadRequest(cookie, {"m0"});
+            auto* range = request->Record.AddCmdDeleteRange()->MutableRange();
+            range->SetFrom(key);
+            range->SetTo(key);
+            range->SetIncludeFrom(true);
+            range->SetIncludeTo(true);
+            SendRequestEvent(std::move(request), tc);
+            const auto reply = ReceiveKeyValueResponse(tc);
+            UNIT_ASSERT_VALUES_EQUAL(reply.GetCookie(), cookie);
+            UNIT_ASSERT_VALUES_EQUAL(reply.GetStatus(), NMsgBusProxy::MSTATUS_OK);
+            tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+        };
+        deleteWithRead("trash", 321);
+        UNIT_ASSERT(!held.empty());
+        SendMainWrite(tc, "b", 20);
+        SendMainWrite(tc, "c", 30);
+        puts.ReleaseAll(tc);
+        ExpectWriteOk(tc);
+        auto& state = GetTabletState(tc, tabletActor);
+        UNIT_ASSERT_VALUES_EQUAL(state.GetMemoryAdmissionStats().RunningBytes, 20u);
+        UNIT_ASSERT_VALUES_EQUAL(state.GetMemoryWaitingForGC(), 100u);
+        // Complete GC while b still holds Red's only slot. c stays ahead of the trim.
+        auto firstGC = std::move(held);
+        held.clear();
+        for (auto& event : firstGC) {
+            tc.Runtime->Send(event.Release(), 0, true);
+        }
+        tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+        UNIT_ASSERT_VALUES_EQUAL(state.GetMemoryWaitingForGC(), 0u);
+        UNIT_ASSERT_VALUES_EQUAL(state.GetMemoryAdmissionStats().PostponedBytes, 130u);
+        UNIT_ASSERT_VALUES_EQUAL(state.GetRunningTrimsCount(), 1u); // Reserved GC turn.
+        deleteWithRead("trash2", 322);
+        UNIT_ASSERT(held.empty()); // The next GC cannot overtake the deferred trim.
+        if (expires) {
+            tc.Runtime->SimulateSleep(TDuration::Seconds(3));
+            const auto reply = ReceiveKeyValueResponse(tc);
+            UNIT_ASSERT_VALUES_EQUAL(reply.GetCookie(), 123u);
+            UNIT_ASSERT_VALUES_EQUAL(reply.GetStatus(), NMsgBusProxy::MSTATUS_TIMEOUT);
+            tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+            UNIT_ASSERT_VALUES_EQUAL(state.GetRunningTrimsCount(), 0u);
+            UNIT_ASSERT_VALUES_EQUAL(state.GetMemoryAdmissionStats().PostponedBytes, 30u);
+            UNIT_ASSERT_VALUES_EQUAL(puts.Held.size(), 1u); // Expiry issued no trim write.
+            UNIT_ASSERT(!held.empty()); // Cleanup released the GC reservation.
+            observer.Remove();
+            for (auto& event : held) {
+                tc.Runtime->Send(event.Release(), 0, true);
+            }
+            puts.ReleaseAll(tc);
+            ExpectWriteOk(tc);
+            puts.ReleaseAll(tc);
+            ExpectWriteOk(tc);
+        } else {
+            puts.ReleaseAll(tc);
+            ExpectWriteOk(tc); // b completed; c runs ahead of the trim.
+            UNIT_ASSERT_VALUES_EQUAL(state.GetMemoryAdmissionStats().RunningBytes, 30u);
+            SendMainWrite(tc, "d", 40); // New work goes behind the reserved trim.
+            puts.ReleaseAll(tc);
+            ExpectWriteOk(tc);
+            UNIT_ASSERT_VALUES_EQUAL(state.GetMemoryAdmissionStats().RunningBytes, 100u);
+            UNIT_ASSERT_VALUES_EQUAL(state.GetRunningTrimsCount(), 1u);
+            UNIT_ASSERT(held.empty());
+            observer.Remove();
+            puts.ReleaseAll(tc);
+            const auto reply = ReceiveKeyValueResponse(tc);
+            UNIT_ASSERT_VALUES_EQUAL(reply.GetCookie(), 123u);
+            UNIT_ASSERT_VALUES_EQUAL(reply.GetStatus(), NMsgBusProxy::MSTATUS_OK);
+            puts.ReleaseAll(tc);
+            ExpectWriteOk(tc);
+        }
+        tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+        UNIT_ASSERT_VALUES_EQUAL(state.GetRunningTrimsCount(), 0u);
+        UNIT_ASSERT_VALUES_EQUAL(state.GetMemoryWaitingForGC(), 0u);
+        UNIT_ASSERT_VALUES_EQUAL(state.GetMemoryAdmissionStats().HeldBytes(), 0u);
+    }
+}
+
 class TAdmitPreparedExpiredRequest : public TActorBootstrapped<TAdmitPreparedExpiredRequest> {
 public:
     TAdmitPreparedExpiredRequest(NKeyValue::TKeyValueState& state, TActorId tablet, TActorId edge)
