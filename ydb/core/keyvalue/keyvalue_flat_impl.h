@@ -940,7 +940,7 @@ public:
         State.OnInitQueueEmpty();
     }
 
-    void Handle(TEvKeyValue::TEvAdmissionDeadline::TPtr& ev, const TActorContext&) {
+    void Handle(TEvKeyValue::TEvAdmissionDeadline::TPtr& ev) {
         State.OnAdmissionDeadline(ev->Get()->RequestUid);
     }
 
