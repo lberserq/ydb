@@ -3069,6 +3069,49 @@ Y_UNIT_TEST(TestReadRequestInFlightLimit) {
     CmdRead({"key-1"}, NKikimrClient::TKeyValueRequest::REALTIME, {"value"}, {false}, {creationUnixTime}, tc);
 }
 
+Y_UNIT_TEST(TestRequestInFlightLimitRejectsReadWriteAndDelete) {
+    TTestContext tc;
+    TFinalizer finalizer(tc);
+    bool activeZone = false;
+    tc.Prepare(INITIAL_TEST_DISPATCH_NAME, [](TTestActorRuntime &){}, activeZone);
+
+    auto &icb = tc.Runtime->GetAppData().Icb;
+    TControlWrapper requestsInFlightLimit(10'000, 1, 1'000'000);
+    TControlBoard::RegisterSharedControl(requestsInFlightLimit,
+        icb->KeyValueVolumeControls.RequestsInFlightLimit);
+    requestsInFlightLimit = 1;
+
+    ExecuteWrite(tc, {{"key", "value"}}, 0, 2,
+        NKikimrKeyValue::Priorities::PRIORITY_REALTIME);
+
+    TGetBlocker gets(*tc.Runtime);
+    gets.BlockChannel(NKeyValue::BLOB_CHANNEL);
+
+    SendRequestEvent(MakeReadRequest(1, {"key"}), tc);
+    tc.Runtime->WaitFor("blocked read fills the request in-flight limit", [&] {
+        return gets.BlockedCount(NKeyValue::BLOB_CHANNEL) == 1;
+    }, TDuration::Seconds(1));
+
+    ExecuteRead<NKikimrKeyValue::Statuses::RSTATUS_BLOCKED>(tc,
+        "key", "", 0, 0, 0);
+    ExecuteWrite<NKikimrKeyValue::Statuses::RSTATUS_BLOCKED>(tc,
+        {{"another-key", "another-value"}}, 0, 2,
+        NKikimrKeyValue::Priorities::PRIORITY_REALTIME);
+
+    TDesiredPair<TEvKeyValue::TEvExecuteTransaction> deleteRequest;
+    deleteRequest.Request.set_tablet_id(tc.TabletId);
+    deleteRequest.Request.set_lock_generation(0);
+    auto *range = deleteRequest.Request.add_commands()->mutable_delete_range()->mutable_range();
+    range->set_from_key_inclusive("key");
+    range->set_to_key_inclusive("key");
+    ExecuteEvent(deleteRequest, tc);
+    UNIT_ASSERT_C(deleteRequest.Response.status() == NKikimrKeyValue::Statuses::RSTATUS_BLOCKED,
+        deleteRequest.Response.msg());
+
+    gets.UnblockOne();
+    CheckReadResponse(ReceiveKeyValueResponse(tc), 1, {"value"});
+}
+
 Y_UNIT_TEST(TestWriteToNonExistentChannelReturnsError) {
     TTestContext tc;
     RunTestWithReboots(tc.TabletIds, [&]() {
@@ -3978,30 +4021,24 @@ void ExpectWriteOk(TTestContext& tc) {
     tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
 }
 
-// the host is a process singleton: every zone test starts from Green and leaves Green behind
-struct TNodeZoneGuard {
-    TNodeZoneGuard() {
-        NMemory::TTabletMemoryHost::Instance().SetNodeZone(NMemory::EMemoryZone::Green);
-    }
-
-    ~TNodeZoneGuard() {
-        NMemory::TTabletMemoryHost::Instance().SetNodeZone(NMemory::EMemoryZone::Green);
-    }
-};
+void SetTabletMemoryZone(TTestContext& tc, const std::optional<TActorId>& tabletActor, NMemory::EMemoryZone zone) {
+    UNIT_ASSERT(tabletActor);
+    auto* tablet = dynamic_cast<NKeyValue::TKeyValueFlat*>(tc.Runtime->FindActor(*tabletActor));
+    UNIT_ASSERT(tablet);
+    tc.Runtime->Send(new IEventHandle(tablet->ExecutorID(), tc.Edge, new NMemory::TEvMemoryZone(zone)));
+    tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+}
 
 Y_UNIT_TEST(TestMemoryZoneGreenAdmitsEverything) {
     std::optional<TActorId> tabletActor;
     TTestContext tc;
     TFinalizer finalizer(tc);
-    TNodeZoneGuard zone;
     bool activeZone = false;
     tc.Prepare(INITIAL_TEST_DISPATCH_NAME, TrackTabletActorWithMemoryHost(tabletActor), activeZone);
     tc.Runtime->SetScheduledLimit(10000);
-    auto& host = NMemory::TTabletMemoryHost::Instance();
 
     ExecuteWrite(tc, {{"m0", TString(30, 'z')}}, 0, NKeyValue::MainStorageChannelInPublicApi,
         NKikimrKeyValue::Priorities::PRIORITY_REALTIME);
-    UNIT_ASSERT_VALUES_EQUAL(host.GetSlotsCount(TTabletTypes::KeyValue), 1);
     THeldPuts puts(tc);
     tc.Runtime->ResetScheduledCount();
     SendMainWrite(tc, "a", 10);
@@ -4030,11 +4067,9 @@ Y_UNIT_TEST(TestMemoryZoneYellowFreezesGrowth) {
     std::optional<TActorId> tabletActor;
     TTestContext tc;
     TFinalizer finalizer(tc);
-    TNodeZoneGuard zone;
     bool activeZone = false;
     tc.Prepare(INITIAL_TEST_DISPATCH_NAME, TrackTabletActorWithMemoryHost(tabletActor), activeZone);
     tc.Runtime->SetScheduledLimit(10000);
-    auto& host = NMemory::TTabletMemoryHost::Instance();
 
     ExecuteWrite(tc, {{"m0", TString(30, 'z')}}, 0, NKeyValue::MainStorageChannelInPublicApi,
         NKikimrKeyValue::Priorities::PRIORITY_REALTIME);
@@ -4045,7 +4080,7 @@ Y_UNIT_TEST(TestMemoryZoneYellowFreezesGrowth) {
     UNIT_ASSERT_VALUES_EQUAL(GetTabletState(tc, tabletActor).GetMemoryAdmissionStats().RunningBytes, 10);
 
     // Yellow freezes the running bytes at 10: 10 plus 30 exceeds the watermark, the write waits and sends no put
-    host.SetNodeZone(NMemory::EMemoryZone::Yellow);
+    SetTabletMemoryZone(tc, tabletActor, NMemory::EMemoryZone::Yellow);
     SendMainWrite(tc, "b", 30);
     UNIT_ASSERT_VALUES_EQUAL(puts.Held.size(), 1);
     {
@@ -4075,16 +4110,14 @@ Y_UNIT_TEST(TestMemoryZoneRedAdmitsOneAtATime) {
     std::optional<TActorId> tabletActor;
     TTestContext tc;
     TFinalizer finalizer(tc);
-    TNodeZoneGuard zone;
     bool activeZone = false;
     tc.Prepare(INITIAL_TEST_DISPATCH_NAME, TrackTabletActorWithMemoryHost(tabletActor), activeZone);
     tc.Runtime->SetScheduledLimit(10000);
-    auto& host = NMemory::TTabletMemoryHost::Instance();
 
     ExecuteWrite(tc, {{"m0", TString(30, 'z')}}, 0, NKeyValue::MainStorageChannelInPublicApi,
         NKikimrKeyValue::Priorities::PRIORITY_REALTIME);
     // Red: nothing is rejected, the writes go one at a time
-    host.SetNodeZone(NMemory::EMemoryZone::Red);
+    SetTabletMemoryZone(tc, tabletActor, NMemory::EMemoryZone::Red);
     THeldPuts puts(tc);
     tc.Runtime->ResetScheduledCount();
     SendMainWrite(tc, "a", 10);
@@ -4111,15 +4144,13 @@ Y_UNIT_TEST(TestMemoryZoneGreenDrainsWithoutCompletion) {
     std::optional<TActorId> tabletActor;
     TTestContext tc;
     TFinalizer finalizer(tc);
-    TNodeZoneGuard zone;
     bool activeZone = false;
     tc.Prepare(INITIAL_TEST_DISPATCH_NAME, TrackTabletActorWithMemoryHost(tabletActor), activeZone);
     tc.Runtime->SetScheduledLimit(10000);
-    auto& host = NMemory::TTabletMemoryHost::Instance();
 
     ExecuteWrite(tc, {{"m0", TString(30, 'z')}}, 0, NKeyValue::MainStorageChannelInPublicApi,
         NKikimrKeyValue::Priorities::PRIORITY_REALTIME);
-    host.SetNodeZone(NMemory::EMemoryZone::Red);
+    SetTabletMemoryZone(tc, tabletActor, NMemory::EMemoryZone::Red);
     THeldPuts puts(tc);
     tc.Runtime->ResetScheduledCount();
     SendMainWrite(tc, "a", 10);
@@ -4128,7 +4159,7 @@ Y_UNIT_TEST(TestMemoryZoneGreenDrainsWithoutCompletion) {
     UNIT_ASSERT_VALUES_EQUAL(GetTabletState(tc, tabletActor).GetMemoryAdmissionStats().PostponedCount, 1);
 
     // Green wakes the tablet and drains the queue while the first write is still running
-    host.SetNodeZone(NMemory::EMemoryZone::Green);
+    SetTabletMemoryZone(tc, tabletActor, NMemory::EMemoryZone::Green);
     tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
     UNIT_ASSERT_VALUES_EQUAL(puts.Held.size(), 2);
     {
@@ -4143,21 +4174,99 @@ Y_UNIT_TEST(TestMemoryZoneGreenDrainsWithoutCompletion) {
     ExpectContents(tc, {{"a", TString(10, 'a')}, {"b", TString(30, 'b')}, {"m0", TString(30, 'z')}});
 }
 
+Y_UNIT_TEST(TestMemoryZoneYellowRefreshesWatermarkWithoutQueuedRequests) {
+    std::optional<TActorId> tabletActor;
+    TTestContext tc;
+    TFinalizer finalizer(tc);
+    bool activeZone = false;
+    tc.Prepare(INITIAL_TEST_DISPATCH_NAME, TrackTabletActorWithMemoryHost(tabletActor), activeZone);
+    tc.Runtime->SetScheduledLimit(10000);
+    ExecuteWrite(tc, {{"m0", TString(30, 'z')}}, 0, NKeyValue::MainStorageChannelInPublicApi,
+        NKikimrKeyValue::Priorities::PRIORITY_REALTIME);
+    THeldPuts puts(tc);
+    SendMainWrite(tc, "a", 100);
+    SetTabletMemoryZone(tc, tabletActor, NMemory::EMemoryZone::Yellow);
+    SendMainWrite(tc, "b", 40);
+    puts.ReleaseAll(tc);
+    ExpectWriteOk(tc);
+    UNIT_ASSERT_VALUES_EQUAL(GetTabletState(tc, tabletActor).GetMemoryAdmissionStats().RunningBytes, 40u);
+    SetTabletMemoryZone(tc, tabletActor, NMemory::EMemoryZone::Green);
+    SetTabletMemoryZone(tc, tabletActor, NMemory::EMemoryZone::Yellow);
+    SendMainWrite(tc, "c", 60);
+    const auto stats = GetTabletState(tc, tabletActor).GetMemoryAdmissionStats();
+    UNIT_ASSERT_VALUES_EQUAL(stats.RunningBytes, 40u);
+    UNIT_ASSERT_VALUES_EQUAL(stats.PostponedBytes, 60u);
+    UNIT_ASSERT_VALUES_EQUAL(puts.Held.size(), 1u);
+    puts.ReleaseAll(tc);
+    ExpectWriteOk(tc);
+    puts.ReleaseAll(tc);
+    ExpectWriteOk(tc);
+    UNIT_ASSERT_VALUES_EQUAL(GetTabletState(tc, tabletActor).GetMemoryAdmissionStats().HeldBytes(), 0u);
+}
+
+Y_UNIT_TEST(TestMemoryAdmissionQueuedRequestsExpire) {
+    for (bool inlineRead : {false, true}) {
+        std::optional<TActorId> tabletActor;
+        TTestContext tc;
+        TFinalizer finalizer(tc);
+        bool activeZone = false;
+        tc.Prepare(INITIAL_TEST_DISPATCH_NAME, TrackTabletActorWithMemoryHost(tabletActor), activeZone);
+        tc.Runtime->SetScheduledLimit(10000);
+        ExecuteWrite(tc, {{"m0", TString(30, 'z')}}, 0, NKeyValue::MainStorageChannelInPublicApi,
+            NKikimrKeyValue::Priorities::PRIORITY_REALTIME);
+        CmdWrite("inline", "inline value", NKikimrClient::TKeyValueRequest::INLINE,
+            NKikimrClient::TKeyValueRequest::REALTIME, tc);
+        tc.Runtime->EnableScheduleForActor(*tabletActor);
+        SetTabletMemoryZone(tc, tabletActor, NMemory::EMemoryZone::Red);
+        THeldPuts puts(tc);
+        SendMainWrite(tc, "a", 10);
+        const auto refsBefore = GetTabletState(tc, tabletActor).GetStateBytes().RefCountsBytes;
+
+        auto request = std::make_unique<TEvKeyValue::TEvRequest>();
+        auto& record = request->Record;
+        record.SetTabletId(tc.TabletId);
+        record.SetCookie(123);
+        record.SetDeadlineInstantMs((tc.Runtime->GetCurrentTime() + TDuration::Seconds(1)).MilliSeconds());
+        if (inlineRead) {
+            record.AddCmdRead()->SetKey("inline");
+        } else {
+            auto* write = record.AddCmdWrite();
+            write->SetKey("expired");
+            write->SetValue(TString(100, 'x'));
+            write->SetStorageChannel(NKikimrClient::TKeyValueRequest::MAIN);
+        }
+        SendRequestEvent(std::move(request), tc);
+        tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+        UNIT_ASSERT_VALUES_EQUAL(GetTabletState(tc, tabletActor).GetMemoryAdmissionStats().PostponedCount, 1u);
+        const auto reply = ReceiveKeyValueResponse(tc);
+        UNIT_ASSERT_VALUES_EQUAL(reply.GetCookie(), 123u);
+        UNIT_ASSERT_VALUES_EQUAL(reply.GetStatus(), NMsgBusProxy::MSTATUS_TIMEOUT);
+        tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+        const auto stats = GetTabletState(tc, tabletActor).GetMemoryAdmissionStats();
+        UNIT_ASSERT_VALUES_EQUAL(stats.RunningCount, 1u);
+        UNIT_ASSERT_VALUES_EQUAL(stats.PostponedCount, 0u);
+        UNIT_ASSERT_VALUES_EQUAL(stats.PostponedBytes, 0u);
+        UNIT_ASSERT_VALUES_EQUAL(puts.Held.size(), 1u);
+        UNIT_ASSERT_VALUES_EQUAL(GetTabletState(tc, tabletActor).GetStateBytes().RefCountsBytes, refsBefore);
+        puts.ReleaseAll(tc);
+        ExpectWriteOk(tc);
+        SetTabletMemoryZone(tc, tabletActor, NMemory::EMemoryZone::Green);
+        ExpectContents(tc, {{"a", TString(10, 'a')}, {"inline", "inline value"}, {"m0", TString(30, 'z')}});
+    }
+}
+
 Y_UNIT_TEST(TestMemoryZoneIgnoredWithoutHost) {
     std::optional<TActorId> tabletActor;
     TTestContext tc;
     TFinalizer finalizer(tc);
-    TNodeZoneGuard zone;
     bool activeZone = false;
     tc.Prepare(INITIAL_TEST_DISPATCH_NAME, TrackTabletActor(tabletActor), activeZone);
     tc.Runtime->SetScheduledLimit(10000);
-    auto& host = NMemory::TTabletMemoryHost::Instance();
 
     ExecuteWrite(tc, {{"m0", TString(30, 'z')}}, 0, NKeyValue::MainStorageChannelInPublicApi,
         NKikimrKeyValue::Priorities::PRIORITY_REALTIME);
-    // the flag is off: the tablet holds a detached slot, so the node zone reaches nobody and nothing waits
-    UNIT_ASSERT_VALUES_EQUAL(host.GetSlotsCount(TTabletTypes::KeyValue), 0);
-    host.SetNodeZone(NMemory::EMemoryZone::Red);
+    // With the feature off, executor feedback must leave admission in Green.
+    SetTabletMemoryZone(tc, tabletActor, NMemory::EMemoryZone::Red);
     THeldPuts puts(tc);
     tc.Runtime->ResetScheduledCount();
     SendMainWrite(tc, "a", 10);

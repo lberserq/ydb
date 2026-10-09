@@ -1,9 +1,12 @@
 #include "local.h"
+#include "tablet_memory_host.h"
 
 #include <ydb/core/protos/config.pb.h>
 #include <ydb/core/base/appdata.h>
 #include <ydb/core/base/counters.h>
 #include <ydb/core/base/hive.h>
+#include <ydb/core/base/memory_controller_iface.h>
+#include <ydb/core/base/memory_controller_iface.h_serialized.h>
 #include <ydb/core/base/domain.h>
 #include <ydb/core/base/tablet_pipe.h>
 #include <ydb/core/blobstorage/base/blobstorage_events.h>
@@ -135,6 +138,19 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
     static constexpr size_t MaxRetainedCutHistoryPerTablet = 1024;
     THashMap<ui64, TVector<TCutHistoryEvent>> RetainedCutHistory;
 
+    // All this registrar needs to host the tablet memory slots of its node
+    struct TNodeMemoryHostContext {
+        NMemory::TTabletMemoryHost Host;
+        // Own subgroup: several registrars of one node share the tablets counters group
+        ::NMonitoring::TDynamicCounterPtr Counters;
+        TIntrusivePtr<NMemory::IMemoryConsumer> TabletsConsumer;
+        TIntrusivePtr<NMemory::IMemoryConsumer> TabletsElasticConsumer;
+        NMemory::EMemoryZone NodeMemoryZone = NMemory::EMemoryZone::Green;
+    };
+
+    bool TabletMemoryHostEnabled = false;
+    TNodeMemoryHostContext MemoryHost;
+
     NKikimrTabletBase::TMetrics ResourceLimit;
     TResourceProfilesPtr ResourceProfiles;
     TSharedQuotaPtr TxCacheQuota;
@@ -162,7 +178,102 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
         return {tabletId.first, 0};
     }
 
+    void RegisterInMemoryController(const TActorContext &ctx) {
+        if (!TabletMemoryHostEnabled) {
+            return;
+        }
+        MemoryHost.Counters = Counters->GetSubgroup("hive", ToString(HiveId));
+        const TActorId memoryController = NMemory::MakeMemoryControllerId();
+        ctx.Send(memoryController, new NMemory::TEvConsumerRegister(NMemory::EMemoryConsumerKind::Tablets));
+        ctx.Send(memoryController, new NMemory::TEvConsumerRegister(NMemory::EMemoryConsumerKind::TabletsElastic));
+    }
+
+    void UnregisterFromMemoryController(const TActorContext &ctx) {
+        if (!TabletMemoryHostEnabled) {
+            return;
+        }
+        const TActorId memoryController = NMemory::MakeMemoryControllerId();
+        ctx.Send(memoryController, new NMemory::TEvConsumerUnregister(NMemory::EMemoryConsumerKind::Tablets));
+        ctx.Send(memoryController, new NMemory::TEvConsumerUnregister(NMemory::EMemoryConsumerKind::TabletsElastic));
+        MemoryHost.TabletsConsumer.Reset();
+        MemoryHost.TabletsElasticConsumer.Reset();
+        MemoryHost.Host.Clear();
+    }
+
+    void PublishTabletMemory() {
+        if (MemoryHost.TabletsConsumer) {
+            MemoryHost.TabletsConsumer->SetReport(MemoryHost.Host.GetReport());
+        }
+        if (MemoryHost.TabletsElasticConsumer) {
+            MemoryHost.TabletsElasticConsumer->SetReport(MemoryHost.Host.GetElasticReport());
+        }
+    }
+
+    void ForgetTabletMemory(TTabletId tabletId) {
+        if (TabletMemoryHostEnabled && MemoryHost.Host.Forget(tabletId)) {
+            PublishTabletMemory();
+        }
+    }
+
+    void UpdateTabletMemory(TTabletId tabletId, const TActorId &executor, TTabletTypes::EType tabletType,
+                            const NKikimrTabletBase::TMetrics &metrics, const TActorContext &ctx) {
+        if (!TabletMemoryHostEnabled) {
+            return;
+        }
+        const auto update = NMemory::TTabletMemoryHost::TReportUpdate::FromMetrics(metrics);
+        if (update.IsEmpty()) {
+            return;
+        }
+        const auto result = MemoryHost.Host.SetReport(tabletId, executor, tabletType, update);
+        if (result.SumsChanged) {
+            PublishTabletMemory();
+        }
+        // A tablet that boots onto a node already under pressure learns the zone with its first report
+        if (result.NewSlot && MemoryHost.NodeMemoryZone != NMemory::EMemoryZone::Green) {
+            ctx.Send(executor, new NMemory::TEvMemoryZone(MemoryHost.NodeMemoryZone));
+        }
+    }
+
+    void Handle(NMemory::TEvConsumerRegistered::TPtr &ev, const TActorContext &ctx) {
+        auto *msg = ev->Get();
+        YDB_LOG_DEBUG_CTX(ctx, "TLocalNodeRegistrar: registered as a memory consumer",
+            {"kind", ToString(msg->Kind)});
+        if (msg->Kind == NMemory::EMemoryConsumerKind::TabletsElastic) {
+            MemoryHost.TabletsElasticConsumer = std::move(msg->Consumer);
+        } else {
+            MemoryHost.TabletsConsumer = std::move(msg->Consumer);
+        }
+        PublishTabletMemory();
+    }
+
+    // The zone is a node-level fact every limit of the tick carries, so it is taken from whichever kind arrives first
+    void ApplyNodeMemoryZone(NMemory::EMemoryZone zone, const TActorContext &ctx) {
+        if (MemoryHost.NodeMemoryZone == zone) {
+            return;
+        }
+        MemoryHost.NodeMemoryZone = zone;
+        YDB_LOG_NOTICE_CTX(ctx, "TLocalNodeRegistrar: node memory zone changed",
+            {"zone", ToString(zone)},
+            {"slotCount", MemoryHost.Host.GetSlotsCount()});
+        for (const TActorId& executor : MemoryHost.Host.GetExecutors()) {
+            ctx.Send(executor, new NMemory::TEvMemoryZone(zone));
+        }
+    }
+
+    void Handle(NMemory::TEvConsumerLimit::TPtr &ev, const TActorContext &ctx) {
+        const auto *msg = ev->Get();
+        ApplyNodeMemoryZone(msg->Zone, ctx);
+        MemoryHost.Host.UpdateCounters(MemoryHost.Counters);
+        if (msg->Kind != NMemory::EMemoryConsumerKind::TabletsElastic) {
+            return;
+        }
+        for (const auto& share : MemoryHost.Host.ApplyElasticLimit(msg->LimitBytes)) {
+            ctx.Send(share.Executor, new NMemory::TEvMemoryZone(MemoryHost.NodeMemoryZone, share.Bytes));
+        }
+    }
+
     void Die(const TActorContext &ctx) override {
+        UnregisterFromMemoryController(ctx);
         if (HivePipeClient) {
             if (Connected) {
                 NTabletPipe::SendData(ctx, HivePipeClient, new TEvLocal::TEvStatus(TEvLocal::TEvStatus::StatusDead));
@@ -371,6 +482,7 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
                     if (x.first.second == 0) { // leader
                         RetainedCutHistory.erase(x.first.first);
                     }
+                    ForgetTabletMemory(x.first);
                 }
                 OnlineTablets.clear();
             }
@@ -431,6 +543,7 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
 
     void FinishPromotion(TTabletId tabletId, TTabletEntry& entry) {
         TTabletId promotedTablet{tabletId.first, entry.PromotingFromFollower};
+        ForgetTabletMemory(promotedTablet);
         OnlineTablets.erase(promotedTablet);
         entry.IsPromoting = false;
         entry.PromotingFromFollower = 0;
@@ -486,6 +599,7 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
                     return;
                 }
                 ctx.Send(it->second.Tablet, new TEvTablet::TEvTabletStop(tabletId.first, TEvTablet::TEvTabletStop::ReasonStop));
+                ForgetTabletMemory(it->first);
                 OnlineTablets.erase(it);
             }
         }
@@ -574,6 +688,12 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
             if (metrics.HasMemory()) {
                 it->second.ResourceValues.SetMemory(metrics.GetMemory());
             }
+            if (metrics.HasMemoryDemand()) {
+                it->second.ResourceValues.SetMemoryDemand(metrics.GetMemoryDemand());
+            }
+            if (metrics.HasMemoryReclaimable()) {
+                it->second.ResourceValues.SetMemoryReclaimable(metrics.GetMemoryReclaimable());
+            }
             if (metrics.HasNetwork()) {
                 it->second.ResourceValues.SetNetwork(metrics.GetNetwork());
             }
@@ -604,6 +724,7 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
                     it->second.ResourceValues.AddGroupWriteIops()->CopyFrom(v);
                 }
             }
+            UpdateTabletMemory(tabletId, ev->Sender, it->second.TabletType, metrics, ctx);
             auto after = it->second.ResourceValues.ByteSize();
             if (after == 0 && before == 0) {
                 return;
@@ -918,12 +1039,13 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
                 auto inbootIt = InbootTablets.find(leader);
                 if (inbootIt != InbootTablets.end()) {
                     MarkDeadTablet(leader, inbootIt->second.Generation, TEvLocal::TEvTabletStatus::StatusFailed, msg->Reason, ctx);
+                    InbootTablets.erase(inbootIt);
                 }
-                InbootTablets.erase(inbootIt);
             }
             if (onlineIt->first.second == 0) { // leader
                 RetainedCutHistory.erase(onlineIt->first.first);
             }
+            ForgetTabletMemory(onlineIt->first);
             OnlineTablets.erase(onlineIt);
             UpdateEstimate();
             return;
@@ -1026,6 +1148,7 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
             SendDrain(ctx);
         }
         Send(SelfId(), new TEvPrivate::TEvUpdateSystemUsage());
+        RegisterInMemoryController(ctx);
         Become(&TThis::StateWork);
     }
 
@@ -1082,6 +1205,7 @@ public:
     void Bootstrap(const TActorContext &ctx) {
         YDB_LOG_DEBUG_CTX(ctx, "TLocalNodeRegistrar::Bootstrap");
         StartTime = ctx.Now();
+        TabletMemoryHostEnabled = AppData(ctx)->FeatureFlags.GetEnableTabletMemoryHost();
         const TActorId wardenId = MakeBlobStorageNodeWardenID(SelfId().NodeId());
         if (IsBridgeMode(ctx)) {
             Send(wardenId, new TEvNodeWardenQueryStorageConfig(true));
@@ -1089,6 +1213,7 @@ public:
         } else {
             TryToRegister(ctx);
             Send(SelfId(), new TEvPrivate::TEvUpdateSystemUsage());
+            RegisterInMemoryController(ctx);
             Become(&TThis::StateWork);
         }
     }
@@ -1116,6 +1241,8 @@ public:
             HFunc(TEvLocal::TEvLocalDrainNode, HandleDrain);
             HFunc(TEvHive::TEvDrainNodeResult, HandleDrainNodeResult);
             HFunc(NNodeWhiteboard::TEvWhiteboard::TEvSystemStateResponse, Handle);
+            HFunc(NMemory::TEvConsumerRegistered, Handle);
+            HFunc(NMemory::TEvConsumerLimit, Handle);
             CFunc(TEvents::TSystem::PoisonPill, HandlePoison);
             default:
                 YDB_LOG_DEBUG_CTX(*TlsActivationContext, "TLocalNodeRegistrar: Unhandled in StateWork",

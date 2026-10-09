@@ -14,6 +14,9 @@ namespace NKeyValue {
 };
 
 namespace TEvKeyValue {
+    inline constexpr char RequestInFlightLimitReached[] =
+        "KeyValue request in-flight limit reached";
+
     enum EEv {
         EvRequest = EventSpaceBegin(TKikimrEvents::ES_KEYVALUE),
         EvIntermediate,
@@ -45,6 +48,7 @@ namespace TEvKeyValue {
         EvAdvanceMoveDataResult = EvResponse + 512,
         EvBlobCopied,
         EvCheckTrash,
+        EvAdmissionDeadline,
 
         EvEnd
     };
@@ -379,6 +383,14 @@ namespace TEvKeyValue {
     };
 
     struct TEvCheckTrash : public TEventLocal<TEvCheckTrash, EvCheckTrash> {};
+
+    struct TEvAdmissionDeadline : public TEventLocal<TEvAdmissionDeadline, EvAdmissionDeadline> {
+        const ui64 RequestUid;
+
+        explicit TEvAdmissionDeadline(ui64 requestUid)
+            : RequestUid(requestUid)
+        {}
+    };
 }
 
 } // NKikimr

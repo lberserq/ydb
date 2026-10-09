@@ -1,12 +1,9 @@
 #pragma once
 
-#include "tablet_memory_host.h"
+#include "memory_controller_iface.h"
 
 #include <util/generic/deque.h>
 #include <util/generic/hash.h>
-#include <util/generic/ptr.h>
-
-#include <functional>
 
 namespace NKikimr::NMemory {
 
@@ -21,32 +18,30 @@ struct TMemoryAdmissionStats {
     }
 };
 
-// Gates the start of memory-charged items by the node zone of the tablet's slot: FIFO, no growth in Yellow, one at a time in Red
-template <class TItem>
+// Tells the owner whether the item is starting on the Admit call or after a wait in the queue
+enum class EAdmitSource {
+    Immediate,
+    FromQueue,
+};
+
+// Gates the start of memory-charged items by the node zone: FIFO, no growth in Yellow, one at a time in Red
+// One admission belongs to one tablet and runs only in that tablet's actor context, so it takes no locks by design
+template <class TItem, class TOwner>
 class TMemoryAdmission {
 public:
-    using TStart = std::function<void(THolder<TItem>&&, bool postponed)>;
-    using TWake = std::function<void()>;
-
-    TMemoryAdmission() = default;
-
-    // The wake callable is what the slot calls on the next zone change while items wait
-    TMemoryAdmission(TIntrusivePtr<TTabletMemorySlot> slot, TWake wake, TStart start)
-        : Slot(std::move(slot))
-        , Wake(std::move(wake))
-        , Start(std::move(start))
+    explicit TMemoryAdmission(TOwner& owner)
+        : Owner(owner)
     {
     }
 
     // Starts the item now or queues it behind the items already waiting
-    void Admit(ui64 uid, THolder<TItem>&& item, ui64 charge) {
+    void Admit(ui64 uid, TItem&& item, ui64 charge) {
         if (Queue.empty() && Admits(charge)) {
-            Run(uid, std::move(item), charge, /* postponed */ false);
+            Run(uid, std::move(item), charge, EAdmitSource::Immediate);
             return;
         }
         PostponedBytes += charge;
         Queue.push_back({uid, charge, std::move(item)});
-        Slot->RequestWakeup(Wake);
     }
 
     // Takes the charge of a completed item back and drains the queue
@@ -62,7 +57,29 @@ public:
         Drain();
     }
 
-    void OnZoneChanged() {
+    // Withdraws a waiting item; a running item is owned by its request actor.
+    std::optional<TItem> CancelQueued(ui64 uid) {
+        for (auto it = Queue.begin(); it != Queue.end(); ++it) {
+            if (it->Uid == uid) {
+                std::optional<TItem> item(std::move(it->Item));
+                Y_DEBUG_ABORT_UNLESS(PostponedBytes >= it->Charge);
+                PostponedBytes -= it->Charge;
+                Queue.erase(it);
+                Drain();
+                return item;
+            }
+        }
+        return std::nullopt;
+    }
+
+    // Called by the tablet from ITablet::OnMemoryZone with the zone the executor delivered
+    void OnZoneChanged(EMemoryZone zone) {
+        if (zone == Zone) {
+            return;
+        }
+        Zone = zone;
+        // The watermark is the running bytes seen on entering the zone, so nothing may grow past it
+        Watermark = RunningBytes;
         Drain();
     }
 
@@ -79,16 +96,11 @@ private:
     struct TEntry {
         ui64 Uid;
         ui64 Charge;
-        THolder<TItem> Item;
+        TItem Item;
     };
 
-    bool Admits(ui64 charge) {
-        const EMemoryZone zone = Slot->GetZone();
-        if (zone != LastZone) {
-            LastZone = zone;
-            Watermark = RunningBytes;
-        }
-        switch (zone) {
+    bool Admits(ui64 charge) const {
+        switch (Zone) {
             case EMemoryZone::Green:
                 return true;
             case EMemoryZone::Yellow:
@@ -99,11 +111,11 @@ private:
         return true;
     }
 
-    void Run(ui64 uid, THolder<TItem>&& item, ui64 charge, bool postponed) {
+    void Run(ui64 uid, TItem&& item, ui64 charge, EAdmitSource source) {
         RunningBytes += charge;
         ++RunningCount;
         Charges[uid] = charge;
-        Start(std::move(item), postponed);
+        Owner.StartAdmitted(std::move(item), source);
     }
 
     void Drain() {
@@ -115,20 +127,15 @@ private:
             TEntry entry = std::move(Queue.front());
             Queue.pop_front();
             PostponedBytes -= entry.Charge;
-            Run(entry.Uid, std::move(entry.Item), entry.Charge, /* postponed */ true);
+            Run(entry.Uid, std::move(entry.Item), entry.Charge, EAdmitSource::FromQueue);
         }
         Draining = false;
-        if (!Queue.empty()) {
-            Slot->RequestWakeup(Wake);
-        }
     }
 
 private:
-    TIntrusivePtr<TTabletMemorySlot> Slot = TTabletMemorySlot::Detached();
-    TWake Wake;
-    TStart Start;
+    TOwner& Owner; // starts what the gate lets through: StartAdmitted(TItem&&, EAdmitSource)
 
-    EMemoryZone LastZone = EMemoryZone::Green;
+    EMemoryZone Zone = EMemoryZone::Green;
     ui64 Watermark = 0;
     ui64 RunningBytes = 0;
     ui64 RunningCount = 0;

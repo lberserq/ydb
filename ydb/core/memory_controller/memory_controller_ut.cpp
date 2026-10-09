@@ -3,7 +3,6 @@
 #include <memory_controller.h>
 #include <memory_controller_config.h>
 #include <ydb/core/base/counters.h>
-#include <ydb/core/base/tablet_memory_host.h>
 #include <ydb/core/tablet/resource_broker.h>
 #include <ydb/core/testlib/basics/appdata.h>
 #include <ydb/core/testlib/basics/runtime.h>
@@ -55,9 +54,8 @@ struct TControllerFixture {
     TIntrusivePtr<::NMonitoring::TDynamicCounters> Counters;
     TActorId MemoryController;
 
-    explicit TControllerFixture(const NKikimrConfig::TMemoryControllerConfig& config, bool tabletMemoryHost = false) {
+    explicit TControllerFixture(const NKikimrConfig::TMemoryControllerConfig& config) {
         Runtime.Initialize(TAppPrepare().Unwrap());
-        Runtime.GetAppData().FeatureFlags.SetEnableTabletMemoryHost(tabletMemoryHost);
         MemoryController = Runtime.Register(CreateMemoryController(
             TDuration::Seconds(1), TIntrusivePtr<IProcessMemoryInfoProvider>(Provider), config, TResourceBrokerConfig{}, CountersRoot));
         Runtime.EnableScheduleForActor(MemoryController);
@@ -74,17 +72,6 @@ struct TControllerFixture {
     TIntrusivePtr<IMemoryConsumer> Register(TActorId registrant, EMemoryConsumerKind kind) {
         Runtime.Send(new IEventHandle(MemoryController, registrant, new TEvConsumerRegister(kind)));
         return Runtime.GrabEdgeEvent<TEvConsumerRegistered>(registrant)->Get()->Consumer;
-    }
-
-    TIntrusivePtr<TTabletMemorySlot> RegisterSlot(TTabletTypes::EType tabletType, ui64 tabletId) {
-        return TTabletMemoryHost::Instance().RegisterConsumer(tabletType, tabletId);
-    }
-
-    // A wake-up callable that sends TEvMemoryZone to the edge actor through the runtime's actor system
-    std::function<void()> WakeEdge(TActorId edge) {
-        return [&sys = *Runtime.GetAnyNodeActorSystem(), edge] {
-            sys.Send(new IEventHandle(edge, {}, new TEvMemoryZone()));
-        };
     }
 
     void Tick() {
@@ -973,243 +960,92 @@ Y_UNIT_TEST(ConsumerUnregisterDropsAccounting) {
     UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/SharedCache/Consumption"), 0);
 }
 
-Y_UNIT_TEST(TabletHostSlotFeedsTheAggregate) {
-    NKikimrConfig::TMemoryControllerConfig config;
-    config.SetHardLimitBytes(200_MB);
-    TControllerFixture fixture(config, /* tabletMemoryHost */ true);
-    fixture.Provider->ProcessMemoryInfo.AllocatedMemory = 150_MB;
-    fixture.Tick();
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Stats/OtherConsumption"), 150_MB);
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/Tablets/Consumption"), 0);
-
-    auto slot = fixture.RegisterSlot(TTabletTypes::KeyValue, 1);
-    slot->SetReport({.Used = 100_MB, .Demand = 100_MB, .Reclaimable = 0});
-    fixture.Tick();
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/Tablets/Consumption"), 100_MB);
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/Tablets/Demand"), 100_MB);
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Stats/OtherConsumption"), 50_MB);
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("TabletMemory/KeyValue/Used"), 100_MB);
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("TabletMemory/KeyValue/Demand"), 100_MB);
-    // Attributed, not budgeted: the aggregate carries no limit
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/Tablets/Limit"), 0);
-
-    // The released slot takes its last report out of the sums by the next tick
-    slot.Reset();
-    fixture.Tick();
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/Tablets/Consumption"), 0);
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("TabletMemory/KeyValue/Used"), 0);
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Stats/OtherConsumption"), 150_MB);
-}
-
-Y_UNIT_TEST(TabletHostOffLeavesTheAggregateAbsent) {
+Y_UNIT_TEST(TabletsAreAttributedNotBudgeted) {
     NKikimrConfig::TMemoryControllerConfig config;
     config.SetHardLimitBytes(200_MB);
     TControllerFixture fixture(config);
-    fixture.Provider->ProcessMemoryInfo.AllocatedMemory = 150_MB;
+    fixture.Provider->ProcessMemoryInfo.AllocatedMemory = 100_MB;
 
-    // What a tablet gets with the flag off: the report goes nowhere and the zone stays Green
-    auto detached = TTabletMemorySlot::Detached();
-    detached->SetReport({.Used = 100_MB, .Demand = 100_MB, .Reclaimable = 0});
-    UNIT_ASSERT(!detached->IsAttached());
-    UNIT_ASSERT_VALUES_EQUAL(TTabletMemoryHost::Instance().GetTotal(TTabletTypes::KeyValue).Used, 0);
-    // Even a linked slot is invisible to a controller that runs with the flag off
-    auto slot = fixture.RegisterSlot(TTabletTypes::KeyValue, 1);
-    slot->SetReport({.Used = 100_MB, .Demand = 100_MB, .Reclaimable = 0});
     fixture.Tick();
-    UNIT_ASSERT(!fixture.Counters->FindCounter("Consumer/Tablets/Consumption"));
-    UNIT_ASSERT(!fixture.Counters->FindCounter("TabletMemory/KeyValue/Used"));
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Stats/OtherConsumption"), 150_MB);
-    UNIT_ASSERT(detached->GetZone() == EMemoryZone::Green);
+    const i64 otherBefore = fixture.Counter("Stats/OtherConsumption");
+    UNIT_ASSERT_VALUES_EQUAL(otherBefore, 100_MB);
+
+    // The bytes a Local reports leave "other consumption" for a kind of their own
+    const TActorId local = fixture.Runtime.AllocateEdgeActor();
+    auto tablets = fixture.Register(local, EMemoryConsumerKind::Tablets);
+    tablets->SetConsumption(30_MB);
+    fixture.Tick();
+    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/Tablets/Consumption"), 30_MB);
+    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Stats/OtherConsumption"), otherBefore - 30_MB);
+
+    // The kind carries no budget of its own
+    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/Tablets/LimitMin"), 0);
+    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/Tablets/LimitMax"), 0);
+    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/Tablets/Limit"), 0);
 }
 
-Y_UNIT_TEST(TabletHostZoneFollowsAllocatedMemory) {
-    NKikimrConfig::TMemoryControllerConfig config;
-    config.SetHardLimitBytes(200_MB);
-    TControllerFixture fixture(config, /* tabletMemoryHost */ true);
-    const TActorId asking = fixture.Runtime.AllocateEdgeActor();
-    const TActorId quiet = fixture.Runtime.AllocateEdgeActor();
-    auto first = fixture.RegisterSlot(TTabletTypes::KeyValue, 1);
-    auto second = fixture.RegisterSlot(TTabletTypes::DataShard, 2);
-
-    // Under the 100 MB target utilization: Green
-    fixture.Provider->ProcessMemoryInfo.AllocatedMemory = 50_MB;
-    fixture.Tick();
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Stats/TabletMemoryZone"), 0);
-    UNIT_ASSERT(first->GetZone() == EMemoryZone::Green);
-
-    // Above the 150 MB soft limit: Red reaches every slot, the wake-up only the slot that asked
-    first->RequestWakeup(fixture.WakeEdge(asking));
-    fixture.Provider->ProcessMemoryInfo.AllocatedMemory = 180_MB;
-    fixture.Tick();
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Stats/TabletMemoryZone"), 2);
-    UNIT_ASSERT(first->GetZone() == EMemoryZone::Red);
-    UNIT_ASSERT(second->GetZone() == EMemoryZone::Red);
-    UNIT_ASSERT(fixture.Runtime.GrabEdgeEvent<TEvMemoryZone>(asking));
-    UNIT_ASSERT(!fixture.Runtime.GrabEdgeEvent<TEvMemoryZone>(quiet, TDuration::MilliSeconds(100)));
-
-    // Between the target and the soft limit: Yellow; the request was one-shot
-    fixture.Provider->ProcessMemoryInfo.AllocatedMemory = 120_MB;
-    fixture.Tick();
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Stats/TabletMemoryZone"), 1);
-    UNIT_ASSERT(first->GetZone() == EMemoryZone::Yellow);
-    UNIT_ASSERT(!fixture.Runtime.GrabEdgeEvent<TEvMemoryZone>(asking, TDuration::MilliSeconds(100)));
-
-    fixture.Provider->ProcessMemoryInfo.AllocatedMemory = 80_MB;
-    fixture.Tick();
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Stats/TabletMemoryZone"), 0);
-    UNIT_ASSERT(first->GetZone() == EMemoryZone::Green);
-    UNIT_ASSERT(second->GetZone() == EMemoryZone::Green);
-}
-
-Y_UNIT_TEST(TabletHostWakesOnlyTheAskingSlot) {
+Y_UNIT_TEST(TabletsElasticBoundsFromRegistrants) {
     NKikimrConfig::TMemoryControllerConfig config;
     config.SetHardLimitBytes(200_MB);
     TControllerFixture fixture(config);
-    auto& host = TTabletMemoryHost::Instance();
-    host.SetNodeZone(EMemoryZone::Green);
-    auto first = fixture.RegisterSlot(TTabletTypes::KeyValue, 1);
-    auto second = fixture.RegisterSlot(TTabletTypes::KeyValue, 2);
-    ui32 firstWakeups = 0;
 
-    first->RequestWakeup([&firstWakeups] { ++firstWakeups; });
-    host.SetNodeZone(EMemoryZone::Yellow);
-    UNIT_ASSERT_VALUES_EQUAL(firstWakeups, 1);
-    UNIT_ASSERT(first->GetZone() == EMemoryZone::Yellow);
-    UNIT_ASSERT(second->GetZone() == EMemoryZone::Yellow);
+    const TActorId first = fixture.Runtime.AllocateEdgeActor();
+    const TActorId second = fixture.Runtime.AllocateEdgeActor();
+    auto firstConsumer = fixture.Register(first, EMemoryConsumerKind::TabletsElastic);
+    auto secondConsumer = fixture.Register(second, EMemoryConsumerKind::TabletsElastic);
 
-    // The request is one-shot: the next change wakes nobody until it is asked for again
-    host.SetNodeZone(EMemoryZone::Red);
-    UNIT_ASSERT_VALUES_EQUAL(firstWakeups, 1);
-    UNIT_ASSERT(first->GetZone() == EMemoryZone::Red);
-
-    // The same zone again is no change: the request stays pending
-    first->RequestWakeup([&firstWakeups] { ++firstWakeups; });
-    host.SetNodeZone(EMemoryZone::Red);
-    UNIT_ASSERT_VALUES_EQUAL(firstWakeups, 1);
-    host.SetNodeZone(EMemoryZone::Green);
-    UNIT_ASSERT_VALUES_EQUAL(firstWakeups, 2);
-    UNIT_ASSERT(first->GetZone() == EMemoryZone::Green);
-
-    // A released slot takes its pending request with it
-    second->RequestWakeup([] { UNIT_FAIL("a released slot must not be woken"); });
-    second.Reset();
-    host.SetNodeZone(EMemoryZone::Yellow);
-    host.SetNodeZone(EMemoryZone::Green);
-}
-
-Y_UNIT_TEST(TabletHostElasticPartsGetSharesByDemand) {
-    NKikimrConfig::TMemoryControllerConfig config;
-    config.SetHardLimitBytes(2000_MB);
-    TControllerFixture fixture(config, /* tabletMemoryHost */ true);
-    auto first = fixture.RegisterSlot(TTabletTypes::KeyValue, 1);
-    auto second = fixture.RegisterSlot(TTabletTypes::KeyValue, 2);
-    auto third = fixture.RegisterSlot(TTabletTypes::DataShard, 3);
-    first->SetReport({.Used = 80_MB, .Demand = 100_MB, .Reclaimable = 30_MB});
-    second->SetReport({.Used = 40_MB, .Demand = 60_MB, .Reclaimable = 10_MB});
-    third->SetReport({.Used = 5_MB, .Demand = 5_MB, .Reclaimable = 0});
-    UNIT_ASSERT(!first->GetShare());
-
-    // The non-elastic parts are Used - Reclaimable, the elastic parts are Reclaimable with the demand above the state
-    fixture.Provider->ProcessMemoryInfo.AllocatedMemory = 0;
+    firstConsumer->SetReport({.Used = 10_MB, .Demand = 30_MB, .Reclaimable = 10_MB});
+    secondConsumer->SetReport({.Used = 5_MB, .Demand = 10_MB, .Reclaimable = 5_MB});
     fixture.Tick();
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/Tablets/Consumption"), 85_MB);
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/Tablets/Limit"), 0);
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/TabletsElastic/Consumption"), 40_MB);
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/TabletsElastic/Demand"), 80_MB);
+
+    // No config field sets these: Min is zero and Max is what the registrants asked for
     UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/TabletsElastic/LimitMin"), 0);
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/TabletsElastic/LimitMax"), 80_MB);
-    // Plenty of memory: the coefficient is one and the limit is Max, the shares follow the elastic demand
-    UNIT_ASSERT_DOUBLES_EQUAL(fixture.Counter("Consumer/TabletsElastic/Limit"), static_cast<i64>(80_MB), static_cast<i64>(1_KB));
-    UNIT_ASSERT_DOUBLES_EQUAL(static_cast<i64>(*first->GetShare()), static_cast<i64>(50_MB), static_cast<i64>(1_KB));
-    UNIT_ASSERT_DOUBLES_EQUAL(static_cast<i64>(*second->GetShare()), static_cast<i64>(30_MB), static_cast<i64>(1_KB));
-    UNIT_ASSERT(!third->GetShare());
-    // The per-type sums keep the whole reports
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("TabletMemory/KeyValue/Used"), 120_MB);
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("TabletMemory/KeyValue/Demand"), 160_MB);
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("TabletMemory/KeyValue/Reclaimable"), 40_MB);
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("TabletMemory/DataShard/Used"), 5_MB);
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("TabletMemory/DataShard/Reclaimable"), 0);
+    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/TabletsElastic/LimitMax"), 40_MB);
+    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/TabletsElastic/Consumption"), 15_MB);
+    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/TabletsElastic/Reclaimable"), 15_MB);
 
-    // Exactly the limit: the demand-proportional split is exact
-    TTabletMemoryHost::Instance().ApplyElasticLimit(80_MB);
-    UNIT_ASSERT_VALUES_EQUAL(*first->GetShare(), 50_MB);
-    UNIT_ASSERT_VALUES_EQUAL(*second->GetShare(), 30_MB);
+    // Nothing else is allocated, so the whole elastic range fits
+    const ui64 limit = fixture.Counter("Consumer/TabletsElastic/Limit");
+    UNIT_ASSERT_DOUBLES_EQUAL(limit / double(1_MB), 40.0, 0.01);
 
-    // Squeezed: the coefficient goes to zero, the limit is Min and every share is zero
-    fixture.Provider->ProcessMemoryInfo.AllocatedMemory = 2000_MB;
+    // Past the equal bootstrap slice the shares follow the demand, three to one
+    const ui64 bootstrap = limit / 16;
+    const ui64 firstLimit = fixture.Runtime.GrabEdgeEvent<TEvConsumerLimit>(first)->Get()->LimitBytes;
+    const ui64 secondLimit = fixture.Runtime.GrabEdgeEvent<TEvConsumerLimit>(second)->Get()->LimitBytes;
+    UNIT_ASSERT(firstLimit > bootstrap && secondLimit > bootstrap);
+    UNIT_ASSERT_DOUBLES_EQUAL(double(firstLimit - bootstrap) / double(secondLimit - bootstrap), 3.0, 0.01);
+
+    // The bounds follow the reports: a registrant that stops asking for an elastic part shrinks Max
+    firstConsumer->SetReport({.Used = 0, .Demand = 0, .Reclaimable = 0});
     fixture.Tick();
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/TabletsElastic/Limit"), 0);
-    UNIT_ASSERT_VALUES_EQUAL(*first->GetShare(), 0);
-    UNIT_ASSERT_VALUES_EQUAL(*second->GetShare(), 0);
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/Tablets/Consumption"), 85_MB);
-    UNIT_ASSERT(!third->GetShare());
-
-    // A slot that keeps an elastic part above its share still counts in full: nothing is clamped to the share
-    first->SetReport({.Used = 80_MB, .Demand = 100_MB, .Reclaimable = 60_MB});
-    fixture.Tick();
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/TabletsElastic/Consumption"), 70_MB);
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/Tablets/Consumption"), 55_MB);
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("TabletMemory/KeyValue/Used"), 120_MB);
-
-    // Released slots leave both sums by the next tick
-    first.Reset();
-    second.Reset();
-    fixture.Tick();
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/TabletsElastic/Consumption"), 0);
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/TabletsElastic/LimitMax"), 0);
-    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/Tablets/Consumption"), 5_MB);
+    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/TabletsElastic/LimitMax"), 10_MB);
 }
 
-Y_UNIT_TEST(TabletHostElasticShareWakesOnlyTheAskingSlot) {
+Y_UNIT_TEST(ConsumerLimitCarriesTheNodeZone) {
+    // Hard limit 200 MB means a 100 MB target utilization and a 150 MB soft limit
     NKikimrConfig::TMemoryControllerConfig config;
     config.SetHardLimitBytes(200_MB);
     TControllerFixture fixture(config);
-    auto& host = TTabletMemoryHost::Instance();
-    host.SetNodeZone(EMemoryZone::Green);
-    auto first = fixture.RegisterSlot(TTabletTypes::KeyValue, 1);
-    auto second = fixture.RegisterSlot(TTabletTypes::KeyValue, 2);
-    auto plain = fixture.RegisterSlot(TTabletTypes::KeyValue, 3);
-    first->SetReport({.Used = 20_MB, .Demand = 20_MB, .Reclaimable = 10_MB});
-    second->SetReport({.Used = 60_MB, .Demand = 60_MB, .Reclaimable = 30_MB});
-    plain->SetReport({.Used = 20_MB, .Demand = 20_MB, .Reclaimable = 0});
-    ui32 firstWakeups = 0;
-    ui32 plainWakeups = 0;
 
-    // With the flag off the controller creates no elastic consumer, the host still sums the parts
-    fixture.Provider->ProcessMemoryInfo.AllocatedMemory = 50_MB;
-    fixture.Tick();
-    UNIT_ASSERT(!fixture.Counters->FindCounter("Consumer/TabletsElastic/Consumption"));
-    UNIT_ASSERT(!fixture.Counters->FindCounter("Consumer/Tablets/Consumption"));
-    UNIT_ASSERT_VALUES_EQUAL(host.GetElasticTotal().Used, 40_MB);
-    UNIT_ASSERT_VALUES_EQUAL(host.GetTotal().Used, 60_MB);
+    const TActorId local = fixture.Runtime.AllocateEdgeActor();
+    fixture.Register(local, EMemoryConsumerKind::Tablets);
 
-    // A share change wakes only the slot with an elastic part that asked; a slot without one gets no share
-    first->RequestWakeup([&firstWakeups] { ++firstWakeups; });
-    plain->RequestWakeup([&plainWakeups] { ++plainWakeups; });
-    host.ApplyElasticLimit(40_MB);
-    UNIT_ASSERT_VALUES_EQUAL(*first->GetShare(), 10_MB);
-    UNIT_ASSERT_VALUES_EQUAL(*second->GetShare(), 30_MB);
-    UNIT_ASSERT(!plain->GetShare());
-    UNIT_ASSERT_VALUES_EQUAL(firstWakeups, 1);
-    UNIT_ASSERT_VALUES_EQUAL(plainWakeups, 0);
+    // The limits queued by the earlier ticks still carry the old zone, so the drain must be bounded
+    auto expectZone = [&](ui64 allocated, EMemoryZone expected) {
+        fixture.Provider->ProcessMemoryInfo.AllocatedMemory = allocated;
+        fixture.Tick();
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Stats/TabletMemoryZone"), static_cast<i64>(expected));
+        bool seen = false;
+        for (int attempt = 0; attempt < 10 && !seen; ++attempt) {
+            seen = fixture.Runtime.GrabEdgeEvent<TEvConsumerLimit>(local)->Get()->Zone == expected;
+        }
+        UNIT_ASSERT_C(seen, "no TEvConsumerLimit carried the expected zone");
+    };
 
-    // The same limit again changes no share: the request stays pending
-    first->RequestWakeup([&firstWakeups] { ++firstWakeups; });
-    host.ApplyElasticLimit(40_MB);
-    UNIT_ASSERT_VALUES_EQUAL(firstWakeups, 1);
-
-    // A larger limit splits by the same proportions, and the changed share fires the pending request
-    host.ApplyElasticLimit(80_MB);
-    UNIT_ASSERT_VALUES_EQUAL(*first->GetShare(), 20_MB);
-    UNIT_ASSERT_VALUES_EQUAL(*second->GetShare(), 60_MB);
-    UNIT_ASSERT_VALUES_EQUAL(firstWakeups, 2);
-    UNIT_ASSERT_VALUES_EQUAL(plainWakeups, 0);
-
-    // The zone still reaches every slot, with or without an elastic part
-    host.SetNodeZone(EMemoryZone::Yellow);
-    UNIT_ASSERT_VALUES_EQUAL(plainWakeups, 1);
-    UNIT_ASSERT(first->GetZone() == EMemoryZone::Yellow);
-    host.SetNodeZone(EMemoryZone::Green);
+    expectZone(10_MB, EMemoryZone::Green);
+    expectZone(120_MB, EMemoryZone::Yellow);
+    expectZone(180_MB, EMemoryZone::Red);
+    expectZone(10_MB, EMemoryZone::Green);
 }
 }
 

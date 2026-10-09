@@ -3906,10 +3906,7 @@ TNodeResult BuildBuiltinFunc(
             return TNonNull(TNodePtr(new TInvalidBuiltin(pos, TStringBuilder() << name << " expected from "
                                                                                << functionInfo->MinArgs << " to " << functionInfo->MaxArgs << " arguments, but got: " << args.size())));
         }
-        TString bindingName = functionInfo->BindingName;
-        if (functionInfo->MinArgs != functionInfo->MaxArgs) {
-            bindingName += ToString(args.size());
-        }
+        const TString bindingName = functionInfo->GetBindingName(args.size());
         ctx.RequiredModules.emplace("spark_module", "/lib/yql/spark.yqls");
         TVector<TNodePtr> applyArgs = {
             new TCallNodeImpl(pos, "bind", {BuildAtom(pos, "spark_module", 0), BuildQuotedAtom(pos, bindingName)})};
@@ -4106,6 +4103,13 @@ TNodeResult BuildBuiltinFunc(
                 }
 
                 settings(label, item->GetLiteralValue());
+            } else if (label == "DisableStatistics") {
+                if (!item->IsLiteral() || item->GetLiteralType() != "Bool") {
+                    return TNonNull(TNodePtr(new TInvalidBuiltin(
+                        pos, TStringBuilder() << name << " disable statistics must be bool literal")));
+                }
+
+                settings(label, FromString<bool>(item->GetLiteralValue()));
             } else if (EqualToOneOf(label, "BlockstatDict", "ParseWithFat")) {
                 continue;
             } else {
@@ -4113,7 +4117,7 @@ TNodeResult BuildBuiltinFunc(
                     pos,
                     TStringBuilder()
                         << name << " got unsupported setting: " << label
-                        << "; supported: Entities, EntitiesStrategy, BlockstatDict, ParseWithFat")));
+                        << "; supported: Entities, EntitiesStrategy, Mode, DisableStatistics, BlockstatDict, ParseWithFat")));
             }
         }
 

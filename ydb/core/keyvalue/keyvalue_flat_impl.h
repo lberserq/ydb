@@ -874,6 +874,7 @@ public:
         if (HandleHook(ev))
             return;
         switch (ev->GetTypeRewrite()) {
+            hFunc(TEvKeyValue::TEvAdmissionDeadline, Handle);
             hFunc(TEvKeyValue::TEvRead, Handle);
             hFunc(TEvKeyValue::TEvReadRange, Handle);
             hFunc(TEvKeyValue::TEvExecuteTransaction, Handle);
@@ -925,7 +926,6 @@ public:
     void InitSchemeComplete() {
         Become(&TThis::StateWork);
         State.SetTabletInfo(Info());
-        State.SetMemorySlot(Executor()->MemorySlot(), ExecutorID());
         State.OnStateWork();
         UpdateTabletYellow();
         while (!InitialEventsQueue.empty()) {
@@ -938,6 +938,10 @@ public:
             InitialEventsQueue.pop_front();
         }
         State.OnInitQueueEmpty();
+    }
+
+    void Handle(TEvKeyValue::TEvAdmissionDeadline::TPtr& ev, const TActorContext&) {
+        State.OnAdmissionDeadline(ev->Get()->RequestUid);
     }
 
     void UpdateTabletYellow() {
@@ -964,8 +968,8 @@ public:
         return State.GetMemoryAdmissionStats();
     }
 
-    void OnMemoryZone(NMemory::EMemoryZone) override {
-        State.OnMemoryZone();
+    void OnMemoryZone(NMemory::EMemoryZone zone) override {
+        State.OnMemoryZone(zone);
     }
 
     bool ValidateMoveDataGroups(const TSet<ui32>& moveDataGroups, const TActorId& sender) const {

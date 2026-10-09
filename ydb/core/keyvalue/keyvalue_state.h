@@ -352,6 +352,7 @@ protected:
     ui64 PostponedIntermediatesCount = 0;
     ui64 IntermediatesInFlight;
     ui64 RoInlineIntermediatesInFlight;
+    THashSet<ui64> DataRequestsInFlight;
     ui64 DeletesPerRequestLimit;
 
     TTabletCountersBase *TabletCounters;
@@ -377,13 +378,16 @@ protected:
     TMemorizableControlWrapper RejectNonExistentStorageChannel;
     TControlWrapper UsePerChannelReadQueues_Base;
     TMemorizableControlWrapper UsePerChannelReadQueues;
+    std::optional<TMemorizableControlWrapper> RequestsInFlightLimit;
 
     // admission of write and inline-read requests by the node memory zone
-    NMemory::TMemoryAdmission<TIntermediate> Admission;
+    NMemory::TMemoryAdmission<THolder<TIntermediate>, TKeyValueState> Admission{*this};
 
     std::shared_ptr<TKeyValueStateLifetimeToken> LifetimeToken = std::make_shared<TKeyValueStateLifetimeToken>();
 
     bool RejectNonExistentStorageChannelEnabled(const TActorContext& ctx);
+    bool TryAcquireRequestSlot(TIntermediate& intermediate, const TActorContext& ctx);
+    void ReleaseRequestSlot(TIntermediate& intermediate);
 
 public:
     TKeyValueState();
@@ -573,9 +577,10 @@ public:
     void OnPeriodicRefresh();
     void OnUpdateWeights(TChannelBalancer::TEvUpdateWeights::TPtr ev);
 
-    void SetMemorySlot(TIntrusivePtr<NMemory::TTabletMemorySlot> slot, TActorId executor);
-    // a zone change the tablet asked to be woken up for: the postponed requests are drained without waiting for completions
-    void OnMemoryZone();
+    void OnMemoryZone(NMemory::EMemoryZone zone);
+    void OnAdmissionDeadline(ui64 requestUid);
+    void AdmitIntermediate(THolder<TIntermediate>&& intermediate);
+    void StartAdmitted(THolder<TIntermediate>&& intermediate, NMemory::EAdmitSource source);
 
     NMemory::TMemoryAdmissionStats GetMemoryAdmissionStats() const {
         return Admission.GetStats();
@@ -740,6 +745,7 @@ public:
                     ctx, info, TEvKeyValue::TEvNotify::ConvertStatus(status), intermediate->Stat,
                     intermediate->AcquiredChannels);
         } else { //metrics change report in OnRequestComplete is not done
+            ReleaseRequestSlot(*intermediate);
             ResourceMetrics->TryUpdate(ctx);
             RequestInputTime.erase(intermediate->RequestUid);
         }
@@ -771,7 +777,7 @@ public:
     // write payloads plus the response estimate of an inline read
     static ui64 GetBudgetCharge(const TIntermediate& intermediate);
     // the admission start callback: the actor of an admitted write or inline read
-    void StartAdmittedIntermediate(THolder<TIntermediate>&& intermediate, bool postponed);
+    void StartAdmittedIntermediate(THolder<TIntermediate>&& intermediate, NMemory::EAdmitSource source);
 
     bool ConvertRange(const NKikimrClient::TKeyValueRequest::TKeyRange& from, TKeyRange *to,
                       const TActorContext& ctx, THolder<TIntermediate>& intermediate, const char *cmd, ui32 index);

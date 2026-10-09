@@ -1,6 +1,7 @@
 #pragma once
 #include <unordered_map>
 #include <ydb/core/base/defs.h>
+#include <ydb/core/base/memory_controller_iface.h>
 #include <ydb/core/util/tuples.h>
 #include <ydb/core/util/metrics.h>
 
@@ -44,6 +45,9 @@ class TResourceMetricsValues {
 public:
     TDecayingAverageValue<ui64, DurationPer15Seconds, DurationPerSecond> CPU;
     TGaugeValue<ui64> Memory;
+    // Keep the report together: legacy writers may update Memory independently.
+    // An engaged optional includes reports whose values are all zero.
+    std::optional<NMemory::TConsumerReport> MemoryReport;
     TDecayingAverageValue<ui64, DurationPer15Seconds, DurationPerSecond> Network;
     TGaugeValue<ui64> StorageSystem;
     TGaugeValue<ui64> StorageUser;
@@ -51,6 +55,11 @@ public:
     TTabletThroughputValue WriteThroughput;
     TTabletIopsValue ReadIops;
     TTabletIopsValue WriteIops;
+
+    void SetMemoryReport(ui64 used, ui64 demand, ui64 reclaimable) {
+        Memory.Set(used);
+        MemoryReport = NMemory::TConsumerReport{.Used = used, .Demand = demand, .Reclaimable = reclaimable};
+    }
 
     void Fill(NKikimrTabletBase::TMetrics& metrics) const;
 };
@@ -74,6 +83,8 @@ protected:
     const TActorId Launcher;
     std::optional<ui32> LevelCPU;
     std::optional<ui32> LevelMemory;
+    std::optional<ui32> LevelMemoryDemand;
+    std::optional<ui32> LevelMemoryReclaimable;
     std::optional<ui32> LevelNetwork;
     std::optional<ui32> LevelStorage;
     std::optional<ui32> LevelIops;

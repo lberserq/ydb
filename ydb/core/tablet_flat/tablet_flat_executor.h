@@ -529,10 +529,10 @@ namespace NFlatExecutorSetup {
             return {.Used = used, .Demand = used, .Reclaimable = 0};
         }
 
-        // called in the tablet's context after a zone change it asked to be woken up for
+        // called in the tablet's context when the node zone changed
         virtual void OnMemoryZone(NMemory::EMemoryZone) { /* default */ }
 
-        // keep the elastic part at or below shareBytes: a tablet that reports Reclaimable > 0 promises to honor it
+        // keep the reclaimable part at or below shareBytes: a tablet that reports Reclaimable > 0 promises to honor it
         virtual void OnMemoryLimit(ui64 /* shareBytes */) { /* default */ }
 
         virtual void OnLeaderUserAuxUpdate(TString) { /* default */ }
@@ -594,8 +594,11 @@ namespace NFlatExecutorSetup {
 
         virtual void Execute(TAutoPtr<ITransaction> transaction, const TActorContext &ctx) = 0;
 
-        // the tablet's slot in the tablet memory host; a detached slot when the host is off
-        virtual TIntrusivePtr<NMemory::TTabletMemorySlot> MemorySlot() const { return NMemory::TTabletMemorySlot::Detached(); }
+        // the node zone the tablet's Local last delivered; Green with no Local or with the host off
+        virtual NMemory::EMemoryZone GetMemoryZone() const { return NMemory::EMemoryZone::Green; }
+
+        // how much of its reclaimable part the tablet may keep, when the node told it one
+        virtual std::optional<ui64> GetMemoryShare() const { return std::nullopt; }
 
         /**
          * Enqueue a transaction for execution
