@@ -93,6 +93,7 @@ TVector<TTabletMemoryHost::TTabletShare> TTabletMemoryHost::ApplyElasticLimit(ui
         // Retain the last sent allocation when suppressing growth, so small increases
         // accumulate. Reductions and withdrawals must reach the owner to keep the
         // sum of delivered allocations within the computed budget.
+        // Growth is significant at 1 MiB or 1% of the last sent allocation.
         constexpr ui64 SignificantShareIncrease = 1 << 20;
         if (slot.ShareDelivered && slot.Share && *slot.Share && share && *share > *slot.Share &&
             *share - *slot.Share < Min(SignificantShareIncrease, Max<ui64>(1, *slot.Share / 100)))

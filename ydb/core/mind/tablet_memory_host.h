@@ -78,7 +78,7 @@ public:
         return {.Used = Sums.Elastic, .Demand = Max(Sums.ElasticDemand, Sums.Elastic), .Reclaimable = Sums.Elastic};
     }
 
-    // Splits the elastic limit proportionally to elastic demand and returns the tablets whose share changed
+    // Computes demand-based targets and emits all reductions and significant growth.
     TVector<TTabletShare> ApplyElasticLimit(ui64 limitBytes);
 
     // Every tablet that has a slot, for the zone fan-out
@@ -92,7 +92,7 @@ private:
         TActorId Executor;
         TTabletTypes::EType TabletType = TTabletTypes::TypeInvalid;
         TConsumerReport Report;
-        std::optional<ui64> Share;
+        std::optional<ui64> Share; // Last emitted allocation; suppressed targets are not stored.
         bool ShareDelivered = false;
     };
 
