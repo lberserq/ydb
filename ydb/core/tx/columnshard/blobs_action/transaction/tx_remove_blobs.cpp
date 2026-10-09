@@ -30,6 +30,7 @@ void TTxRemoveSharedBlobs::Complete(const TActorContext& ctx) {
                                    NKikimrColumnShardBlobOperationsProto::TEvDeleteSharedBlobsFinished::Success));
 
     Self->GetStoragesManager()->GetSharedBlobsManager()->FinishExternalModification();
+    Self->ResumePostponedMoveData(ctx);
 }
 
 }   // namespace NKikimr::NColumnShard

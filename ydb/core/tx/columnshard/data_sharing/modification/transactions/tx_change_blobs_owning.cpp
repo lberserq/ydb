@@ -15,11 +15,12 @@ bool TTxApplyLinksModification::DoExecute(TTransactionContext& txc, const TActor
     return true;
 }
 
-void TTxApplyLinksModification::DoComplete(const TActorContext& /*ctx*/) {
+void TTxApplyLinksModification::DoComplete(const TActorContext& ctx) {
     YDB_LOG_CREATE_CONTEXT_COMP(NKikimrServices::TX_COLUMNSHARD,
         {"tabletId", Self->TabletID()},
         {"txState", "complete"});
     Task->ApplyForRuntime(Self->GetStoragesManager()->GetSharedBlobsManager());
+    Self->ResumePostponedMoveData(ctx);
 
     auto ev = std::make_unique<NOlap::NDataSharing::NEvents::TEvApplyLinksModificationFinished>(Task->GetTabletId(), SessionId, PackIdx);
     NActors::TActivationContext::AsActorContext().Send(MakePipePerNodeCacheID(false),

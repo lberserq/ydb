@@ -49,6 +49,7 @@ TCSCounters::TCSCounters()
     MoveDataPortionsRetired = TBase::GetValueAutoAggregationsClient("MoveData/Portions/Retired");
     MoveDataFinishedCount = TBase::GetDeriviative("MoveData/Finished/Count");
     MoveDataGateCheckedCount = TBase::GetDeriviative("MoveData/Gate/Checked/Count");
+    MoveDataBlobsCheckedCount = TBase::GetDeriviative("MoveData/Gate/BlobsChecked/Count");
     MoveDataGateBlockedByReseedCount = TBase::GetDeriviative("MoveData/GateBlocked/Reseed/Count");
     MoveDataGateBlockedByVacuumCount = TBase::GetDeriviative("MoveData/GateBlocked/Vacuum/Count");
     MoveDataGateBlockedByPortionsCount = TBase::GetDeriviative("MoveData/GateBlocked/Portions/Count");

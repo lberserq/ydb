@@ -141,6 +141,7 @@ void TMoveDataDriver::RestartMoveData() {
     PendingRequestId = 0;
     RetryMetadataAfter = TInstant::Zero();
     MetadataScan = TMoveDataMetadataScan();
+    BlobsWait.reset();
     if (!Self->HasIndex()) {
         return;
     }
@@ -184,6 +185,12 @@ void TColumnShard::MoveDataCompleted(const TActorContext& ctx) {
     ctx.Send(MoveDataDriverId, new TEvPrivate::TEvMoveDataPoke());
 }
 
+void TColumnShard::ResumePostponedMoveData(const TActorContext& ctx) {
+    if (MoveDataDriverId) {
+        ctx.Send(MoveDataDriverId, new TEvPrivate::TEvMoveDataBlobsChanged());
+    }
+}
+
 NOlap::NActualizer::TMoveDataQueueSizes TColumnShard::GetMoveDataQueueSizes() const {
     if (!HasIndex()) {
         return {};
@@ -191,62 +198,69 @@ NOlap::NActualizer::TMoveDataQueueSizes TColumnShard::GetMoveDataQueueSizes() co
     return GetIndexAs<NOlap::TColumnEngineForLogs>().GetMoveDataQueueSizes();
 }
 
-void TColumnShard::CheckMoveDataGate(const TActorContext& ctx, const NOlap::NActualizer::TMoveDataQueueSizes& queues) {
+void TMoveDataDriver::CheckMoveDataGate(const TActorContext& ctx, const NOlap::NActualizer::TMoveDataQueueSizes& queues) {
+    auto& counters = Self->Counters.GetCSCounters();
+    auto& state = Self->MoveDataState;
     // The driver checked session activity and applied target changes in this same mailbox turn.
-    Counters.GetCSCounters().OnMoveDataGateChecked();
+    counters.OnMoveDataGateChecked();
 
-    Counters.GetCSCounters().OnMoveDataQueues(queues.Pending, queues.ConfirmedToMove, queues.InFlight, queues.Uncommitted, queues.Retired);
-    if (queues.Rejected > MoveDataState.ReportedRejections) {
-        Counters.GetCSCounters().OnMoveDataPortionsRejected(queues.Rejected - MoveDataState.ReportedRejections);
-        MoveDataState.ReportedRejections = queues.Rejected;
+    counters.OnMoveDataQueues(queues.Pending, queues.ConfirmedToMove, queues.InFlight, queues.Uncommitted, queues.Retired);
+    if (queues.Rejected > state.ReportedRejections) {
+        counters.OnMoveDataPortionsRejected(queues.Rejected - state.ReportedRejections);
+        state.ReportedRejections = queues.Rejected;
     }
-    if (!MoveDataState.VacuumCompleted) {
-        Counters.GetCSCounters().OnMoveDataGateBlockedByVacuum();
+    if (!state.VacuumCompleted) {
+        counters.OnMoveDataGateBlockedByVacuum();
         return;
     }
     if (queues.GetTotal() != 0) {
-        Counters.GetCSCounters().OnMoveDataGateBlockedByPortions();
+        counters.OnMoveDataGateBlockedByPortions();
         if (queues.Uncommitted) {
-            YDB_LOG_INFO("MoveData gate waits for uncommitted writes", {"tabletId", TabletID()}, {"uncommitted", queues.Uncommitted});
+            YDB_LOG_INFO("MoveData gate waits for uncommitted writes", {"tabletId", Self->TabletID()}, {"uncommitted", queues.Uncommitted});
         }
         return;
     }
     // A selected target portion still in the granule has not reached the GC queues.
     if (queues.Retired != 0) {
-        Counters.GetCSCounters().OnMoveDataGateBlockedByCleanup();
-        YDB_LOG_INFO("MoveData gate waits for cleanup", {"tabletId", TabletID()}, {"retired", queues.Retired});
+        counters.OnMoveDataGateBlockedByCleanup();
+        YDB_LOG_INFO("MoveData gate waits for cleanup", {"tabletId", Self->TabletID()}, {"retired", queues.Retired});
         return;
     }
-    const auto& defaultOperator = GetStoragesManager()->GetDefaultOperator();
+    const auto& defaultOperator = Self->GetStoragesManager()->GetDefaultOperator();
     if (!defaultOperator->HasCollectedBeforeCurrentGeneration()) {
-        Counters.GetCSCounters().OnMoveDataGateBlockedByFirstGCRound();
-        YDB_LOG_INFO("MoveData gate waits for the first GC round", {"tabletId", TabletID()});
+        counters.OnMoveDataGateBlockedByFirstGCRound();
+        YDB_LOG_INFO("MoveData gate waits for the first GC round", {"tabletId", Self->TabletID()});
         return;
     }
-    if (defaultOperator->HasBlobsForGroups(MoveDataState.TargetGroups)) {
-        // Same wait either way, but a shared or borrowed link is not ours to collect, so it gets its own sensor.
-        const auto& sharedBlobs = defaultOperator->GetSharedBlobs();
-        if (sharedBlobs->HasBlobsForGroups(MoveDataState.TargetGroups)) {
-            Counters.GetCSCounters().OnMoveDataGateBlockedByShared();
-            YDB_LOG_INFO("MoveData gate waits for shared blobs", {"tabletId", TabletID()});
+    if (!BlobsWait) {
+        counters.OnMoveDataBlobsChecked();
+        if (defaultOperator->HasBlobsForGroups(state.TargetGroups)) {
+            // Keep the shared/borrowed gate as well as the queues and in-flight GC gate.
+            BlobsWait = defaultOperator->GetSharedBlobs()->HasBlobsForGroups(state.TargetGroups) ? EBlobsWait::Shared : EBlobsWait::GC;
+        }
+    }
+    if (BlobsWait) {
+        if (*BlobsWait == EBlobsWait::Shared) {
+            counters.OnMoveDataGateBlockedByShared();
+            YDB_LOG_INFO("MoveData gate waits for shared blobs", {"tabletId", Self->TabletID()});
         } else {
-            Counters.GetCSCounters().OnMoveDataGateBlockedByGC();
-            YDB_LOG_INFO("MoveData gate waits for pending GC", {"tabletId", TabletID()});
+            counters.OnMoveDataGateBlockedByGC();
+            YDB_LOG_INFO("MoveData gate waits for pending GC", {"tabletId", Self->TabletID()});
         }
         return;
     }
-    YDB_LOG_INFO("MoveData gate passed", {"tabletId", TabletID()});
+    YDB_LOG_INFO("MoveData gate passed", {"tabletId", Self->TabletID()});
 
-    if (HasIndex()) {
-        MutableIndexAs<NOlap::TColumnEngineForLogs>().StopMoveData();
+    if (Self->HasIndex()) {
+        Self->MutableIndexAs<NOlap::TColumnEngineForLogs>().StopMoveData();
     }
     // The boot-time CutHistory scan finds drained intervals by itself, so nothing needs persisting before Success.
-    for (const auto& subscriber : MoveDataState.Subscribers) {
-        ctx.Send(subscriber, new TEvTablet::TEvMoveDataResponse(TabletID(), NKikimrTabletBase::TEvMoveDataResponse::Success));
+    for (const auto& subscriber : state.Subscribers) {
+        ctx.Send(subscriber, new TEvTablet::TEvMoveDataResponse(Self->TabletID(), NKikimrTabletBase::TEvMoveDataResponse::Success));
     }
-    Counters.GetCSCounters().OnMoveDataFinished();
-    MoveDataState = TMoveDataState{};
-    StopMoveDataDriver(ctx);
+    counters.OnMoveDataFinished();
+    state = TMoveDataState{};
+    Self->StopMoveDataDriver(ctx);
 }
 
 void TMoveDataDriver::SubmitMetadataBatch(const TActorContext& ctx) {
@@ -299,7 +313,7 @@ void TMoveDataDriver::StartAndCheckGate(const TActorContext& ctx) {
     if (queues.ConfirmedToMove) {
         Self->SetupMoveDataRewrites();
     }
-    Self->CheckMoveDataGate(ctx, queues);
+    CheckMoveDataGate(ctx, queues);
 }
 
 void TMoveDataDriver::Handle(TEvPrivate::TEvMoveDataMetadataResult::TPtr& ev, const TActorContext& ctx) {
@@ -366,6 +380,15 @@ void TMoveDataDriver::Handle(TEvPrivate::TEvMoveDataWakeup::TPtr&, const TActorC
     }
     StartAndCheckGate(ctx);
     ScheduleWakeup(ctx);
+}
+
+void TMoveDataDriver::Handle(TEvPrivate::TEvMoveDataBlobsChanged::TPtr&, const TActorContext& ctx) {
+    if (!IsOwnerAlive()) {
+        PassAway();
+        return;
+    }
+    BlobsWait.reset();
+    StartAndCheckGate(ctx);
 }
 
 void TMoveDataDriver::Handle(TEvPrivate::TEvMoveDataPoke::TPtr&, const TActorContext& ctx) {

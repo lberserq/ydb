@@ -4,9 +4,12 @@
 #include <ydb/core/base/counters.h>
 #include <ydb/core/blobstorage/dsproxy/mock/model.h>
 #include <ydb/core/testlib/tablet_helpers.h>
+#include <ydb/core/tx/columnshard/blobs_action/events/delete_blobs.h>
 #include <ydb/core/tx/columnshard/columnshard.h>
 #include <ydb/core/tx/columnshard/columnshard_impl.h>
 #include <ydb/core/tx/columnshard/columnshard_private_events.h>
+#include <ydb/core/tx/columnshard/data_sharing/modification/events/change_owning.h>
+#include <ydb/core/tx/columnshard/data_sharing/modification/tasks/modification.h>
 #include <ydb/core/tx/columnshard/engines/changes/cleanup_portions.h>
 #include <ydb/core/tx/columnshard/engines/changes/ttl.h>
 #include <ydb/core/tx/columnshard/engines/column_engine_logs.h>
@@ -60,10 +63,14 @@ std::vector<TLogoBlobID> LivePortionBlobs(const NFake::TProxyDS& proxy, const ui
 }
 
 // TCSCounters registers under module_id=CS, and GetDeriviative prefixes the name with "Deriviative/".
-i64 GateBlockedByFirstGCRound(TTestBasicRuntime& runtime) {
+i64 MoveDataCounter(TTestBasicRuntime& runtime, const TStringBuf name) {
     const auto subgroup =
         GetServiceCounters(runtime.GetDynamicCounters(0), "tablets")->GetSubgroup("subsystem", "columnshard")->GetSubgroup("module_id", "CS");
-    return subgroup->GetCounter("Deriviative/MoveData/GateBlocked/FirstGCRound/Count", true)->Val();
+    return subgroup->GetCounter(TStringBuilder() << "Deriviative/MoveData/" << name, true)->Val();
+}
+
+i64 GateBlockedByFirstGCRound(TTestBasicRuntime& runtime) {
+    return MoveDataCounter(runtime, "GateBlocked/FirstGCRound/Count");
 }
 
 // Private event ids repeat across components, so the type id alone does not identify TEvWriteIndex.
@@ -278,10 +285,148 @@ void RunMoveDataToCompletion(const bool moveDataEnabled) {
     UNIT_ASSERT_VALUES_EQUAL(f.ReadRows(), 1000);
 }
 
+enum class EReleaseSharedBlob {
+    DeleteShared,
+    RemoveLink,
+    RemapBorrowed,
+};
+
+void RunMoveDataSharedBlobWait(const EReleaseSharedBlob release) {
+    TMoveDataFixture f;
+    // Establish the current-generation barrier without writing any portion data.
+    f.StartMove({ MidGroup });
+    const auto initialResponse = f.DriveGate(150);
+    UNIT_ASSERT(initialResponse);
+    f.AssertDrainedSuccess(initialResponse);
+    f.Controller->DisableBackground(EBackground::GC);
+
+    const auto shared = f.Controller->GetTheOnlyShard()->GetStoragesManager()->GetDefaultOperator()->GetSharedBlobs();
+    const auto otherTablet = static_cast<NOlap::TTabletId>(TabletId + 1);
+    // Foreign blob ids matter too: CutHistory's own-blob visitor cannot replace this gate.
+    const NOlap::TUnifiedBlobId blob(MidGroup, TLogoBlobID(TabletId + 1, 1, 1, 2, 10, 0));
+    if (release == EReleaseSharedBlob::RemapBorrowed) {
+        UNIT_ASSERT(shared->UpsertBorrowedBlobOnLoad(blob, otherTablet));
+    } else {
+        UNIT_ASSERT(shared->UpsertSharedBlobOnLoad(blob, otherTablet));
+    }
+
+    bool dropFallbacks = false;
+    auto observer = f.Runtime.AddObserver<IEventHandle>([&](IEventHandle::TPtr& ev) {
+        if (dropFallbacks && ev->HasEvent() &&
+            (dynamic_cast<TEvPrivate::TEvMoveDataWakeup*>(ev->GetBase()) || dynamic_cast<TEvPrivate::TEvMoveDataPoke*>(ev->GetBase()))) {
+            ev.Reset();
+        }
+    });
+    f.StartMove({ MidGroup });
+    UNIT_ASSERT(!f.DriveGate(100, {}, [&] {
+        return MoveDataCounter(f.Runtime, "GateBlocked/Shared/Count") > 0;
+    }));
+    UNIT_ASSERT_GT(MoveDataCounter(f.Runtime, "GateBlocked/Shared/Count"), 0);
+    const i64 scans = MoveDataCounter(f.Runtime, "Gate/BlobsChecked/Count");
+    const i64 checks = MoveDataCounter(f.Runtime, "Gate/Checked/Count");
+    // A duplicate request pokes the driver; the following wait also spans several timer ticks.
+    f.StartMove({ MidGroup });
+    UNIT_ASSERT(!f.DriveGate(120));
+    UNIT_ASSERT_GT(MoveDataCounter(f.Runtime, "Gate/Checked/Count"), checks + 1);
+    UNIT_ASSERT_VALUES_EQUAL(MoveDataCounter(f.Runtime, "Gate/BlobsChecked/Count"), scans);
+
+    // Only the committed link change can wake the driver from this point on.
+    dropFallbacks = true;
+    if (release == EReleaseSharedBlob::DeleteShared) {
+        f.Runtime.SendToPipe(
+            TabletId, f.Sender, new NOlap::NBlobOperations::NEvents::TEvDeleteSharedBlobs(f.Sender, static_cast<ui64>(otherTablet),
+                                    NOlap::IStoragesManager::DefaultStorageId, { blob }), 0, GetPipeConfigWithRetries());
+    } else {
+        NOlap::NDataSharing::TStorageTabletTask storageTask(NOlap::IStoragesManager::DefaultStorageId, static_cast<NOlap::TTabletId>(TabletId));
+        if (release == EReleaseSharedBlob::RemapBorrowed) {
+            storageTask.AddRemapOwner(blob, otherTablet, static_cast<NOlap::TTabletId>(TabletId));
+        } else {
+            storageTask.RemoveLink(blob, otherTablet);
+        }
+        NOlap::NDataSharing::TTaskForTablet task(static_cast<NOlap::TTabletId>(TabletId));
+        task.AddStorage(std::move(storageTask));
+        f.Runtime.SendToPipe(TabletId, f.Sender,
+            new NOlap::NDataSharing::NEvents::TEvApplyLinksModification(static_cast<NOlap::TTabletId>(TabletId), "move-data-gc-wait", 1, task),
+            0, GetPipeConfigWithRetries());
+    }
+    const auto response = f.DriveGate(20);
+    UNIT_ASSERT_C(response, "a committed shared-link change did not resume MoveData without its periodic fallback");
+    f.AssertDrainedSuccess(response);
+    UNIT_ASSERT(!shared->HasBlobsForGroups({ MidGroup }));
+    UNIT_ASSERT_GT(MoveDataCounter(f.Runtime, "Gate/BlobsChecked/Count"), scans);
+}
+
 }   // namespace
 
 // Whole chain: TEvMoveData -> selection -> accessor metadata -> rewrite -> response.
 Y_UNIT_TEST_SUITE(TColumnShardMoveDataE2E) {
+    Y_UNIT_TEST(SharedBlobDeleteResumesMoveDataWithoutPolling) {
+        RunMoveDataSharedBlobWait(EReleaseSharedBlob::DeleteShared);
+    }
+
+    Y_UNIT_TEST(SharedLinkRemovalResumesMoveDataWithoutPolling) {
+        RunMoveDataSharedBlobWait(EReleaseSharedBlob::RemoveLink);
+    }
+
+    Y_UNIT_TEST(BorrowedOwnerChangeResumesMoveDataWithoutPolling) {
+        RunMoveDataSharedBlobWait(EReleaseSharedBlob::RemapBorrowed);
+    }
+
+    Y_UNIT_TEST(GCCommitResumesMoveDataWithoutPolling) {
+        TMoveDataFixture f;
+        f.Controller->DisableBackground(EBackground::TTL);
+        f.Write(1, 0, 1000);
+        f.Controller->WaitCompactions(TDuration::Seconds(10));
+        f.ReassignPastWrittenData();
+        // Finish the incarnation's first GC round before testing the pending-GC gate.
+        f.StartMove({ MidGroup });
+        const auto initialResponse = f.DriveGate(150);
+        UNIT_ASSERT(initialResponse);
+        UNIT_ASSERT_VALUES_EQUAL(
+            static_cast<int>(initialResponse->Get()->Record.GetStatus()), static_cast<int>(NKikimrTabletBase::TEvMoveDataResponse::Success));
+        f.Controller->DisableBackground(EBackground::GC);
+        f.StartMove();
+        UNIT_ASSERT(!f.DriveGateWithWrite(150, 2, 1000, 1001, [&] {
+            return MoveDataCounter(f.Runtime, "GateBlocked/GC/Count") > 0;
+        }));
+        UNIT_ASSERT_GT(MoveDataCounter(f.Runtime, "GateBlocked/GC/Count"), 0);
+        const i64 scans = MoveDataCounter(f.Runtime, "Gate/BlobsChecked/Count");
+        const i64 checks = MoveDataCounter(f.Runtime, "Gate/Checked/Count");
+        f.StartMove();
+        UNIT_ASSERT(!f.DriveGate(120));
+        UNIT_ASSERT_GT(MoveDataCounter(f.Runtime, "Gate/Checked/Count"), checks + 1);
+        UNIT_ASSERT_VALUES_EQUAL(MoveDataCounter(f.Runtime, "Gate/BlobsChecked/Count"), scans);
+
+        std::vector<TAutoPtr<IEventHandle>> heldGC;
+        bool holdGC = true;
+        auto observer = f.Runtime.AddObserver<IEventHandle>([&](IEventHandle::TPtr& ev) {
+            if (!ev->HasEvent()) {
+                return;
+            }
+            if (dynamic_cast<TEvPrivate::TEvMoveDataWakeup*>(ev->GetBase()) || dynamic_cast<TEvPrivate::TEvMoveDataPoke*>(ev->GetBase())) {
+                ev.Reset();
+            } else if (holdGC && dynamic_cast<TEvPrivate::TEvGarbageCollectionFinished*>(ev->GetBase())) {
+                heldGC.emplace_back(ev.Release());
+            }
+        });
+        f.Controller->EnableBackground(EBackground::GC);
+        UNIT_ASSERT(!f.DriveGate(100, {}, [&] {
+            return !heldGC.empty();
+        }));
+        UNIT_ASSERT_C(!heldGC.empty(), "GC never reached its final cleanup transaction");
+        UNIT_ASSERT(!f.DriveGate(20));
+        UNIT_ASSERT_VALUES_EQUAL(MoveDataCounter(f.Runtime, "Gate/BlobsChecked/Count"), scans);
+        holdGC = false;
+        for (auto& ev : heldGC) {
+            f.Runtime.Send(ev.Release());
+        }
+        const auto response = f.DriveGate(100);
+        UNIT_ASSERT_C(response, "GC commit did not resume MoveData without its periodic fallback");
+        f.AssertDrainedSuccess(response);
+        UNIT_ASSERT_GT(MoveDataCounter(f.Runtime, "Gate/BlobsChecked/Count"), scans);
+        UNIT_ASSERT_VALUES_EQUAL(f.ReadRows(), 1000);
+    }
+
     Y_UNIT_TEST(MoveDataStartedWithoutIndexCompletesAfterSchemaInitialization) {
         TMoveDataFixture f(/*moveDataEnabled=*/true, {}, /*initializeSchema=*/false);
         UNIT_ASSERT(!f.Controller->GetTheOnlyShard()->HasIndex());

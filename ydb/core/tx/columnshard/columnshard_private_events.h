@@ -101,6 +101,7 @@ struct TEvPrivate {
         EvContinueFindEmptyHistoryIntervals,
         EvFindEmptyHistoryIntervalsPortionsReady,
         EvMoveDataMetadataResult,
+        EvMoveDataBlobsChanged,
         EvEnd
     };
 
@@ -556,12 +557,14 @@ struct TEvPrivate {
     // Run one driver turn now instead of waiting for the cadence tick.
     struct TEvMoveDataPoke: public TEventLocal<TEvMoveDataPoke, EvMoveDataPoke> {};
 
+    struct TEvMoveDataBlobsChanged: public TEventLocal<TEvMoveDataBlobsChanged, EvMoveDataBlobsChanged> {};
+
     struct TEvMoveDataMetadataResult: public TEventLocal<TEvMoveDataMetadataResult, EvMoveDataMetadataResult> {
         const ui64 RequestId;
         NOlap::NResourceBroker::NSubscribe::TResourceContainer<NOlap::TDataAccessorsResult> Result;
 
-        TEvMoveDataMetadataResult(const ui64 requestId,
-            NOlap::NResourceBroker::NSubscribe::TResourceContainer<NOlap::TDataAccessorsResult>&& result)
+        TEvMoveDataMetadataResult(
+            const ui64 requestId, NOlap::NResourceBroker::NSubscribe::TResourceContainer<NOlap::TDataAccessorsResult>&& result)
             : RequestId(requestId)
             , Result(std::move(result))
         {

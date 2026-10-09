@@ -20,6 +20,7 @@ void TTxGarbageCollectionFinished::Complete(const TActorContext& ctx) {
         {"event", "complete"});
     Action->OnCompleteTxAfterCleaning(*Self, Action);
     Self->ResumePostponedCutHistory(ctx);
+    Self->ResumePostponedMoveData(ctx);
 }
 
 bool TTxGarbageCollectionStart::Execute(TTransactionContext& txc, const TActorContext& /*ctx*/) {

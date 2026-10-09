@@ -121,6 +121,7 @@ private:
     NMonitoring::TDynamicCounters::TCounterPtr MoveDataFinishedCount;
     // The denominator for every GateBlocked counter below.
     NMonitoring::TDynamicCounters::TCounterPtr MoveDataGateCheckedCount;
+    NMonitoring::TDynamicCounters::TCounterPtr MoveDataBlobsCheckedCount;
     NMonitoring::TDynamicCounters::TCounterPtr MoveDataGateBlockedByReseedCount;
     NMonitoring::TDynamicCounters::TCounterPtr MoveDataGateBlockedByVacuumCount;
     NMonitoring::TDynamicCounters::TCounterPtr MoveDataGateBlockedByPortionsCount;
@@ -251,6 +252,10 @@ public:
 
     void OnMoveDataGateChecked() const {
         MoveDataGateCheckedCount->Add(1);
+    }
+
+    void OnMoveDataBlobsChecked() const noexcept {
+        MoveDataBlobsCheckedCount->Add(1);
     }
 
     void OnMoveDataGateBlockedByReseed() const {

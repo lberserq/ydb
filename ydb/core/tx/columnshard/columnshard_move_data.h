@@ -84,6 +84,13 @@ private:
     // Dropped to zero by TColumnShard::Die before it poisons us; an event queued in between must not touch Self.
     const std::shared_ptr<TAtomicCounter> TabletActivity;
     TMoveDataMetadataScan MetadataScan;
+    enum class EBlobsWait {
+        GC,
+        Shared,
+    };
+    // Only cache a blocked check. GC and shared-link transaction completions invalidate it;
+    // an empty check must lead to Success in the same mailbox turn.
+    std::optional<EBlobsWait> BlobsWait;
     ui64 NextRequestId = 0;
     ui64 PendingRequestId = 0;
     ui64 RejectedPortions = 0;
@@ -100,11 +107,13 @@ private:
     }
 
     void StartAndCheckGate(const TActorContext& ctx);
+    void CheckMoveDataGate(const TActorContext& ctx, const NOlap::NActualizer::TMoveDataQueueSizes& queues);
     void RestartMoveData();
     void SubmitMetadataBatch(const TActorContext& ctx);
 
     void Handle(TEvPrivate::TEvMoveDataWakeup::TPtr&, const TActorContext& ctx);
     void Handle(TEvPrivate::TEvMoveDataPoke::TPtr&, const TActorContext& ctx);
+    void Handle(TEvPrivate::TEvMoveDataBlobsChanged::TPtr&, const TActorContext& ctx);
     void Handle(TEvPrivate::TEvMoveDataMetadataResult::TPtr& ev, const TActorContext& ctx);
 
 public:
@@ -124,6 +133,7 @@ public:
         switch (ev->GetTypeRewrite()) {
             HFunc(TEvPrivate::TEvMoveDataWakeup, Handle);
             HFunc(TEvPrivate::TEvMoveDataPoke, Handle);
+            HFunc(TEvPrivate::TEvMoveDataBlobsChanged, Handle);
             HFunc(TEvPrivate::TEvMoveDataMetadataResult, Handle);
             cFunc(TEvents::TEvPoison::EventType, PassAway);
             default:

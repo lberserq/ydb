@@ -353,7 +353,6 @@ class TColumnShard: public TActor<TColumnShard>, public NTabletFlatExecutor::TTa
     void Handle(TEvTablet::TEvMoveData::TPtr& ev, const TActorContext& ctx);
     virtual void MoveDataCompleted(const TActorContext& ctx) override;
     // Takes the sizes the driver already walked the index for, so a gate check adds no walk of its own.
-    void CheckMoveDataGate(const TActorContext& ctx, const NOlap::NActualizer::TMoveDataQueueSizes& queues);
     NOlap::NActualizer::TMoveDataQueueSizes GetMoveDataQueueSizes() const;
     void SetupMoveDataRewrites();
     void StartMoveDataDriver(const TActorContext& ctx);
@@ -663,6 +662,7 @@ private:
 
 public:
     void ResumePostponedCutHistory(const TActorContext& ctx);
+    void ResumePostponedMoveData(const TActorContext& ctx);
     ui64 TabletTxCounter = 0;
 
     std::shared_ptr<const TAtomicCounter> GetTabletActivity() const {
