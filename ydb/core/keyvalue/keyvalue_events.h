@@ -384,13 +384,8 @@ namespace TEvKeyValue {
 
     struct TEvCheckTrash : public TEventLocal<TEvCheckTrash, EvCheckTrash> {};
 
-    struct TEvAdmissionDeadline : public TEventLocal<TEvAdmissionDeadline, EvAdmissionDeadline> {
-        const ui64 RequestUid;
+    struct TEvAdmissionDeadline : public TEventLocal<TEvAdmissionDeadline, EvAdmissionDeadline> {};
 
-        explicit TEvAdmissionDeadline(ui64 requestUid)
-            : RequestUid(requestUid)
-        {}
-    };
 }
 
 } // NKikimr

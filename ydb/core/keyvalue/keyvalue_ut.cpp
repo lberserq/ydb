@@ -4249,6 +4249,7 @@ Y_UNIT_TEST(TestMemoryAdmissionQueuedRequestsExpire) {
         }
         tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
         UNIT_ASSERT_VALUES_EQUAL(GetTabletState(tc, tabletActor).GetMemoryAdmissionStats().PostponedCount, 1u);
+        UNIT_ASSERT_VALUES_EQUAL(GetTabletState(tc, tabletActor).GetTabletCounters().Simple()[NKeyValue::COUNTER_MEMORY_ADMISSION_QUEUED_COUNT].Get(), 1u);
         if (newApi && inlineRead) {
             const auto reply = ReceiveResponse<TEvKeyValue::TEvReadResponse>(tc);
             UNIT_ASSERT_VALUES_EQUAL(reply.cookie(), 123u);
@@ -4267,6 +4268,7 @@ Y_UNIT_TEST(TestMemoryAdmissionQueuedRequestsExpire) {
         UNIT_ASSERT_VALUES_EQUAL(stats.RunningCount, 1u);
         UNIT_ASSERT_VALUES_EQUAL(stats.PostponedCount, 0u);
         UNIT_ASSERT_VALUES_EQUAL(stats.PostponedBytes, 0u);
+        UNIT_ASSERT_VALUES_EQUAL(GetTabletState(tc, tabletActor).GetTabletCounters().Simple()[NKeyValue::COUNTER_MEMORY_ADMISSION_QUEUED_COUNT].Get(), 0u);
         UNIT_ASSERT_VALUES_EQUAL(puts.Held.size(), 1u);
         UNIT_ASSERT_VALUES_EQUAL(GetTabletState(tc, tabletActor).GetStateBytes().RefCountsBytes, refsBefore);
         puts.ReleaseAll(tc);
@@ -4274,6 +4276,69 @@ Y_UNIT_TEST(TestMemoryAdmissionQueuedRequestsExpire) {
         SetTabletMemoryZone(tc, tabletActor, NMemory::EMemoryZone::Green);
         ExpectContents(tc, {{"a", TString(10, 'a')}, {"inline", "inline value"}, {"m0", TString(30, 'z')}});
     }
+}
+
+Y_UNIT_TEST(TestAdmissionDeadlinesAreNotScheduledForImmediateRequests) {
+    for (bool enabled : {false, true}) {
+        std::optional<TActorId> tabletActor;
+        TTestContext tc;
+        TFinalizer finalizer(tc);
+        bool activeZone = false;
+        tc.Prepare(INITIAL_TEST_DISPATCH_NAME, enabled
+            ? TrackTabletActorWithMemoryHost(tabletActor) : TrackTabletActor(tabletActor), activeZone);
+        tc.Runtime->SetScheduledLimit(10000);
+        ExecuteWrite(tc, {{"m0", TString(30, 'z')}}, 0, NKeyValue::MainStorageChannelInPublicApi,
+            NKikimrKeyValue::Priorities::PRIORITY_REALTIME);
+        ui32 timers = 0;
+        TTestActorRuntimeBase::TScheduledEventFilter previous;
+        previous = tc.Runtime->SetScheduledEventFilter([&](auto& runtime, auto& event, auto delay, auto& deadline) {
+            timers += event->GetTypeRewrite() == TEvKeyValue::EvAdmissionDeadline;
+            return previous(runtime, event, delay, deadline);
+        });
+        const ui64 deadline = (tc.Runtime->GetCurrentTime() + TDuration::Seconds(30)).MilliSeconds();
+        THeldPuts puts(tc);
+        for (ui32 i = 0; i != 128; ++i) {
+            auto request = MakeWriteRequest(i, ToString(i), TString(100, 'x'), NKikimrClient::TKeyValueRequest::MAIN);
+            request->Record.SetDeadlineInstantMs(deadline);
+            SendRequestEvent(std::move(request), tc);
+        }
+        tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+        UNIT_ASSERT_VALUES_EQUAL(puts.Held.size(), 128u);
+        UNIT_ASSERT_VALUES_EQUAL(timers, 0u);
+        puts.ReleaseAll(tc);
+        for (ui32 i = 0; i != 128; ++i) {
+            UNIT_ASSERT_VALUES_EQUAL(ReceiveKeyValueResponse(tc).GetStatus(), NMsgBusProxy::MSTATUS_OK);
+        }
+        tc.Runtime->SetScheduledEventFilter(previous);
+    }
+}
+
+Y_UNIT_TEST(TestQueuedTrimDoesNotBlockGC) {
+    std::optional<TActorId> tabletActor;
+    TTestContext tc;
+    TFinalizer finalizer(tc);
+    bool activeZone = false;
+    tc.Prepare(INITIAL_TEST_DISPATCH_NAME, TrackTabletActorWithMemoryHost(tabletActor), activeZone);
+    tc.Runtime->SetScheduledLimit(10000);
+    ExecuteWrite(tc, {{"m0", TString(30, 'z')}}, 0, NKeyValue::MainStorageChannelInPublicApi,
+        NKikimrKeyValue::Priorities::PRIORITY_REALTIME);
+    SetTabletMemoryZone(tc, tabletActor, NMemory::EMemoryZone::Red);
+    THeldPuts puts(tc);
+    SendMainWrite(tc, "a", 10);
+    auto request = std::make_unique<TEvKeyValue::TEvRequest>();
+    request->Record.MutableCmdTrimLeakedBlobs()->SetMaxItemsToTrim(100);
+    SendRequestEvent(std::move(request), tc);
+    tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+    auto& state = GetTabletState(tc, tabletActor);
+    UNIT_ASSERT_VALUES_EQUAL(state.GetMemoryAdmissionStats().PostponedCount, 1u);
+    UNIT_ASSERT(state.CmdTrimLeakedBlobsUids.empty());
+    UNIT_ASSERT_VALUES_EQUAL(state.GetTabletCounters().Simple()[NKeyValue::COUNTER_MEMORY_ADMISSION_QUEUED_COUNT].Get(), 1u);
+    puts.ReleaseAll(tc);
+    ExpectWriteOk(tc);
+    UNIT_ASSERT_VALUES_EQUAL(ReceiveKeyValueResponse(tc).GetStatus(), NMsgBusProxy::MSTATUS_OK);
+    tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+    UNIT_ASSERT_VALUES_EQUAL(state.GetTabletCounters().Simple()[NKeyValue::COUNTER_MEMORY_ADMISSION_QUEUED_COUNT].Get(), 0u);
+    UNIT_ASSERT_VALUES_EQUAL(state.GetTabletCounters().Simple()[NKeyValue::COUNTER_REQ_RO_INLINE_IN_FLY].Get(), 0u);
 }
 
 Y_UNIT_TEST(TestMemoryZoneIgnoredWithoutHost) {

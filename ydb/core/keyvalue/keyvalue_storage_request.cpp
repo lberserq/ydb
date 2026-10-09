@@ -515,6 +515,10 @@ public:
     }
 
     void Bootstrap(const TActorContext &ctx) {
+        if (IntermediateResults->AdmissionTimedOut) {
+            ReplyErrorAndDie(ctx, "Request expired in memory admission queue", NMsgBusProxy::MSTATUS_TIMEOUT);
+            return;
+        }
         // Check parameters and send requests
         if (IntermediateResults->Deadline != TInstant::Max()) {
             TInstant now = TAppData::TimeProvider->Now();

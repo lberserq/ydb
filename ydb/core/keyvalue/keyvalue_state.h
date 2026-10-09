@@ -382,6 +382,9 @@ protected:
 
     // admission of write and inline-read requests by the node memory zone
     NMemory::TMemoryAdmission<THolder<TIntermediate>, TKeyValueState> Admission{*this};
+    TMap<std::pair<TInstant, ui64>, bool> AdmissionDeadlines;
+    THashMap<ui64, TInstant> AdmissionDeadlineByUid;
+    bool AdmissionDeadlineScheduled = false;
 
     std::shared_ptr<TKeyValueStateLifetimeToken> LifetimeToken = std::make_shared<TKeyValueStateLifetimeToken>();
 
@@ -578,7 +581,10 @@ public:
     void OnUpdateWeights(TChannelBalancer::TEvUpdateWeights::TPtr ev);
 
     void OnMemoryZone(NMemory::EMemoryZone zone);
-    void OnAdmissionDeadline(ui64 requestUid);
+    void OnAdmissionDeadline();
+    void ScheduleAdmissionDeadline();
+    void RemoveAdmissionDeadline(ui64 requestUid);
+    void PublishAdmissionCounters();
     void AdmitIntermediate(THolder<TIntermediate>&& intermediate);
     void StartAdmitted(THolder<TIntermediate>&& intermediate, NMemory::EAdmitSource source);
 

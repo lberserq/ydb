@@ -940,8 +940,8 @@ public:
         State.OnInitQueueEmpty();
     }
 
-    void Handle(TEvKeyValue::TEvAdmissionDeadline::TPtr& ev) {
-        State.OnAdmissionDeadline(ev->Get()->RequestUid);
+    void Handle(TEvKeyValue::TEvAdmissionDeadline::TPtr&) {
+        State.OnAdmissionDeadline();
     }
 
     void UpdateTabletYellow() {
