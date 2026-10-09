@@ -925,6 +925,10 @@ private:
     void EraseTrash(TSet<TLogoBlobID>& trashBin, const TLogoBlobID& id);
 
 public: // For testing
+    size_t GetRunningTrimsCount() const {
+        return CmdTrimLeakedBlobsUids.size();
+    }
+
     TStateBytes RecountStateBytes() const;
     TString Dump() const;
     void VerifyEqualIndex(const TKeyValueState& state) const;

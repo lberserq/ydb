@@ -2098,7 +2098,7 @@ void TKeyValueState::ScheduleAdmissionDeadline() {
     const TInstant now = TAppData::TimeProvider->Now();
     const TInstant next = AdmissionDeadlines.begin()->first.first;
     TActivationContext::Schedule(Min(next > now ? next - now : TDuration::Zero(), TDuration::MilliSeconds(100)),
-        new TEvKeyValue::TEvAdmissionDeadline());
+        MakeHolder<IEventHandle>(KeyValueActorId, KeyValueActorId, new TEvKeyValue::TEvAdmissionDeadline()));
 }
 
 void TKeyValueState::OnAdmissionDeadline() {

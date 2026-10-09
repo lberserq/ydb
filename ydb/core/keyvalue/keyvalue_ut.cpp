@@ -4331,7 +4331,7 @@ Y_UNIT_TEST(TestQueuedTrimDoesNotBlockGC) {
     tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
     auto& state = GetTabletState(tc, tabletActor);
     UNIT_ASSERT_VALUES_EQUAL(state.GetMemoryAdmissionStats().PostponedCount, 1u);
-    UNIT_ASSERT(state.CmdTrimLeakedBlobsUids.empty());
+    UNIT_ASSERT_VALUES_EQUAL(state.GetRunningTrimsCount(), 0u);
     UNIT_ASSERT_VALUES_EQUAL(state.GetTabletCounters().Simple()[NKeyValue::COUNTER_MEMORY_ADMISSION_QUEUED_COUNT].Get(), 1u);
     puts.ReleaseAll(tc);
     ExpectWriteOk(tc);
