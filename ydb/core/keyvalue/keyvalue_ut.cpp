@@ -4205,7 +4205,8 @@ Y_UNIT_TEST(TestMemoryZoneYellowRefreshesWatermarkWithoutQueuedRequests) {
 }
 
 Y_UNIT_TEST(TestMemoryAdmissionQueuedRequestsExpire) {
-    for (bool inlineRead : {false, true}) {
+    for (auto [newApi, inlineRead] : std::array<std::pair<bool, bool>, 4>{{
+        {false, false}, {false, true}, {true, false}, {true, true}}}) {
         std::optional<TActorId> tabletActor;
         TTestContext tc;
         TFinalizer finalizer(tc);
@@ -4222,25 +4223,45 @@ Y_UNIT_TEST(TestMemoryAdmissionQueuedRequestsExpire) {
         SendMainWrite(tc, "a", 10);
         const auto refsBefore = GetTabletState(tc, tabletActor).GetStateBytes().RefCountsBytes;
 
-        auto request = std::make_unique<TEvKeyValue::TEvRequest>();
-        auto& record = request->Record;
-        record.SetTabletId(tc.TabletId);
-        record.SetCookie(123);
-        record.SetDeadlineInstantMs((tc.Runtime->GetCurrentTime() + TDuration::Seconds(1)).MilliSeconds());
-        if (inlineRead) {
-            record.AddCmdRead()->SetKey("inline");
+        const ui64 deadline = (tc.Runtime->GetCurrentTime() + TDuration::Seconds(1)).MilliSeconds();
+        if (newApi && inlineRead) {
+            auto request = std::make_unique<TEvKeyValue::TEvRead>();
+            request->Record.set_key("inline");
+            request->Record.set_cookie(123);
+            request->Record.set_deadline_instant_ms(deadline);
+            SendRequestEvent(std::move(request), tc);
+        } else if (newApi) {
+            auto request = std::make_unique<TEvKeyValue::TEvExecuteTransaction>();
+            request->Record.set_tablet_id(tc.TabletId);
+            request->Record.set_cookie(123);
+            request->Record.set_deadline_instant_ms(deadline);
+            auto* write = request->Record.add_commands()->mutable_write();
+            write->set_key("expired");
+            write->set_value(TString(100, 'x'));
+            write->set_storage_channel(NKeyValue::MainStorageChannelInPublicApi);
+            SendRequestEvent(std::move(request), tc);
         } else {
-            auto* write = record.AddCmdWrite();
-            write->SetKey("expired");
-            write->SetValue(TString(100, 'x'));
-            write->SetStorageChannel(NKikimrClient::TKeyValueRequest::MAIN);
+            auto request = inlineRead
+                ? MakeReadRequest(123, {"inline"})
+                : MakeWriteRequest(123, "expired", TString(100, 'x'), NKikimrClient::TKeyValueRequest::MAIN);
+            request->Record.SetDeadlineInstantMs(deadline);
+            SendRequestEvent(std::move(request), tc);
         }
-        SendRequestEvent(std::move(request), tc);
         tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
         UNIT_ASSERT_VALUES_EQUAL(GetTabletState(tc, tabletActor).GetMemoryAdmissionStats().PostponedCount, 1u);
-        const auto reply = ReceiveKeyValueResponse(tc);
-        UNIT_ASSERT_VALUES_EQUAL(reply.GetCookie(), 123u);
-        UNIT_ASSERT_VALUES_EQUAL(reply.GetStatus(), NMsgBusProxy::MSTATUS_TIMEOUT);
+        if (newApi && inlineRead) {
+            const auto reply = ReceiveResponse<TEvKeyValue::TEvReadResponse>(tc);
+            UNIT_ASSERT_VALUES_EQUAL(reply.cookie(), 123u);
+            UNIT_ASSERT_VALUES_EQUAL(reply.status(), NKikimrKeyValue::Statuses::RSTATUS_TIMEOUT);
+        } else if (newApi) {
+            const auto reply = ReceiveResponse<TEvKeyValue::TEvExecuteTransactionResponse>(tc);
+            UNIT_ASSERT_VALUES_EQUAL(reply.cookie(), 123u);
+            UNIT_ASSERT_VALUES_EQUAL(reply.status(), NKikimrKeyValue::Statuses::RSTATUS_TIMEOUT);
+        } else {
+            const auto reply = ReceiveKeyValueResponse(tc);
+            UNIT_ASSERT_VALUES_EQUAL(reply.GetCookie(), 123u);
+            UNIT_ASSERT_VALUES_EQUAL(reply.GetStatus(), NMsgBusProxy::MSTATUS_TIMEOUT);
+        }
         tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
         const auto stats = GetTabletState(tc, tabletActor).GetMemoryAdmissionStats();
         UNIT_ASSERT_VALUES_EQUAL(stats.RunningCount, 1u);
