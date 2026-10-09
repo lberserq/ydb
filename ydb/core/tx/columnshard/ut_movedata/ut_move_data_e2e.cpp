@@ -280,6 +280,85 @@ Y_UNIT_TEST_SUITE(TColumnShardMoveDataE2E) {
         RunMoveDataToCompletion(/*moveDataEnabled=*/true);
     }
 
+    // Reassignment alone must not cut live history; MoveData and its GC make that history cuttable on the next boot.
+    Y_UNIT_TEST(MoveDataMakesOldDataHistoryCuttable) {
+        TMoveDataFixture f;
+        f.Controller->DisableBackground(EBackground::TTL);
+        f.Runtime.GetAppData().FeatureFlags.SetEnableCutHistory(true);
+        f.Runtime.GetAppData().FeatureFlags.SetEnableColumnshardCutHistory(true);
+        f.Runtime.SetScheduledEventFilter([](TTestActorRuntimeBase& r, TAutoPtr<IEventHandle>& event, TDuration delay, TInstant& deadline) {
+            if (event->HasEvent() && (dynamic_cast<TEvPrivate::TEvMoveDataWakeup*>(event->GetBase()) ||
+                                         dynamic_cast<TEvPrivate::TEvContinueFindEmptyHistoryIntervals*>(event->GetBase()))) {
+                return false;
+            }
+            return TTestActorRuntime::DefaultScheduledFilterFunc(r, event, delay, deadline);
+        });
+        const auto counters =
+            GetServiceCounters(f.Runtime.GetDynamicCounters(0), "tablets")->GetSubgroup("subsystem", "columnshard")->GetSubgroup("module_id",
+                "CS");
+        const auto completedScans = [&] {
+            const auto histogram = counters->FindHistogram("Histogram/CutHistory/Scan/DurationMs");
+            UNIT_ASSERT(histogram);
+            const auto snapshot = histogram->Snapshot();
+            ui64 samples = 0;
+            for (ui32 i = 0; i < snapshot->Count(); ++i) {
+                samples += snapshot->Value(i);
+            }
+            return samples;
+        };
+        THashSet<ui32> cutChannels;
+        auto observer = f.Runtime.AddObserver<TEvTablet::TEvCutTabletHistory>([&](TEvTablet::TEvCutTabletHistory::TPtr& ev) {
+            const auto& cut = ev->Get()->Record;
+            if (cut.GetChannel() >= FirstDataChannel) {
+                UNIT_ASSERT_VALUES_EQUAL(cut.GetTabletID(), TabletId);
+                UNIT_ASSERT_VALUES_EQUAL(cut.GetGroupID(), OldGroup);
+                UNIT_ASSERT_VALUES_EQUAL(cut.GetFromGeneration(), 0u);
+                cutChannels.insert(cut.GetChannel());
+            }
+            ev.Reset();
+        });
+
+        f.Write(1, 0, 1000);
+        f.Controller->WaitCompactions(TDuration::Seconds(10));
+        f.ReassignPastWrittenData();
+        // The first boot after reassignment ends OldGroup's interval at the current generation.
+        // One more boot makes it eligible, so absence of a cut below proves the live-data guard.
+        const ui64 scansBeforeLiveCheck = completedScans();
+        f.Restart();
+        UNIT_ASSERT(!f.DriveGate(100, {}, [&] {
+            return completedScans() > scansBeforeLiveCheck;
+        }));
+        UNIT_ASSERT_VALUES_EQUAL_C(completedScans(), scansBeforeLiveCheck + 1, "CutHistory never inspected the live old-group data");
+        UNIT_ASSERT(!f.DriveGate(10));
+        const auto liveOldBlobs = LivePortionBlobs(*f.OldGroupProxy, TabletId);
+        UNIT_ASSERT_C(!liveOldBlobs.empty(), "the pre-move history check must protect real data");
+        for (const auto& blob : liveOldBlobs) {
+            UNIT_ASSERT_C(!cutChannels.contains(blob.Channel()), "CutHistory cut a channel containing live old-group data");
+        }
+
+        f.StartMove();
+        const auto response = f.DriveGateWithWrite(150, 2, 1000, 1001);
+        UNIT_ASSERT_C(response, "MoveData never drained OldGroup");
+        f.AssertDrainedSuccess(response);
+        UNIT_ASSERT_C(!LivePortionBlobs(*f.NewGroupProxy, TabletId).empty(), "MoveData did not rewrite any data into NewGroup");
+        UNIT_ASSERT_VALUES_EQUAL(f.ReadRows(), 1000u);
+
+        // The fixture observes cut requests without changing Hive's supplied channel history.
+        cutChannels.clear();
+        const ui64 scansBeforeEmptyCheck = completedScans();
+        f.Restart();
+        UNIT_ASSERT(!f.DriveGate(150, {}, [&] {
+            return cutChannels.size() == 3;
+        }));
+        UNIT_ASSERT_VALUES_EQUAL_C(completedScans(), scansBeforeEmptyCheck + 1, "CutHistory did not rescan the drained history");
+        // MakeTabletInfo assigns the same history to all three data channels.
+        UNIT_ASSERT_VALUES_EQUAL(cutChannels.size(), 3u);
+        for (const ui32 channel : { 2u, 3u, 4u }) {
+            UNIT_ASSERT_C(cutChannels.contains(channel), "missing CutHistory request for drained data channel " << channel);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(f.ReadRows(), 1000u);
+    }
+
     // Flag off: TEvMoveData goes straight to the executor, which leaves the portions alone.
     Y_UNIT_TEST(MoveDataDisabledLeavesPortionsInPlace) {
         RunMoveDataToCompletion(/*moveDataEnabled=*/false);
