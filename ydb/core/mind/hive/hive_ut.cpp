@@ -567,6 +567,10 @@ class TMemoryProbeTablet : public TActor<TMemoryProbeTablet>, public NTabletFlat
         State->LastShare = shareBytes;
     }
 
+    void OnMemoryLimitCleared() override {
+        State->LastShare.reset();
+    }
+
 public:
     static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
         return NKikimrServices::TActivity::TEST_ACTOR_RUNTIME;
@@ -12271,14 +12275,14 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         UNIT_ASSERT_C(!reported.empty(), "Local forwarded no metrics for the tablet");
         const auto& last = reported.back();
 
-        // The honest report, not the 50 KB estimate every tablet type used to send
+        // Placement accounting stays legacy; owner bytes have a separate snapshot.
         UNIT_ASSERT_C(last.HasMemory(), "no Memory in the metrics Hive received");
-        UNIT_ASSERT_GE(last.GetMemory(), 40_MB);
-        UNIT_ASSERT_LT(last.GetMemory(), 45_MB);
+        UNIT_ASSERT_VALUES_EQUAL(last.GetTabletMemoryUsed(), 40_MB);
+        UNIT_ASSERT_LT(last.GetMemory(), 40_MB);
         UNIT_ASSERT_VALUES_EQUAL(last.GetMemoryReclaimable(), 10_MB);
-        UNIT_ASSERT_VALUES_EQUAL(last.GetMemoryDemand(), last.GetMemory() + 20_MB);
+        UNIT_ASSERT_VALUES_EQUAL(last.GetMemoryDemand(), 60_MB);
 
-        // MC receives owner bytes only; Hive keeps the total including executor overhead.
+        // MC receives owner bytes only, without executor-owned memtables or pinned pages.
         UNIT_ASSERT(env.Controller->Tablets && env.Controller->TabletsElastic);
         UNIT_ASSERT_VALUES_EQUAL(env.Controller->Tablets->Last.Used, 30_MB);
         UNIT_ASSERT_VALUES_EQUAL(env.Controller->Tablets->Last.Reclaimable, 0);
@@ -12341,8 +12345,9 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         UNIT_ASSERT_VALUES_EQUAL(*env.Probe->LastShare, 4_MB);
         // No further controller tick: the report itself must revoke the old allowance.
         env.Probe->Report.Reclaimable = 0;
+        env.Probe->Report.Demand = env.Probe->Report.Used;
         env.Runtime.SimulateSleep(TDuration::Seconds(30));
-        UNIT_ASSERT_VALUES_EQUAL(*env.Probe->LastShare, 0u);
+        UNIT_ASSERT(!env.Probe->LastShare);
     }
 
     Y_UNIT_TEST(TestTabletMemoryZoneReachesTabletBootedUnderPressure) {
@@ -12362,6 +12367,31 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         env.Runtime.SimulateSleep(TDuration::Seconds(60));
         UNIT_ASSERT(env.Probe->LastZone);
         UNIT_ASSERT_VALUES_EQUAL(static_cast<ui32>(*env.Probe->LastZone), static_cast<ui32>(NMemory::EMemoryZone::Red));
+    }
+
+    Y_UNIT_TEST(TestTabletMemoryReportsCoalesceShareFeedback) {
+        TTabletMemoryEnv env(true, {.Used = 40_MB, .Demand = 60_MB, .Reclaimable = 10_MB});
+        const ui64 second = SendCreateTestTablet(env.Runtime, MakeDefaultHiveID(), MakeTabletID(false, 2),
+            MakeHolder<TEvHive::TEvCreateTablet>(MakeTabletID(false, 2), 0, TTabletTypes::Dummy, BINDED_CHANNELS), 0, true);
+        MakeSureTabletIsUp(env.Runtime, second, 0);
+        env.Runtime.SimulateSleep(TDuration::Seconds(60));
+        env.Runtime.Send(new IEventHandle(env.Controller->Registrant, TActorId(),
+            new NMemory::TEvConsumerLimit(NMemory::EMemoryConsumerKind::TabletsElastic, 10_MB, NMemory::EMemoryZone::Green)));
+        env.Runtime.SimulateSleep(TDuration::Seconds(1));
+        ui32 feedback = 0;
+        const auto observer = env.Runtime.AddObserver<NMemory::TEvMemoryZone>([&](auto& event) {
+            if (event->Get()->Share || event->Get()->ClearShare) {
+                ++feedback;
+            }
+        });
+        const auto recipient = env.Runtime.AllocateEdgeActor();
+        for (ui32 i = 0; i != 100; ++i) {
+            env.Runtime.Send(new IEventHandle(env.Controller->Registrant, recipient,
+                new TEvLocal::TEvTabletMetrics(env.TabletId, 0, {}, recipient,
+                    NMemory::TConsumerReport{.Used = 40_MB, .Demand = 60_MB + i * 1_MB, .Reclaimable = 10_MB})));
+        }
+        env.Runtime.SimulateSleep(TDuration::Seconds(1));
+        UNIT_ASSERT_C(feedback > 0 && feedback <= 2, "share feedback per batch: " << feedback);
     }
 
     Y_UNIT_TEST(TestTabletMemoryReportIsOffWithoutTheFlag) {

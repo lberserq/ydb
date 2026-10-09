@@ -45,6 +45,7 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
             EvSendTabletMetrics,
             EvUpdateSystemUsage,
             EvLocalDrainTimeout,
+            EvUpdateTabletMemoryShares,
             EvEnd
         };
 
@@ -52,6 +53,7 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
 
         struct TEvSendTabletMetrics : TEventLocal<TEvSendTabletMetrics, EvSendTabletMetrics> {};
         struct TEvUpdateSystemUsage : TEventLocal<TEvUpdateSystemUsage, EvUpdateSystemUsage> {};
+        struct TEvUpdateTabletMemoryShares : TEventLocal<TEvUpdateTabletMemoryShares, EvUpdateTabletMemoryShares> {};
         struct TEvLocalDrainTimeout : TEventLocal<TEvLocalDrainTimeout, EvLocalDrainTimeout> {};
     };
 
@@ -147,6 +149,7 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
         TIntrusivePtr<NMemory::IMemoryConsumer> TabletsElasticConsumer;
         NMemory::EMemoryZone NodeMemoryZone = NMemory::EMemoryZone::Green;
         std::optional<ui64> ElasticLimit;
+        bool ShareUpdateScheduled = false;
     };
 
     bool TabletMemoryHostEnabled = false;
@@ -210,9 +213,10 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
         }
     }
 
-    void ForgetTabletMemory(TTabletId tabletId) {
+    void ForgetTabletMemory(TTabletId tabletId, const TActorContext& ctx) {
         if (TabletMemoryHostEnabled && MemoryHost.Host.Forget(tabletId)) {
             PublishTabletMemory();
+            ScheduleTabletMemoryShares(ctx);
         }
     }
 
@@ -231,15 +235,26 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
         if (result.NewSlot || result.ExecutorChanged) {
             ctx.Send(executor, new NMemory::TEvMemoryZone(MemoryHost.NodeMemoryZone));
         }
-        if (MemoryHost.ElasticLimit && (result.SumsChanged || result.NewSlot || result.ExecutorChanged)) {
-            ApplyTabletElasticLimit(*MemoryHost.ElasticLimit, ctx);
+        if (result.SharesChanged) {
+            ScheduleTabletMemoryShares(ctx);
         }
     }
 
-    void ApplyTabletElasticLimit(ui64 limitBytes, const TActorContext& ctx) {
-        MemoryHost.ElasticLimit = limitBytes;
-        for (const auto& share : MemoryHost.Host.ApplyElasticLimit(limitBytes)) {
-            ctx.Send(share.Executor, new NMemory::TEvMemoryZone(MemoryHost.NodeMemoryZone, share.Bytes));
+    void ScheduleTabletMemoryShares(const TActorContext& ctx) {
+        if (!MemoryHost.ElasticLimit || MemoryHost.ShareUpdateScheduled) {
+            return;
+        }
+        MemoryHost.ShareUpdateScheduled = true;
+        ctx.Schedule(TDuration::MilliSeconds(100), new TEvPrivate::TEvUpdateTabletMemoryShares());
+    }
+
+    void Handle(TEvPrivate::TEvUpdateTabletMemoryShares::TPtr&, const TActorContext& ctx) {
+        MemoryHost.ShareUpdateScheduled = false;
+        if (!MemoryHost.ElasticLimit) {
+            return;
+        }
+        for (const auto& share : MemoryHost.Host.ApplyElasticLimit(*MemoryHost.ElasticLimit)) {
+            ctx.Send(share.Executor, new NMemory::TEvMemoryZone(MemoryHost.NodeMemoryZone, share.Bytes, !share.Bytes));
         }
     }
 
@@ -276,7 +291,10 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
         if (msg->Kind != NMemory::EMemoryConsumerKind::TabletsElastic) {
             return;
         }
-        ApplyTabletElasticLimit(msg->LimitBytes, ctx);
+        if (MemoryHost.ElasticLimit != msg->LimitBytes) {
+            MemoryHost.ElasticLimit = msg->LimitBytes;
+            ScheduleTabletMemoryShares(ctx);
+        }
     }
 
     void Die(const TActorContext &ctx) override {
@@ -489,7 +507,7 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
                     if (x.first.second == 0) { // leader
                         RetainedCutHistory.erase(x.first.first);
                     }
-                    ForgetTabletMemory(x.first);
+                    ForgetTabletMemory(x.first, ctx);
                 }
                 OnlineTablets.clear();
             }
@@ -550,7 +568,7 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
 
     void FinishPromotion(TTabletId tabletId, TTabletEntry& entry) {
         TTabletId promotedTablet{tabletId.first, entry.PromotingFromFollower};
-        ForgetTabletMemory(promotedTablet);
+        ForgetTabletMemory(promotedTablet, ctx);
         OnlineTablets.erase(promotedTablet);
         entry.IsPromoting = false;
         entry.PromotingFromFollower = 0;
@@ -606,7 +624,7 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
                     return;
                 }
                 ctx.Send(it->second.Tablet, new TEvTablet::TEvTabletStop(tabletId.first, TEvTablet::TEvTabletStop::ReasonStop));
-                ForgetTabletMemory(it->first);
+                ForgetTabletMemory(it->first, ctx);
                 OnlineTablets.erase(it);
             }
         }
@@ -694,6 +712,9 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
             }
             if (metrics.HasMemory()) {
                 it->second.ResourceValues.SetMemory(metrics.GetMemory());
+            }
+            if (metrics.HasTabletMemoryUsed()) {
+                it->second.ResourceValues.SetTabletMemoryUsed(metrics.GetTabletMemoryUsed());
             }
             if (metrics.HasMemoryDemand()) {
                 it->second.ResourceValues.SetMemoryDemand(metrics.GetMemoryDemand());
@@ -1052,7 +1073,7 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
             if (onlineIt->first.second == 0) { // leader
                 RetainedCutHistory.erase(onlineIt->first.first);
             }
-            ForgetTabletMemory(onlineIt->first);
+            ForgetTabletMemory(onlineIt->first, ctx);
             OnlineTablets.erase(onlineIt);
             UpdateEstimate();
             return;
@@ -1243,6 +1264,7 @@ public:
             HFunc(TEvTabletPipe::TEvClientConnected, Handle);
             HFunc(TEvTabletPipe::TEvClientDestroyed, Handle);
             HFunc(TEvPrivate::TEvSendTabletMetrics, Handle);
+            HFunc(TEvPrivate::TEvUpdateTabletMemoryShares, Handle);
             HFunc(TEvPrivate::TEvUpdateSystemUsage, Handle);
             HFunc(TEvPrivate::TEvLocalDrainTimeout, HandleDrainTimeout);
             HFunc(TEvLocal::TEvLocalDrainNode, HandleDrain);
