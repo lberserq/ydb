@@ -12380,12 +12380,19 @@ Y_UNIT_TEST_SUITE(THiveTest) {
         env.Runtime.SimulateSleep(TDuration::Seconds(1));
         ui32 feedback = 0;
         const auto recipient = env.Runtime.AllocateEdgeActor();
+        // Measure the injected batch without periodic owner snapshots replacing it.
+        const auto reports = env.Runtime.AddObserver<TEvLocal::TEvTabletMetrics>([&](auto& event) {
+            const auto* msg = event->Get();
+            if ((msg->TabletId == env.TabletId || msg->TabletId == second) && msg->Executor != recipient) {
+                event.Reset();
+            }
+        });
         const auto observer = env.Runtime.AddObserver<NMemory::TEvMemoryZone>([&](auto& event) {
             if (event->Get()->Share || event->Get()->ClearShare) {
                 ++feedback;
             }
             // Edge mailbox events are observed again until consumed by the test.
-            if (event->Recipient == recipient) {
+            if (event->GetRecipientRewrite() == recipient) {
                 event.Reset();
             }
         });
@@ -12395,7 +12402,7 @@ Y_UNIT_TEST_SUITE(THiveTest) {
                     NMemory::TConsumerReport{.Used = 40_MB, .Demand = 60_MB + i * 1_MB, .Reclaimable = 10_MB})));
         }
         env.Runtime.SimulateSleep(TDuration::Seconds(1));
-        UNIT_ASSERT_C(feedback > 0 && feedback <= 2, "share feedback per batch: " << feedback);
+        UNIT_ASSERT_VALUES_EQUAL_C(feedback, 2u, "share feedback per batch");
     }
 
     Y_UNIT_TEST(TestTabletMemoryReportIsOffWithoutTheFlag) {
