@@ -2091,7 +2091,9 @@ void TKeyValueState::AddAdmissionDeadline(const TIntermediate& intermediate) {
 }
 
 void TKeyValueState::PostponeTrim(THolder<TIntermediate>&& intermediate) {
-    AddAdmissionDeadline(*intermediate);
+    if (AppData(TActivationContext::AsActorContext())->FeatureFlags.GetEnableTabletMemoryHost()) {
+        AddAdmissionDeadline(*intermediate);
+    }
     const ui64 uid = intermediate->RequestUid;
     CmdTrimLeakedBlobsPostponed.push_back(std::move(intermediate));
     PostponedTrimByUid.emplace(uid, std::prev(CmdTrimLeakedBlobsPostponed.end()));
@@ -2169,7 +2171,7 @@ void TKeyValueState::StartAdmittedIntermediate(THolder<TIntermediate>&& intermed
     if (intermediate->Deadline != TInstant::Max() && intermediate->Deadline <= TAppData::TimeProvider->Now()) {
         intermediate->AdmissionTimedOut = true;
     }
-    if (source == NMemory::EAdmitSource::FromQueue) {
+    if (!alreadyStarted && source == NMemory::EAdmitSource::FromQueue) {
         CountLatencyQueue(intermediate->Stat);
     }
     if (!alreadyStarted && intermediate->Stat.RequestType == TRequestType::ReadOnlyInline) {
