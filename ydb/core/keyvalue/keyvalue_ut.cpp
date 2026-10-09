@@ -4313,6 +4313,102 @@ Y_UNIT_TEST(TestAdmissionDeadlinesAreNotScheduledForImmediateRequests) {
     }
 }
 
+Y_UNIT_TEST(TestQueuedDeadlinesShareOnePendingWakeup) {
+    std::optional<TActorId> tabletActor;
+    TTestContext tc;
+    TFinalizer finalizer(tc);
+    bool activeZone = false;
+    tc.Prepare(INITIAL_TEST_DISPATCH_NAME, TrackTabletActorWithMemoryHost(tabletActor), activeZone);
+    tc.Runtime->SetScheduledLimit(10000);
+    ExecuteWrite(tc, {{"m0", TString(30, 'z')}}, 0, NKeyValue::MainStorageChannelInPublicApi,
+        NKikimrKeyValue::Priorities::PRIORITY_REALTIME);
+    tc.Runtime->EnableScheduleForActor(*tabletActor);
+    SetTabletMemoryZone(tc, tabletActor, NMemory::EMemoryZone::Red);
+    THeldPuts puts(tc);
+    SendMainWrite(tc, "a", 10);
+    ui32 pending = 0, peak = 0;
+    TTestActorRuntimeBase::TScheduledEventFilter previous;
+    previous = tc.Runtime->SetScheduledEventFilter([&](auto& runtime, auto& event, auto delay, auto& deadline) {
+        if (event->GetTypeRewrite() == TEvKeyValue::EvAdmissionDeadline) {
+            peak = Max(peak, ++pending);
+        }
+        return previous(runtime, event, delay, deadline);
+    });
+    const auto observer = tc.Runtime->AddObserver<TEvKeyValue::TEvAdmissionDeadline>([&](auto&) {
+        UNIT_ASSERT(pending);
+        --pending;
+    });
+    const ui64 deadline = (tc.Runtime->GetCurrentTime() + TDuration::Seconds(30)).MilliSeconds();
+    for (ui32 i = 0; i != 128; ++i) {
+        auto request = MakeWriteRequest(i, ToString(i), TString(100, 'x'), NKikimrClient::TKeyValueRequest::MAIN);
+        request->Record.SetDeadlineInstantMs(deadline);
+        SendRequestEvent(std::move(request), tc);
+    }
+    tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+    UNIT_ASSERT_VALUES_EQUAL(GetTabletState(tc, tabletActor).GetMemoryAdmissionStats().PostponedCount, 128u);
+    UNIT_ASSERT_VALUES_EQUAL(peak, 1u);
+    SetTabletMemoryZone(tc, tabletActor, NMemory::EMemoryZone::Green);
+    puts.ReleaseAll(tc);
+    ExpectWriteOk(tc);
+    for (ui32 i = 0; i != 128; ++i) {
+        UNIT_ASSERT_VALUES_EQUAL(ReceiveKeyValueResponse(tc).GetStatus(), NMsgBusProxy::MSTATUS_OK);
+    }
+    tc.Runtime->SimulateSleep(TDuration::Seconds(1));
+    UNIT_ASSERT_VALUES_EQUAL(pending, 0u);
+    UNIT_ASSERT_VALUES_EQUAL(peak, 1u);
+    tc.Runtime->SetScheduledEventFilter(previous);
+}
+
+Y_UNIT_TEST(TestAdmittedTrimStillExpiresWhileGCIsStalled) {
+    std::optional<TActorId> tabletActor;
+    TTestContext tc;
+    TFinalizer finalizer(tc);
+    bool activeZone = false;
+    tc.Prepare(INITIAL_TEST_DISPATCH_NAME, TrackTabletActorWithMemoryHost(tabletActor), activeZone);
+    tc.Runtime->SetScheduledLimit(10000);
+    ExecuteWrite(tc, {{"m0", TString(30, 'z')}, {"trash", TString(30, 't')}, {"advance", TString(30, 'd')}},
+        0, NKeyValue::MainStorageChannelInPublicApi, NKikimrKeyValue::Priorities::PRIORITY_REALTIME);
+    ExecuteDeleteRange(tc, "advance", EBorderKind::Include, "advance", EBorderKind::Include, 0);
+    tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+    tc.Runtime->EnableScheduleForActor(*tabletActor);
+    SetTabletMemoryZone(tc, tabletActor, NMemory::EMemoryZone::Red);
+    THeldPuts puts(tc);
+    SendMainWrite(tc, "a", 10);
+    auto trim = std::make_unique<TEvKeyValue::TEvRequest>();
+    trim->Record.SetCookie(123);
+    trim->Record.SetDeadlineInstantMs((tc.Runtime->GetCurrentTime() + TDuration::Seconds(3)).MilliSeconds());
+    trim->Record.MutableCmdTrimLeakedBlobs()->SetMaxItemsToTrim(100);
+    SendRequestEvent(std::move(trim), tc);
+    tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+    TDeque<TEvBlobStorage::TEvCollectGarbageResult::TPtr> held;
+    auto observer = tc.Runtime->AddObserver<TEvBlobStorage::TEvCollectGarbageResult>([&](auto& event) {
+        held.emplace_back(std::move(event));
+    });
+    auto request = MakeReadRequest(321, {"m0"});
+    auto* range = request->Record.AddCmdDeleteRange()->MutableRange();
+    range->SetFrom("trash");
+    range->SetTo("trash");
+    range->SetIncludeFrom(true);
+    range->SetIncludeTo(true);
+    SendRequestEvent(std::move(request), tc);
+    UNIT_ASSERT_VALUES_EQUAL(ReceiveKeyValueResponse(tc).GetCookie(), 321u);
+    tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+    UNIT_ASSERT(!held.empty());
+    SetTabletMemoryZone(tc, tabletActor, NMemory::EMemoryZone::Green);
+    UNIT_ASSERT_VALUES_EQUAL(GetTabletState(tc, tabletActor).GetMemoryAdmissionStats().RunningCount, 2u);
+    const auto reply = ReceiveKeyValueResponse(tc);
+    UNIT_ASSERT_VALUES_EQUAL(reply.GetCookie(), 123u);
+    UNIT_ASSERT_VALUES_EQUAL(reply.GetStatus(), NMsgBusProxy::MSTATUS_TIMEOUT);
+    tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+    UNIT_ASSERT_VALUES_EQUAL(GetTabletState(tc, tabletActor).GetMemoryAdmissionStats().RunningCount, 1u);
+    observer.Remove();
+    for (auto& event : held) {
+        tc.Runtime->Send(event.Release(), 0, true);
+    }
+    puts.ReleaseAll(tc);
+    ExpectWriteOk(tc);
+}
+
 Y_UNIT_TEST(TestQueuedTrimDoesNotBlockGC) {
     std::optional<TActorId> tabletActor;
     TTestContext tc;
