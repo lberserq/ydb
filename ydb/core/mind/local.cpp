@@ -566,7 +566,7 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
         leaderEntry.PromotingFromFollower = tabletId.second;
     }
 
-    void FinishPromotion(TTabletId tabletId, TTabletEntry& entry) {
+    void FinishPromotion(TTabletId tabletId, TTabletEntry& entry, const TActorContext& ctx) {
         TTabletId promotedTablet{tabletId.first, entry.PromotingFromFollower};
         ForgetTabletMemory(promotedTablet, ctx);
         OnlineTablets.erase(promotedTablet);
@@ -921,7 +921,7 @@ class TLocalNodeRegistrar : public TActorBootstrapped<TLocalNodeRegistrar> {
             {"generation", generation});
         NTabletPipe::SendData(ctx, HivePipeClient, new TEvLocal::TEvTabletStatus(TEvLocal::TEvTabletStatus::StatusOk, tabletId, generation));
         if (inbootIt->second.IsPromoting) {
-            FinishPromotion(tabletId, inbootIt->second);
+            FinishPromotion(tabletId, inbootIt->second, ctx);
         }
         OnlineTablets.emplace(tabletId, inbootIt->second);
         InbootTablets.erase(inbootIt);
