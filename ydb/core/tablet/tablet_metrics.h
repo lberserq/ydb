@@ -47,7 +47,6 @@ public:
     TGaugeValue<ui64> Memory;
     // Keep the report together: legacy writers may update Memory independently.
     // An engaged optional includes reports whose values are all zero.
-    std::optional<NMemory::TConsumerReport> MemoryReport;
     std::optional<NMemory::TConsumerReport> TabletMemoryReport;
     TDecayingAverageValue<ui64, DurationPer15Seconds, DurationPerSecond> Network;
     TGaugeValue<ui64> StorageSystem;
@@ -58,8 +57,7 @@ public:
     TTabletIopsValue WriteIops;
 
     void SetMemoryReport(ui64 used, ui64 demand, ui64 reclaimable) {
-        Memory.Set(used);
-        MemoryReport = NMemory::TConsumerReport{.Used = used, .Demand = demand, .Reclaimable = reclaimable};
+        TabletMemoryReport = NMemory::TConsumerReport{.Used = used, .Demand = demand, .Reclaimable = reclaimable};
     }
 
     void Fill(NKikimrTabletBase::TMetrics& metrics) const;
@@ -86,6 +84,7 @@ protected:
     std::optional<NMemory::TConsumerReport> LastTabletMemoryReport;
     std::optional<ui32> LevelCPU;
     std::optional<ui32> LevelMemory;
+    std::optional<ui32> LevelTabletMemoryUsed;
     std::optional<ui32> LevelMemoryDemand;
     std::optional<ui32> LevelMemoryReclaimable;
     std::optional<ui32> LevelNetwork;

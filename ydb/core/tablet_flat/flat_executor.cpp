@@ -4142,7 +4142,7 @@ void TExecutor::UpdateUsedTabletMemory() {
     // Clamp at the source, so no reader of the report has to guard against a wrap
     OwnerMemoryReport.Demand = Max(OwnerMemoryReport.Demand, OwnerMemoryReport.Used);
     OwnerMemoryReport.Reclaimable = Min(OwnerMemoryReport.Reclaimable, OwnerMemoryReport.Used);
-    UsedTabletMemory += TabletMemoryHostEnabled ? OwnerMemoryReport.Used : Owner->GetMemoryUsage();
+    UsedTabletMemory += Owner->GetMemoryUsage();
 }
 
 void TExecutor::UpdateCounters(const TActorContext &ctx) {
@@ -4268,21 +4268,9 @@ void TExecutor::UpdateCounters(const TActorContext &ctx) {
 
                 ResourceMetrics->StorageSystem.Set(storageSize);
 
-                ui64 memorySize = 0;
-                if (TabletMemoryHostEnabled) {
-                    // The report travels to Local in the metrics it already forwards to Hive
-                    // Static transaction memory is managed by the executor, outside the owner's report.
-                    memorySize = UsedTabletMemory + memory.Static;
-                    ResourceMetrics->SetMemoryReport(memorySize,
-                        memorySize + (OwnerMemoryReport.Demand - OwnerMemoryReport.Used),
-                        OwnerMemoryReport.Reclaimable);
-                    // Owner bytes only: memtables, shared pages and RB reservations have their own MC attribution.
-                    ResourceMetrics->TabletMemoryReport = OwnerMemoryReport;
-                } else {
-                    auto limit = Memory->Profile->GetStaticTabletTxMemoryLimit();
-                    memorySize = limit ? (UsedTabletMemory + limit) : (UsedTabletMemory + memory.Static);
-                    ResourceMetrics->Memory.Set(memorySize);
-                }
+                const auto limit = Memory->Profile->GetStaticTabletTxMemoryLimit();
+                const ui64 memorySize = UsedTabletMemory + (limit ? limit : memory.Static);
+                ResourceMetrics->Memory.Set(memorySize);
                 Counters->Simple()[TExecutorCounters::CONSUMED_STORAGE].Set(storageSize);
                 Counters->Simple()[TExecutorCounters::CONSUMED_MEMORY].Set(memorySize);
             }
@@ -4291,6 +4279,11 @@ void TExecutor::UpdateCounters(const TActorContext &ctx) {
         if (AppCounters) {
             externalTabletCounters = AppCounters->MakeDiffForAggr(*AppCountersBaseline);
             AppCounters->RememberCurrentStateAsBaseline(*AppCountersBaseline);
+        }
+
+        // Publish owner attribution for leaders and followers independently of Hive accounting.
+        if (ResourceMetrics && TabletMemoryHostEnabled) {
+            ResourceMetrics->SetMemoryReport(OwnerMemoryReport.Used, OwnerMemoryReport.Demand, OwnerMemoryReport.Reclaimable);
         }
 
         // tablet id + tablet type
@@ -4574,9 +4567,12 @@ void TExecutor::Handle(NMemory::TEvMemoryZone::TPtr &ev) {
         return;
     }
     const auto *msg = ev->Get();
+    Y_ABORT_UNLESS(!msg->ClearShare || !msg->Share);
     const bool zoneChanged = MemoryZone != msg->Zone;
     MemoryZone = msg->Zone;
-    if (msg->Share) {
+    if (msg->ClearShare) {
+        MemoryShare.reset();
+    } else if (msg->Share) {
         MemoryShare = msg->Share;
     }
     if (!Owner) {
@@ -4585,7 +4581,10 @@ void TExecutor::Handle(NMemory::TEvMemoryZone::TPtr &ev) {
     if (zoneChanged) {
         Owner->OnMemoryZone(MemoryZone);
     }
-    if (msg->Share) {
+    if (msg->ClearShare) {
+        Owner->OnMemoryLimit(0);
+        Owner->OnMemoryLimitCleared();
+    } else if (msg->Share) {
         Owner->OnMemoryLimit(*msg->Share);
     }
 }
