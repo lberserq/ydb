@@ -4522,10 +4522,14 @@ Y_UNIT_TEST(TestGCDeferredTrimKeepsItsTurnUntilStartOrExpiry) {
         // Complete GC while b still holds Red's only slot. c stays ahead of the trim.
         auto firstGC = std::move(held);
         held.clear();
+        observer.Remove();
         for (auto& event : firstGC) {
             tc.Runtime->Send(event.Release(), 0, true);
         }
         tc.Runtime->DispatchEvents(TDispatchOptions(), TDuration::MilliSeconds(100));
+        observer = tc.Runtime->AddObserver<TEvBlobStorage::TEvCollectGarbageResult>([&](auto& event) {
+            held.emplace_back(std::move(event));
+        });
         UNIT_ASSERT_VALUES_EQUAL(state.GetMemoryWaitingForGC(), 0u);
         UNIT_ASSERT_VALUES_EQUAL(state.GetMemoryAdmissionStats().PostponedBytes, 130u);
         UNIT_ASSERT_VALUES_EQUAL(state.GetRunningTrimsCount(), 1u); // Reserved GC turn.
