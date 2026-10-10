@@ -19,6 +19,7 @@ class TTabletMemoryHost {
 public:
     using TTabletKey = std::pair<ui64, ui32>; // <tablet id, follower id>
 
+    // Public snapshots clip at ui64 max; the private accounting retains exact sums.
     struct TSums {
         ui64 Total = 0; // sum of Used - Reclaimable, the state the tablets cannot give back
         ui64 Elastic = 0; // sum of Reclaimable
@@ -88,6 +89,23 @@ public:
     void UpdateCounters(const TIntrusivePtr<::NMonitoring::TDynamicCounters>& group) const;
 
 private:
+    using TWideValue = unsigned __int128;
+
+    // At most size_t slots each report ui64 values, so these totals fit in 128 bits.
+    struct TWideSums {
+        TWideValue Total = 0;
+        TWideValue Elastic = 0;
+        TWideValue ElasticDemand = 0;
+
+        bool operator==(const TWideSums&) const = default;
+    };
+
+    struct TWideReport {
+        TWideValue Used = 0;
+        TWideValue Demand = 0;
+        TWideValue Reclaimable = 0;
+    };
+
     struct TSlot {
         TActorId Executor;
         TTabletTypes::EType TabletType = TTabletTypes::TypeInvalid;
@@ -101,7 +119,8 @@ private:
 
 private:
     THashMap<TTabletKey, TSlot> Slots;
-    TMap<TTabletTypes::EType, TConsumerReport> PerType;
+    TMap<TTabletTypes::EType, TWideReport> PerType;
+    TWideSums ExactSums;
     TSums Sums;
 };
 

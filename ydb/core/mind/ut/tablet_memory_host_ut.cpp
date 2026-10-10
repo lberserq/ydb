@@ -161,6 +161,175 @@ Y_UNIT_TEST(ElasticSharesDoNotExceedTheLimit) {
     UNIT_ASSERT(*shares[0].Bytes <= Max<ui64>() - *shares[1].Bytes);
 }
 
+Y_UNIT_TEST(HalfRangeColdDemandsKeepTheirBudgetShares) {
+    constexpr ui64 halfRange = ui64(1) << 63;
+    TTabletMemoryHost host;
+    host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, Report(0, halfRange, 0));
+    host.SetReport({2, 0}, MakeExecutor(2), TTabletTypes::DataShard, Report(0, halfRange, 0));
+
+    // Check the report before allocation so wrapped demand fails without dividing by zero.
+    UNIT_ASSERT_VALUES_EQUAL(host.GetSums().Total, 0u);
+    UNIT_ASSERT_VALUES_EQUAL(host.GetSums().Elastic, 0u);
+    UNIT_ASSERT_VALUES_EQUAL(host.GetSums().ElasticDemand, Max<ui64>());
+    UNIT_ASSERT_VALUES_EQUAL(host.GetElasticReport().Demand, Max<ui64>());
+    const auto shares = host.ApplyElasticLimit(100);
+    UNIT_ASSERT_VALUES_EQUAL(shares.size(), 2u);
+    for (const auto& share : shares) {
+        UNIT_ASSERT(share.Bytes);
+        UNIT_ASSERT_VALUES_EQUAL(*share.Bytes, 50u);
+    }
+    const auto zeroShares = host.ApplyElasticLimit(0);
+    UNIT_ASSERT_VALUES_EQUAL(zeroShares.size(), 2u);
+    for (const auto& share : zeroShares) {
+        UNIT_ASSERT(share.Bytes && *share.Bytes == 0u);
+    }
+}
+
+Y_UNIT_TEST(OverflowingDemandPreservesTheWeightedBudget) {
+    constexpr ui64 quarterRange = ui64(1) << 62;
+    TTabletMemoryHost host;
+    host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, Report(0, 3 * quarterRange, 0));
+    host.SetReport({2, 0}, MakeExecutor(2), TTabletTypes::DataShard, Report(0, 2 * quarterRange, 0));
+    UNIT_ASSERT_VALUES_EQUAL(host.GetElasticReport().Demand, Max<ui64>());
+
+    const auto shares = host.ApplyElasticLimit(100);
+    UNIT_ASSERT_VALUES_EQUAL(shares.size(), 2u);
+    TMap<TActorId, ui64> byExecutor;
+    for (const auto& share : shares) {
+        UNIT_ASSERT(share.Bytes);
+        byExecutor[share.Executor] = *share.Bytes;
+    }
+    // The exact demand ratio is 3:2 even though its total exceeds ui64.
+    UNIT_ASSERT_VALUES_EQUAL(byExecutor[MakeExecutor(1)], 60u);
+    UNIT_ASSERT_VALUES_EQUAL(byExecutor[MakeExecutor(2)], 40u);
+    const auto maximumShares = host.ApplyElasticLimit(Max<ui64>());
+    UNIT_ASSERT_VALUES_EQUAL(maximumShares.size(), 2u);
+    UNIT_ASSERT(maximumShares[0].Bytes && maximumShares[1].Bytes);
+    UNIT_ASSERT(*maximumShares[0].Bytes <= Max<ui64>() - *maximumShares[1].Bytes);
+}
+
+Y_UNIT_TEST(SaturatedDemandStillSignalsChangesAndRecoversExactly) {
+    constexpr ui64 halfRange = ui64(1) << 63;
+    TTabletMemoryHost host;
+    for (ui32 i = 1; i <= 3; ++i) {
+        host.SetReport({i, 0}, MakeExecutor(i), TTabletTypes::DataShard, Report(0, halfRange, 0));
+    }
+    TMap<TActorId, ui64> delivered;
+    const auto apply = [&] {
+        const auto shares = host.ApplyElasticLimit(600);
+        for (const auto& share : shares) {
+            UNIT_ASSERT(share.Bytes);
+            delivered[share.Executor] = *share.Bytes;
+        }
+        ui64 total = 0;
+        for (const auto& [executor, bytes] : delivered) {
+            UNIT_ASSERT(bytes <= 600u - total);
+            total += bytes;
+        }
+        return shares.size();
+    };
+    const auto& sums = host.GetSums();
+    // Assert the report first so the original host fails before unsafe allocation.
+    UNIT_ASSERT_VALUES_EQUAL(sums.ElasticDemand, Max<ui64>());
+    UNIT_ASSERT_VALUES_EQUAL(apply(), 3u);
+    for (const auto& [executor, bytes] : delivered) {
+        UNIT_ASSERT_VALUES_EQUAL(bytes, 200u);
+    }
+    const auto before = sums;
+    const auto replacement = host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, {.Demand = Max<ui64>()});
+    UNIT_ASSERT(replacement.SumsChanged);
+    UNIT_ASSERT(replacement.SharesChanged);
+    UNIT_ASSERT(sums == before);
+    UNIT_ASSERT_VALUES_EQUAL(apply(), 3u);
+    UNIT_ASSERT_VALUES_EQUAL(delivered[MakeExecutor(1)], 299u);
+    UNIT_ASSERT_VALUES_EQUAL(delivered[MakeExecutor(2)], 150u);
+    UNIT_ASSERT_VALUES_EQUAL(delivered[MakeExecutor(3)], 150u);
+    const auto unchanged = host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, {.Demand = Max<ui64>()});
+    UNIT_ASSERT(!unchanged.SumsChanged);
+    UNIT_ASSERT(!unchanged.SharesChanged);
+    UNIT_ASSERT_VALUES_EQUAL(apply(), 0u);
+
+    UNIT_ASSERT(host.Forget({2, 0}));
+    delivered.erase(MakeExecutor(2));
+    UNIT_ASSERT(sums == before);
+    UNIT_ASSERT_VALUES_EQUAL(host.GetSlotsCount(), 2u);
+    UNIT_ASSERT_VALUES_EQUAL(apply(), 2u);
+    UNIT_ASSERT_VALUES_EQUAL(delivered[MakeExecutor(1)], 399u);
+    UNIT_ASSERT_VALUES_EQUAL(delivered[MakeExecutor(3)], 200u);
+    UNIT_ASSERT(host.Forget({3, 0}));
+    delivered.erase(MakeExecutor(3));
+    UNIT_ASSERT_VALUES_EQUAL(sums.ElasticDemand, Max<ui64>());
+    UNIT_ASSERT_VALUES_EQUAL(apply(), 1u);
+    UNIT_ASSERT_VALUES_EQUAL(delivered[MakeExecutor(1)], 600u);
+    const auto recovery = host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, {.Demand = halfRange + 10});
+    UNIT_ASSERT(recovery.SumsChanged && recovery.SharesChanged);
+    UNIT_ASSERT_VALUES_EQUAL(sums.ElasticDemand, halfRange + 10);
+    UNIT_ASSERT_VALUES_EQUAL(host.GetElasticReport().Demand, halfRange + 10);
+    UNIT_ASSERT_VALUES_EQUAL(apply(), 0u);
+    UNIT_ASSERT_VALUES_EQUAL(delivered[MakeExecutor(1)], 600u);
+    UNIT_ASSERT(host.Forget({1, 0}));
+    UNIT_ASSERT_VALUES_EQUAL(sums.ElasticDemand, 0u);
+    UNIT_ASSERT(!host.Forget({1, 0}));
+}
+
+Y_UNIT_TEST(RetypingAReportSignalsRemovalAndWithdrawsItsShare) {
+    TTabletMemoryHost host;
+    host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, Report(100, 160, 40));
+    const auto initial = host.ApplyElasticLimit(100);
+    UNIT_ASSERT_VALUES_EQUAL(initial.size(), 1u);
+    UNIT_ASSERT(initial.front().Bytes && *initial.front().Bytes == 100u);
+
+    const auto removed = host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::KeyValue, Report(0, 0, 0));
+    UNIT_ASSERT(removed.SumsChanged);
+    UNIT_ASSERT(removed.SharesChanged);
+    UNIT_ASSERT_VALUES_EQUAL(host.GetSums().Total, 0u);
+    UNIT_ASSERT_VALUES_EQUAL(host.GetSums().Elastic, 0u);
+    UNIT_ASSERT_VALUES_EQUAL(host.GetSums().ElasticDemand, 0u);
+    const auto withdrawal = host.ApplyElasticLimit(100);
+    UNIT_ASSERT_VALUES_EQUAL(withdrawal.size(), 1u);
+    UNIT_ASSERT_VALUES_EQUAL(withdrawal.front().Executor, MakeExecutor(1));
+    UNIT_ASSERT(!withdrawal.front().Bytes);
+
+    host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::KeyValue, Report(100, 160, 40));
+    UNIT_ASSERT_VALUES_EQUAL(host.ApplyElasticLimit(100).size(), 1u);
+    const auto migrated = host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, Report(100, 160, 40));
+    UNIT_ASSERT(!migrated.SumsChanged);
+    UNIT_ASSERT(!migrated.SharesChanged);
+    UNIT_ASSERT(host.ApplyElasticLimit(100).empty());
+    auto counters = MakeIntrusive<::NMonitoring::TDynamicCounters>();
+    host.UpdateCounters(counters);
+    const TString dataShard = TStringBuilder() << "TabletMemory/" << TTabletTypes::TypeToStr(TTabletTypes::DataShard) << "/";
+    const TString keyValue = TStringBuilder() << "TabletMemory/" << TTabletTypes::TypeToStr(TTabletTypes::KeyValue) << "/";
+    UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(dataShard + "Used")->Val(), 100u);
+    UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(dataShard + "Demand")->Val(), 160u);
+    UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(dataShard + "Reclaimable")->Val(), 40u);
+    UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(keyValue + "Used")->Val(), 0u);
+    UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(keyValue + "Demand")->Val(), 0u);
+    UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(keyValue + "Reclaimable")->Val(), 0u);
+}
+
+Y_UNIT_TEST(SaturatedStateRecoversAfterReplacementAndRemoval) {
+    constexpr ui64 halfRange = ui64(1) << 63;
+    TTabletMemoryHost host;
+    for (ui32 i = 1; i <= 3; ++i) {
+        host.SetReport({i, 0}, MakeExecutor(i), TTabletTypes::DataShard, Report(halfRange, halfRange, 0));
+    }
+    UNIT_ASSERT_VALUES_EQUAL(host.GetSums().Total, Max<ui64>());
+    UNIT_ASSERT_VALUES_EQUAL(host.GetReport().Used, Max<ui64>());
+    UNIT_ASSERT_VALUES_EQUAL(host.GetReport().Demand, Max<ui64>());
+    const auto replacement = host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard,
+        Report(halfRange + 10, halfRange + 10, 0));
+    UNIT_ASSERT(replacement.SumsChanged);
+    UNIT_ASSERT(!replacement.SharesChanged);
+    UNIT_ASSERT_VALUES_EQUAL(host.GetReport().Used, Max<ui64>());
+    UNIT_ASSERT(host.Forget({2, 0}));
+    UNIT_ASSERT_VALUES_EQUAL(host.GetReport().Used, Max<ui64>());
+    UNIT_ASSERT(host.Forget({3, 0}));
+    UNIT_ASSERT_VALUES_EQUAL(host.GetSums().Total, halfRange + 10);
+    UNIT_ASSERT_VALUES_EQUAL(host.GetReport().Used, halfRange + 10);
+    UNIT_ASSERT_VALUES_EQUAL(host.GetReport().Reclaimable, 0u);
+}
+
 Y_UNIT_TEST(AnEmptyCacheReceivesBudgetToRecover) {
     TTabletMemoryHost host;
     host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, Report(100, 200, 0));
@@ -297,6 +466,82 @@ Y_UNIT_TEST(PerTypeSensorsFallToZeroWhenTheLastTabletOfATypeLeaves) {
     UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(keyValue + "Used")->Val(), 0);
     UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(keyValue + "Demand")->Val(), 0);
     UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(keyValue + "Reclaimable")->Val(), 0);
+}
+
+Y_UNIT_TEST(SaturatedTypeGaugesRecoverAfterReplacementAndRemoval) {
+    TTabletMemoryHost host;
+    for (ui32 i = 1; i <= 3; ++i) {
+        host.SetReport({i, 0}, MakeExecutor(i), TTabletTypes::DataShard,
+            Report(Max<ui64>(), Max<ui64>(), Max<ui64>()));
+    }
+    auto counters = MakeIntrusive<::NMonitoring::TDynamicCounters>();
+    const TString dataShard = TStringBuilder() << "TabletMemory/" << TTabletTypes::TypeToStr(TTabletTypes::DataShard) << "/";
+    const auto expect = [&](const TString& prefix, TAtomicBase used, TAtomicBase demand, TAtomicBase reclaimable) {
+        host.UpdateCounters(counters);
+        UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(prefix + "Used")->Val(), used);
+        UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(prefix + "Demand")->Val(), demand);
+        UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(prefix + "Reclaimable")->Val(), reclaimable);
+    };
+    const auto gaugeMax = Max<::NMonitoring::TDeprecatedCounter::TValueBase>();
+    UNIT_ASSERT_VALUES_EQUAL(host.GetSums().Elastic, Max<ui64>());
+    UNIT_ASSERT_VALUES_EQUAL(host.GetElasticReport().Used, Max<ui64>());
+    UNIT_ASSERT_VALUES_EQUAL(host.GetElasticReport().Reclaimable, Max<ui64>());
+    expect(dataShard, gaugeMax, gaugeMax, gaugeMax);
+    UNIT_ASSERT(host.Forget({2, 0}));
+    expect(dataShard, gaugeMax, gaugeMax, gaugeMax);
+    const auto replacement = host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::DataShard, Report(100, 120, 20));
+    UNIT_ASSERT(replacement.SumsChanged);
+    UNIT_ASSERT(replacement.SharesChanged);
+    UNIT_ASSERT_VALUES_EQUAL(host.GetSums().Elastic, Max<ui64>());
+    UNIT_ASSERT_VALUES_EQUAL(host.GetSums().ElasticDemand, Max<ui64>());
+    expect(dataShard, gaugeMax, gaugeMax, gaugeMax);
+    UNIT_ASSERT(host.Forget({3, 0}));
+    UNIT_ASSERT_VALUES_EQUAL(host.GetSums().Total, 80u);
+    UNIT_ASSERT_VALUES_EQUAL(host.GetSums().Elastic, 20u);
+    UNIT_ASSERT_VALUES_EQUAL(host.GetSums().ElasticDemand, 40u);
+    expect(dataShard, 100, 120, 20);
+
+    host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::KeyValue, Report(200, 240, 40));
+    expect(dataShard, 0, 0, 0);
+    const TString keyValue = TStringBuilder() << "TabletMemory/" << TTabletTypes::TypeToStr(TTabletTypes::KeyValue) << "/";
+    expect(keyValue, 200, 240, 40);
+}
+
+Y_UNIT_TEST(ClearResetsOverflowedAccountingBeforeNewReports) {
+    TTabletMemoryHost host;
+    auto counters = MakeIntrusive<::NMonitoring::TDynamicCounters>();
+    for (ui32 i = 1; i <= 3; ++i) {
+        host.SetReport({i, 0}, MakeExecutor(i), TTabletTypes::KeyValue,
+            Report(Max<ui64>(), Max<ui64>(), Max<ui64>()));
+    }
+    host.UpdateCounters(counters);
+    const TString prefix = TStringBuilder() << "TabletMemory/" << TTabletTypes::TypeToStr(TTabletTypes::KeyValue) << "/";
+    const auto gaugeMax = Max<::NMonitoring::TDeprecatedCounter::TValueBase>();
+    UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(prefix + "Used")->Val(), gaugeMax);
+    UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(prefix + "Demand")->Val(), gaugeMax);
+    UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(prefix + "Reclaimable")->Val(), gaugeMax);
+    host.Clear(counters);
+    UNIT_ASSERT_VALUES_EQUAL(host.GetSlotsCount(), 0u);
+    UNIT_ASSERT_VALUES_EQUAL(host.GetSums().Total, 0u);
+    UNIT_ASSERT_VALUES_EQUAL(host.GetSums().Elastic, 0u);
+    UNIT_ASSERT_VALUES_EQUAL(host.GetSums().ElasticDemand, 0u);
+    UNIT_ASSERT(host.ApplyElasticLimit(100).empty());
+    UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(prefix + "Used")->Val(), 0u);
+    UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(prefix + "Demand")->Val(), 0u);
+    UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(prefix + "Reclaimable")->Val(), 0u);
+
+    const auto update = host.SetReport({1, 0}, MakeExecutor(1), TTabletTypes::KeyValue, Report(100, 120, 20));
+    UNIT_ASSERT(update.NewSlot && update.SumsChanged && update.SharesChanged);
+    UNIT_ASSERT_VALUES_EQUAL(host.GetSums().Total, 80u);
+    UNIT_ASSERT_VALUES_EQUAL(host.GetSums().Elastic, 20u);
+    UNIT_ASSERT_VALUES_EQUAL(host.GetSums().ElasticDemand, 40u);
+    host.UpdateCounters(counters);
+    UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(prefix + "Used")->Val(), 100u);
+    UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(prefix + "Demand")->Val(), 120u);
+    UNIT_ASSERT_VALUES_EQUAL(counters->GetCounter(prefix + "Reclaimable")->Val(), 20u);
+    const auto shares = host.ApplyElasticLimit(100);
+    UNIT_ASSERT_VALUES_EQUAL(shares.size(), 1u);
+    UNIT_ASSERT(shares.front().Bytes && *shares.front().Bytes == 100u);
 }
 
 Y_UNIT_TEST(ClearResetsPublishedTypeGauges) {
