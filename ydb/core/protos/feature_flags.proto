@@ -436,5 +436,5 @@ message TFeatureFlags {
     // cluster root for database names, or the database for schema-object paths.
     optional bool EnableRelativePaths = 354 [default = false];
     // Tablets report their memory through Local to the memory controller and get a zone and a share back
-    optional bool EnableTabletMemoryHost = 355 [default = false];
+    optional bool EnableTabletMemoryHost = 366 [default = false];
 }
