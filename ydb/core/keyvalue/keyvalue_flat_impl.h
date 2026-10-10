@@ -28,9 +28,6 @@
 #include <ydb/core/util/stlog.h>
 #include <util/string/escape.h>
 
-// Uncomment the following macro to enable consistency check before every transactions in TTxRequest
-//#define KIKIMR_KEYVALUE_CONSISTENCY_CHECKS
-
 namespace NKikimr {
 namespace NKeyValue {
 
@@ -170,21 +167,8 @@ protected:
             Self->State.RequestComplete(Intermediate, ctx, Self->Info());
         }
 
-        bool CheckConsistency(NTabletFlatExecutor::TTransactionContext &txc) {
-#ifdef KIKIMR_KEYVALUE_CONSISTENCY_CHECKS
-            TKeyValueState state;
-            if (!TTxInit::LoadStateFromDB(state, txc.DB)) {
-                return false;
-            }
-            Y_ABORT_UNLESS(!state.IsDamaged());
-            state.VerifyEqualIndex(Self->State);
-            txc.DB.NoMoreReadsForTx();
-            return true;
-#else
-            Y_UNUSED(txc);
-            return true;
-#endif
-        }
+        // defined in keyvalue.cpp, a no-op unless the library is built with -DKIKIMR_KEYVALUE_CONSISTENCY_CHECKS=yes
+        bool CheckConsistency(NTabletFlatExecutor::TTransactionContext &txc);
     };
 
     struct TTxDropRefCountsOnError : NTabletFlatExecutor::ITransaction {
@@ -807,18 +791,16 @@ public:
         return NKikimrServices::TActivity::KEYVALUE_ACTOR;
     }
 
+    static TAutoPtr<TTabletCountersBase> MakeTabletCounters() {
+        return new TProtobufTabletCounters<ESimpleCounters_descriptor, ECumulativeCounters_descriptor,
+            EPercentileCounters_descriptor, ETxTypes_descriptor>();
+    }
+
     TKeyValueFlat(const TActorId &tablet, TTabletStorageInfo *info)
         : TActor(&TThis::StateInit)
         , TTabletExecutedFlat(info, tablet, new NMiniKQL::TMiniKQLFactory)
     {
-        TAutoPtr<TTabletCountersBase> counters(
-        new TProtobufTabletCounters<
-                ESimpleCounters_descriptor,
-                ECumulativeCounters_descriptor,
-                EPercentileCounters_descriptor,
-                ETxTypes_descriptor
-            >());
-        State.SetupTabletCounters(counters);
+        State.SetupTabletCounters(MakeTabletCounters());
         State.Clear();
         State.SetTabletInfo(info);
     }
@@ -892,6 +874,7 @@ public:
         if (HandleHook(ev))
             return;
         switch (ev->GetTypeRewrite()) {
+            hFunc(TEvKeyValue::TEvAdmissionDeadline, Handle);
             hFunc(TEvKeyValue::TEvRead, Handle);
             hFunc(TEvKeyValue::TEvReadRange, Handle);
             hFunc(TEvKeyValue::TEvExecuteTransaction, Handle);
@@ -957,6 +940,10 @@ public:
         State.OnInitQueueEmpty();
     }
 
+    void Handle(TEvKeyValue::TEvAdmissionDeadline::TPtr&) {
+        State.OnAdmissionDeadline();
+    }
+
     void UpdateTabletYellow() {
         if (Executor()) {
             State.SetTabletYellowMove(Executor()->GetStats().IsAnyChannelYellowMove);
@@ -970,6 +957,20 @@ public:
 
     bool ReassignChannelsEnabled() const override {
         return true;
+    }
+
+    // Owner attribution excludes executor memory and is used only with the host flag enabled.
+    NMemory::TConsumerReport GetMemoryReport() const override {
+        const ui64 used = State.GetStateBytes().Total() + State.GetMemoryAdmissionStats().HeldBytes() + State.GetMemoryWaitingForGC();
+        return {.Used = used, .Demand = used, .Reclaimable = 0};
+    }
+
+    NMemory::TMemoryAdmissionStats GetMemoryAdmissionStats() const override {
+        return State.GetMemoryAdmissionStats();
+    }
+
+    void OnMemoryZone(NMemory::EMemoryZone zone) override {
+        State.OnMemoryZone(zone);
     }
 
     bool ValidateMoveDataGroups(const TSet<ui32>& moveDataGroups, const TActorId& sender) const {

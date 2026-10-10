@@ -160,6 +160,7 @@ void TKeyValueState::Clear() {
     NextLogoBlobCookie = 1;
     Index.clear();
     RefCounts.clear();
+    StateBytes = {};
     CompletedVacuumGeneration = 0;
     CompletedVacuumTrashGeneration = 0;
 
@@ -461,6 +462,14 @@ void TKeyValueState::CountTrashDeleted(const TLogoBlobID& id) {
         TabletCounters->Simple()[COUNTER_VIRTUAL_TRASH_BYTES].Get() == TotalTrashSize);
 }
 
+void TKeyValueState::PublishStateBytesCounters() {
+    TabletCounters->Simple()[COUNTER_MEMORY_STATE_BYTES].Set(StateBytes.Total());
+    TabletCounters->Simple()[COUNTER_MEMORY_INDEX_BYTES].Set(StateBytes.IndexBytes);
+    TabletCounters->Simple()[COUNTER_MEMORY_INLINE_DATA_BYTES].Set(StateBytes.InlineDataBytes);
+    TabletCounters->Simple()[COUNTER_MEMORY_REF_COUNTS_BYTES].Set(StateBytes.RefCountsBytes);
+    TabletCounters->Simple()[COUNTER_MEMORY_TRASH_BYTES].Set(StateBytes.TrashBytes);
+}
+
 void TKeyValueState::CountOverrun() {
     TabletCounters->Cumulative()[COUNTER_REQ_OVERRUN].Increment(1);
 }
@@ -539,15 +548,16 @@ void TKeyValueState::Load(const TString &key, const TString& value) {
         }
         case EIT_KEYVALUE_1:
         {
-            TIndexRecord &record = Index[arbitraryPart];
             TString errorInfo;
             bool isOk = false;
-            EItemType headerItemType = TIndexRecord::ReadItemType(value);
-            if (headerItemType == EIT_KEYVALUE_1) {
-                isOk = record.Deserialize1(value, errorInfo);
-            } else {
-                isOk = record.Deserialize2(value, errorInfo);
-            }
+            const TIndexRecord& record = ModifyIndexRecord(arbitraryPart, [&](TIndexRecord& record) {
+                EItemType headerItemType = TIndexRecord::ReadItemType(value);
+                if (headerItemType == EIT_KEYVALUE_1) {
+                    isOk = record.Deserialize1(value, errorInfo);
+                } else {
+                    isOk = record.Deserialize2(value, errorInfo);
+                }
+            });
             if (!isOk) {
                 TStringStream str;
                 str << " Tablet# " << TabletId;
@@ -563,7 +573,7 @@ void TKeyValueState::Load(const TString &key, const TString& value) {
             }
             for (const TIndexRecord::TChainItem& item : record.Chain) {
                 if (!item.IsInline()) {
-                    const ui32 newRefCount = ++RefCounts[item.LogoBlobId];
+                    const ui32 newRefCount = ++GetOrCreateRefCount(item.LogoBlobId);
                     if (newRefCount == 1) {
                         CountWriteRecord(item.LogoBlobId);
                     }
@@ -577,7 +587,7 @@ void TKeyValueState::Load(const TString &key, const TString& value) {
             Y_ABORT_UNLESS(value.size() == 0);
             Y_ABORT_UNLESS(arbitraryPart.size() == sizeof(TTrashKeyArbitrary));
             const TTrashKeyArbitrary *trashKey = (const TTrashKeyArbitrary *) arbitraryPart.data();
-            GetCurrentTrashBin().insert(trashKey->LogoBlobId);
+            InsertTrash(GetCurrentTrashBin(), trashKey->LogoBlobId);
             TotalTrashSize += trashKey->LogoBlobId.BlobSize();
             CountInitialTrashRecord(trashKey->LogoBlobId);
             break;
@@ -1010,7 +1020,7 @@ void TKeyValueState::DropRefCountsOnError(std::deque<std::pair<TLogoBlobID, bool
         if (it->second != 1) { // just drop the reference, item kept alive
             --it->second;
         } else if (initial && !writesMade) { // this was just generated BlobId and no writes were possibly made
-            RefCounts.erase(it);
+            EraseRefCount(it);
         } else { // this item has to be removed inside tx by rotation to Trash -- it may have been written somehow
             return false;
         }
@@ -1018,6 +1028,7 @@ void TKeyValueState::DropRefCountsOnError(std::deque<std::pair<TLogoBlobID, bool
     };
 
     refCountsIncr.erase(std::remove_if(refCountsIncr.begin(), refCountsIncr.end(), pred), refCountsIncr.end());
+    PublishStateBytesCounters();
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1205,40 +1216,41 @@ void TKeyValueState::ProcessCmd(TIntermediate::TWrite &request,
         ISimpleDb &db, const TActorContext &ctx, TRequestStat &/*stat*/, ui64 /*unixTime*/,
         TIntermediate* /*intermediate*/)
 {
-    TIndexRecord& record = Index[request.Key];
-    Dereference(record, db);
-
-    record.Chain = {};
     ui32 storage_channel = 0;
-    if (request.Status == NKikimrProto::SCHEDULED) {
-        TRope inlineData = request.Data;
-        const size_t size = inlineData.size();
-        record.Chain.push_back(TIndexRecord::TChainItem(std::move(inlineData), 0));
-        CountWriteRecord(TLogoBlobID(0, 0, 0, 0, size, 0));
-        request.Status = NKikimrProto::OK;
-        storage_channel = InlineStorageChannelInPublicApi;
-    } else {
-        int channel = -1;
+    ModifyIndexRecord(request.Key, [&](TIndexRecord& record) {
+        Dereference(record, db);
 
-        ui64 offset = 0;
-        for (const TLogoBlobID& logoBlobId : request.LogoBlobIds) {
-            record.Chain.push_back(TIndexRecord::TChainItem(logoBlobId, offset));
-            offset += logoBlobId.BlobSize();
-            CountWriteRecord(logoBlobId);
-            if (channel == -1) {
-                channel = logoBlobId.Channel();
-            } else {
-                // all blobs from the same write must be within the same channel
-                Y_ABORT_UNLESS(channel == (int)logoBlobId.Channel());
+        record.Chain = {};
+        if (request.Status == NKikimrProto::SCHEDULED) {
+            TRope inlineData = request.Data;
+            const size_t size = inlineData.size();
+            record.Chain.push_back(TIndexRecord::TChainItem(std::move(inlineData), 0));
+            CountWriteRecord(TLogoBlobID(0, 0, 0, 0, size, 0));
+            request.Status = NKikimrProto::OK;
+            storage_channel = InlineStorageChannelInPublicApi;
+        } else {
+            int channel = -1;
+
+            ui64 offset = 0;
+            for (const TLogoBlobID& logoBlobId : request.LogoBlobIds) {
+                record.Chain.push_back(TIndexRecord::TChainItem(logoBlobId, offset));
+                offset += logoBlobId.BlobSize();
+                CountWriteRecord(logoBlobId);
+                if (channel == -1) {
+                    channel = logoBlobId.Channel();
+                } else {
+                    // all blobs from the same write must be within the same channel
+                    Y_ABORT_UNLESS(channel == (int)logoBlobId.Channel());
+                }
             }
+            storage_channel = channel + MainStorageChannelInPublicApi;
+
+            ctx.Send(ChannelBalancerActorId, new TChannelBalancer::TEvReportWriteLatency(channel, request.Latency));
         }
-        storage_channel = channel + MainStorageChannelInPublicApi;
 
-        ctx.Send(ChannelBalancerActorId, new TChannelBalancer::TEvReportWriteLatency(channel, request.Latency));
-    }
-
-    record.CreationUnixTime = request.CreationUnixTime;
-    UpdateKeyValue(request.Key, record, db);
+        record.CreationUnixTime = request.CreationUnixTime;
+        UpdateKeyValue(request.Key, record, db);
+    });
 
     if (legacyResponse) {
         legacyResponse->SetStatus(NKikimrProto::OK);
@@ -1257,19 +1269,20 @@ void TKeyValueState::ProcessCmd(TIntermediate::TPatch &request,
         ISimpleDb &db, const TActorContext &/*ctx*/, TRequestStat &/*stat*/, ui64 unixTime,
         TIntermediate* /*intermediate*/)
 {
-    TIndexRecord& record = Index[request.PatchedKey];
-    Dereference(record, db);
+    ModifyIndexRecord(request.PatchedKey, [&](TIndexRecord& record) {
+        Dereference(record, db);
 
-    record.Chain = {};
+        record.Chain = {};
 
-    record.Chain.push_back(TIndexRecord::TChainItem(request.PatchedBlobId, 0));
-    CountWriteRecord(request.PatchedBlobId); // TODO(kruall) change to CountPatchRecord
+        record.Chain.push_back(TIndexRecord::TChainItem(request.PatchedBlobId, 0));
+        CountWriteRecord(request.PatchedBlobId); // TODO(kruall) change to CountPatchRecord
+
+        record.CreationUnixTime = unixTime;
+        UpdateKeyValue(request.PatchedKey, record, db);
+    });
 
     ui32 storage_channel = request.PatchedBlobId.Channel() + MainStorageChannelInPublicApi;
     // ctx.Send(ChannelBalancerActorId, new TChannelBalancer::TEvReportWriteLatency(channel, request.Latency));
-
-    record.CreationUnixTime = unixTime;
-    UpdateKeyValue(request.PatchedKey, record, db);
 
     if (legacyResponse) {
         legacyResponse->SetStatus(NKikimrProto::OK);
@@ -1294,7 +1307,7 @@ void TKeyValueState::ProcessCmd(const TIntermediate::TDelete &request,
         stat.DeleteBytes += it->second.GetFullValueSize();
         Dereference(it->second, db);
         EraseKey(it->first, db);
-        Index.erase(it);
+        EraseIndexRecord(it);
     });
 
     if (legacyResponse) {
@@ -1310,7 +1323,6 @@ void TKeyValueState::ProcessCmd(const TIntermediate::TRename &request,
 {
     auto oldIter = Index.find(request.OldKey);
     Y_ABORT_UNLESS(oldIter != Index.end());
-    TIndexRecord& source = oldIter->second;
 
     // a rename onto itself changes nothing; the generic path would trash the value and erase the record
     if (request.OldKey == request.NewKey) {
@@ -1320,15 +1332,15 @@ void TKeyValueState::ProcessCmd(const TIntermediate::TRename &request,
         return;
     }
 
-    TIndexRecord& dest = Index[request.NewKey];
-    Dereference(dest, db);
-    dest.Chain = std::move(source.Chain);
-    dest.CreationUnixTime = request.CreationUnixTime;
-
     EraseKey(oldIter->first, db);
-    Index.erase(oldIter);
+    TVector<TIndexRecord::TChainItem> chain = EraseIndexRecord(oldIter);
 
-    UpdateKeyValue(request.NewKey, dest, db);
+    ModifyIndexRecord(request.NewKey, [&](TIndexRecord& dest) {
+        Dereference(dest, db);
+        dest.Chain = std::move(chain);
+        dest.CreationUnixTime = request.CreationUnixTime;
+        UpdateKeyValue(request.NewKey, dest, db);
+    });
 
     if (legacyResponse) {
         legacyResponse->SetStatus(NKikimrProto::OK);
@@ -1356,7 +1368,7 @@ void TKeyValueState::ProcessCmd(const TIntermediate::TCopyRange &request,
             if (item.IsInline()) {
                 inlineSize += item.GetSize();
             } else {
-                ++RefCounts[item.LogoBlobId];
+                ++GetOrCreateRefCount(item.LogoBlobId);
                 intermediate->RefCountsIncr.emplace_back(item.LogoBlobId, false);
             }
         }
@@ -1365,11 +1377,12 @@ void TKeyValueState::ProcessCmd(const TIntermediate::TCopyRange &request,
         }
 
         TString newKey = request.PrefixToAdd + it->first.substr(request.PrefixToRemove.size());
-        TIndexRecord& record = Index[newKey];
-        Dereference(record, db);
-        record.Chain = sourceRecord.Chain;
-        record.CreationUnixTime = sourceRecord.CreationUnixTime;
-        UpdateKeyValue(newKey, record, db);
+        ModifyIndexRecord(newKey, [&](TIndexRecord& record) {
+            Dereference(record, db);
+            record.Chain = sourceRecord.Chain;
+            record.CreationUnixTime = sourceRecord.CreationUnixTime;
+            UpdateKeyValue(newKey, record, db);
+        });
     }
 
     if (legacyResponse) {
@@ -1399,7 +1412,7 @@ void TKeyValueState::ProcessCmd(const TIntermediate::TConcat &request,
             } else {
                 const TLogoBlobID& id = chainItem.LogoBlobId;
                 chain.push_back(TIndexRecord::TChainItem(id, offset));
-                ++RefCounts[id];
+                ++GetOrCreateRefCount(id);
                 intermediate->RefCountsIncr.emplace_back(id, false);
             }
             offset += chainItem.GetSize();
@@ -1411,15 +1424,16 @@ void TKeyValueState::ProcessCmd(const TIntermediate::TConcat &request,
         if (!request.KeepInputs) {
             Dereference(input, db);
             EraseKey(it->first, db);
-            Index.erase(it);
+            EraseIndexRecord(it);
         }
     }
 
-    TIndexRecord& record = Index[request.OutputKey];
-    Dereference(record, db);
-    record.Chain = std::move(chain);
-    record.CreationUnixTime = unixTime;
-    UpdateKeyValue(request.OutputKey, record, db);
+    ModifyIndexRecord(request.OutputKey, [&](TIndexRecord& record) {
+        Dereference(record, db);
+        record.Chain = std::move(chain);
+        record.CreationUnixTime = unixTime;
+        UpdateKeyValue(request.OutputKey, record, db);
+    });
 
     if (legacyResponse) {
         legacyResponse->SetStatus(NKikimrProto::OK);
@@ -1553,7 +1567,7 @@ void TKeyValueState::CmdTrimLeakedBlobs(THolder<TIntermediate>& intermediate, IS
                         YDB_LOG_WARN("Trimming",
                             {"keyValue", TabletId},
                             {"id", id});
-                        GetCurrentTrashBin().insert(id);
+                        InsertTrash(GetCurrentTrashBin(), id);
                         TotalTrashSize += id.BlobSize();
                         CountUncommittedTrashRecord(id);
                         THelpers::DbUpdateTrash(id, db);
@@ -1880,6 +1894,81 @@ bool TKeyValueState::IncrementGeneration(THolder<TIntermediate> &intermediate, I
     return true;
 }
 
+TKeyValueState::TStateBytes TKeyValueState::GetIndexRecordBytes(const TString& key, const TIndexRecord& record) {
+    TStateBytes bytes;
+    bytes.IndexBytes = IndexNodeBytes + key.size() + record.Chain.size() * ChainItemBytes;
+    for (const TIndexRecord::TChainItem& item : record.Chain) {
+        if (item.IsInline()) {
+            bytes.InlineDataBytes += item.InlineData.size();
+        }
+    }
+    return bytes;
+}
+
+void TKeyValueState::SubtractStateBytes(ui64& total, ui64 bytes) {
+    Y_DEBUG_ABORT_UNLESS(total >= bytes);
+    if (total < bytes) {
+        TabletCounters->Cumulative()[COUNTER_MEMORY_STATE_BYTES_UNDERFLOWS].Increment(1);
+    }
+    total -= Min(total, bytes);
+}
+
+void TKeyValueState::AccountIndexRecord(const TString& key, const TIndexRecord& record) {
+    const TStateBytes bytes = GetIndexRecordBytes(key, record);
+    StateBytes.IndexBytes += bytes.IndexBytes;
+    StateBytes.InlineDataBytes += bytes.InlineDataBytes;
+}
+
+void TKeyValueState::UnaccountIndexRecord(const TString& key, const TIndexRecord& record) {
+    const TStateBytes bytes = GetIndexRecordBytes(key, record);
+    SubtractStateBytes(StateBytes.IndexBytes, bytes.IndexBytes);
+    SubtractStateBytes(StateBytes.InlineDataBytes, bytes.InlineDataBytes);
+}
+
+TVector<TIndexRecord::TChainItem> TKeyValueState::EraseIndexRecord(TIndex::iterator it) {
+    UnaccountIndexRecord(it->first, it->second);
+    TVector<TIndexRecord::TChainItem> chain = std::move(it->second.Chain);
+    Index.erase(it);
+    return chain;
+}
+
+ui32& TKeyValueState::GetOrCreateRefCount(const TLogoBlobID& id) {
+    const auto [it, inserted] = RefCounts.try_emplace(id, 0);
+    if (inserted) {
+        StateBytes.RefCountsBytes += RefCountNodeBytes;
+    }
+    return it->second;
+}
+
+void TKeyValueState::EraseRefCount(THashMap<TLogoBlobID, ui32>::iterator it) {
+    RefCounts.erase(it);
+    SubtractStateBytes(StateBytes.RefCountsBytes, RefCountNodeBytes);
+}
+
+void TKeyValueState::EraseTrash(TSet<TLogoBlobID>& trashBin, const TLogoBlobID& id) {
+    const size_t numErased = trashBin.erase(id);
+    Y_ABORT_UNLESS(numErased == 1);
+    SubtractStateBytes(StateBytes.TrashBytes, TrashNodeBytes);
+}
+
+void TKeyValueState::InsertTrash(TSet<TLogoBlobID>& trashBin, const TLogoBlobID& id) {
+    if (trashBin.insert(id).second) {
+        StateBytes.TrashBytes += TrashNodeBytes;
+    }
+}
+
+TKeyValueState::TStateBytes TKeyValueState::RecountStateBytes() const {
+    TStateBytes bytes;
+    for (const auto& [key, record] : Index) {
+        const TStateBytes recordBytes = GetIndexRecordBytes(key, record);
+        bytes.IndexBytes += recordBytes.IndexBytes;
+        bytes.InlineDataBytes += recordBytes.InlineDataBytes;
+    }
+    bytes.RefCountsBytes = RefCounts.size() * RefCountNodeBytes;
+    bytes.TrashBytes = GetTrashCount() * TrashNodeBytes;
+    return bytes;
+}
+
 void TKeyValueState::Dereference(const TIndexRecord& record, ISimpleDb& db) {
     ui32 inlineSize = 0;
     for (const TIndexRecord::TChainItem& item : record.Chain) {
@@ -1899,7 +1988,7 @@ void TKeyValueState::Dereference(const TLogoBlobID& id, ISimpleDb& db, bool init
     Y_ABORT_UNLESS(it != RefCounts.end());
     --it->second;
     if (!it->second) {
-        RefCounts.erase(it);
+        EraseRefCount(it);
         db.AddTrash(id);
         TotalTrashSize += id.BlobSize();
         THelpers::DbUpdateTrash(id, db);
@@ -1912,10 +2001,13 @@ void TKeyValueState::Dereference(const TLogoBlobID& id, ISimpleDb& db, bool init
 }
 
 void TKeyValueState::PushTrashBeingCommitted(TVector<TLogoBlobID>& trashBeingCommitted, const TActorContext& ctx) {
-    GetCurrentTrashBin().insert(trashBeingCommitted.begin(), trashBeingCommitted.end());
+    TSet<TLogoBlobID>& trashBin = GetCurrentTrashBin();
     for (const TLogoBlobID& id : trashBeingCommitted) {
+        InsertTrash(trashBin, id);
         CountTrashCommitted(id);
     }
+    // every state-changing transaction completes here, so the state size is published once per transaction
+    PublishStateBytesCounters();
     PrepareCollectIfNeeded(ctx);
 }
 
@@ -1960,6 +2052,159 @@ void TKeyValueState::OnPeriodicRefresh() {
 
 void TKeyValueState::OnUpdateWeights(TChannelBalancer::TEvUpdateWeights::TPtr ev) {
     WeightManager = std::move(ev->Get()->WeightManager);
+}
+
+void TKeyValueState::PublishAdmissionCounters() {
+    const auto stats = Admission.GetStats();
+    auto& counters = TabletCounters->Simple();
+    counters[COUNTER_MEMORY_ADMISSION_RUNNING_BYTES].Set(stats.RunningBytes);
+    counters[COUNTER_MEMORY_ADMISSION_RUNNING_COUNT].Set(stats.RunningCount);
+    counters[COUNTER_MEMORY_ADMISSION_QUEUED_BYTES].Set(stats.PostponedBytes);
+    counters[COUNTER_MEMORY_ADMISSION_QUEUED_COUNT].Set(stats.PostponedCount);
+}
+
+void TKeyValueState::OnMemoryZone(NMemory::EMemoryZone zone) {
+    Admission.OnZoneChanged(zone);
+    PublishAdmissionCounters();
+}
+
+void TKeyValueState::AdmitIntermediate(THolder<TIntermediate>&& intermediate) {
+    const ui64 charge = GetBudgetCharge(*intermediate);
+    const ui64 uid = intermediate->RequestUid;
+    const TInstant deadline = intermediate->Deadline;
+    const auto result = Admission.Admit(uid, std::move(intermediate), charge);
+    Y_ABORT_UNLESS(result != NMemory::EAdmitResult::Duplicate);
+    if (result == NMemory::EAdmitResult::Queued && deadline != TInstant::Max()) {
+        AdmissionDeadlines.emplace(std::make_pair(deadline, uid), true);
+        AdmissionDeadlineByUid.emplace(uid, deadline);
+        ScheduleAdmissionDeadline();
+    }
+    PublishAdmissionCounters();
+}
+
+void TKeyValueState::AddAdmissionDeadline(const TIntermediate& intermediate) {
+    if (intermediate.Deadline != TInstant::Max()) {
+        AdmissionDeadlines.emplace(std::make_pair(intermediate.Deadline, intermediate.RequestUid), true);
+        AdmissionDeadlineByUid.emplace(intermediate.RequestUid, intermediate.Deadline);
+        ScheduleAdmissionDeadline();
+    }
+}
+
+void TKeyValueState::PostponeTrim(THolder<TIntermediate>&& intermediate) {
+    if (AppData(TActivationContext::AsActorContext())->FeatureFlags.GetEnableTabletMemoryHost()) {
+        AddAdmissionDeadline(*intermediate);
+    }
+    const ui64 uid = intermediate->RequestUid;
+    PostponedTrimBytes += GetBudgetCharge(*intermediate);
+    CmdTrimLeakedBlobsPostponed.push_back(std::move(intermediate));
+    PostponedTrimByUid.emplace(uid, std::prev(CmdTrimLeakedBlobsPostponed.end()));
+}
+
+void TKeyValueState::RemoveAdmissionDeadline(ui64 requestUid) {
+    const auto it = AdmissionDeadlineByUid.find(requestUid);
+    if (it != AdmissionDeadlineByUid.end()) {
+        AdmissionDeadlines.erase({it->second, requestUid});
+        AdmissionDeadlineByUid.erase(it);
+    }
+}
+
+void TKeyValueState::ScheduleAdmissionDeadline() {
+    if (AdmissionDeadlineScheduled || AdmissionDeadlines.empty()) {
+        return;
+    }
+    AdmissionDeadlineScheduled = true;
+    const TInstant now = TAppData::TimeProvider->Now();
+    const TInstant next = AdmissionDeadlines.begin()->first.first;
+    TActivationContext::Schedule(Min(next > now ? next - now : TDuration::Zero(), TDuration::MilliSeconds(100)),
+        MakeHolder<IEventHandle>(KeyValueActorId, KeyValueActorId, new TEvKeyValue::TEvAdmissionDeadline()));
+}
+
+void TKeyValueState::OnAdmissionDeadline() {
+    AdmissionDeadlineScheduled = false;
+    const TInstant now = TAppData::TimeProvider->Now();
+    while (!AdmissionDeadlines.empty() && AdmissionDeadlines.begin()->first.first <= now) {
+        const ui64 uid = AdmissionDeadlines.begin()->first.second;
+        RemoveAdmissionDeadline(uid);
+        auto item = Admission.CancelQueued(uid);
+        if (!item) {
+            const auto trim = PostponedTrimByUid.find(uid);
+            if (trim != PostponedTrimByUid.end()) {
+                PostponedTrimBytes -= GetBudgetCharge(**trim->second);
+                item.emplace(std::move(*trim->second));
+                CmdTrimLeakedBlobsPostponed.erase(trim->second);
+                PostponedTrimByUid.erase(trim);
+            }
+        }
+        if (item) {
+            // A terminal timeout actor uses the usual reply/refcount cleanup protocol.
+            // Its explicit flag prevents I/O even if the deadline clock moves backwards.
+            (*item)->AdmissionTimedOut = true;
+            StartAdmittedIntermediate(std::move(*item), NMemory::EAdmitSource::FromQueue);
+        }
+    }
+    PublishAdmissionCounters();
+    ScheduleAdmissionDeadline();
+}
+
+void TKeyValueState::StartAdmitted(THolder<TIntermediate>&& intermediate, NMemory::EAdmitSource source) {
+    StartAdmittedIntermediate(std::move(intermediate), source);
+}
+
+ui64 TKeyValueState::GetBudgetCharge(const TIntermediate& intermediate) {
+    ui64 bytes = 0;
+    for (const TIntermediate::TWrite& write : intermediate.Writes) {
+        bytes += write.Data.size();
+    }
+    for (const TIntermediate::TCmd& command : intermediate.Commands) {
+        if (std::holds_alternative<TIntermediate::TWrite>(command)) {
+            bytes += std::get<TIntermediate::TWrite>(command).Data.size();
+        }
+    }
+    if (intermediate.Stat.RequestType == TRequestType::ReadOnlyInline) {
+        bytes += intermediate.TotalSize;
+    }
+    return bytes;
+}
+
+void TKeyValueState::StartAdmittedIntermediate(THolder<TIntermediate>&& intermediate, NMemory::EAdmitSource source) {
+    const bool alreadyStarted = intermediate->MemoryAdmissionStarted;
+    const bool expired = intermediate->Deadline != TInstant::Max() &&
+        intermediate->Deadline <= TAppData::TimeProvider->Now();
+    if (source == NMemory::EAdmitSource::FromQueue) {
+        intermediate->WaitedInMemoryAdmission = true;
+        if (expired && AppData(TActivationContext::AsActorContext())->FeatureFlags.GetEnableTabletMemoryHost()) {
+            intermediate->AdmissionTimedOut = true;
+        }
+    }
+    if (!alreadyStarted && intermediate->TrimLeakedBlobs && IsCollectEventSent &&
+        !intermediate->AdmissionTimedOut && !expired) {
+        // GC-ineligible work yields the admission slot and rejoins after GC completes.
+        // Its resident payload remains charged in the owner's GC waiting ledger.
+        const ui64 uid = intermediate->RequestUid;
+        PostponeTrim(std::move(intermediate));
+        Admission.Release(uid);
+        PublishAdmissionCounters();
+        return;
+    }
+    intermediate->MemoryAdmissionStarted = true;
+    RemoveAdmissionDeadline(intermediate->RequestUid);
+    if (!alreadyStarted && intermediate->WaitedInMemoryAdmission) {
+        CountLatencyQueue(intermediate->Stat);
+    }
+    if (!alreadyStarted && intermediate->Stat.RequestType == TRequestType::ReadOnlyInline) {
+        ++RoInlineIntermediatesInFlight;
+        TabletCounters->Simple()[COUNTER_REQ_RO_INLINE_IN_FLY].Set(RoInlineIntermediatesInFlight);
+    }
+    const TActorContext& ctx = TActivationContext::AsActorContext();
+    switch (intermediate->EvType) {
+    case TEvKeyValue::TEvRead::EventType:
+    case TEvKeyValue::TEvReadRange::EventType:
+        RegisterReadRequestActor(ctx, std::move(intermediate), TabletInfo.Get(), ExecutorGeneration);
+        break;
+    default:
+        RegisterRequestActor(ctx, std::move(intermediate), TabletInfo.Get(), ExecutorGeneration);
+        break;
+    }
 }
 
 TVector<ui32> TKeyValueState::GetAcquiredChannels(const TIntermediate &intermediate) const {
@@ -2178,6 +2423,9 @@ void TKeyValueState::OnRequestComplete(ui64 requestUid, ui64 generation, ui64 st
     if (!releasedChannels.empty()) {
         ProcessPostponedChannels(releasedChannels, ctx, info);
     }
+    RemoveAdmissionDeadline(requestUid);
+    Admission.Release(requestUid);
+    PublishAdmissionCounters();
 
     CmdTrimLeakedBlobsUids.erase(requestUid);
     CancelInFlight(requestUid);
@@ -3522,11 +3770,20 @@ void TKeyValueState::RegisterReadRequestActor(const TActorContext &ctx, THolder<
 void TKeyValueState::RegisterRequestActor(const TActorContext &ctx, THolder<TIntermediate> &&intermediate,
         const TTabletStorageInfo *info, ui32 tabletGeneration)
 {
+    const bool expired = intermediate->Deadline != TInstant::Max() &&
+        intermediate->Deadline <= TAppData::TimeProvider->Now();
+    if (intermediate->TrimLeakedBlobs && !intermediate->AdmissionTimedOut && !expired) {
+        if (IsCollectEventSent) {
+            PostponeTrim(std::move(intermediate));
+            return;
+        }
+        CmdTrimLeakedBlobsUids.insert(intermediate->RequestUid);
+    }
     auto fixWrite = [&](TIntermediate::TWrite& write) {
         for (auto& logoBlobId : write.LogoBlobIds) {
             Y_ABORT_UNLESS(logoBlobId.TabletID() == 0);
             logoBlobId = AllocateLogoBlobId(logoBlobId.BlobSize(), logoBlobId.Channel(), intermediate->RequestUid);
-            ui32 newRefCount = ++RefCounts[logoBlobId];
+            ui32 newRefCount = ++GetOrCreateRefCount(logoBlobId);
             Y_ABORT_UNLESS(newRefCount == 1);
             intermediate->RefCountsIncr.emplace_back(logoBlobId, true);
         }
@@ -3535,7 +3792,7 @@ void TKeyValueState::RegisterRequestActor(const TActorContext &ctx, THolder<TInt
     auto fixPatch = [&](TIntermediate::TPatch& patch) {
         Y_ABORT_UNLESS(patch.PatchedBlobId.TabletID() == 0);
         patch.PatchedBlobId = AllocatePatchedLogoBlobId(patch.PatchedBlobId.BlobSize(), patch.PatchedBlobId.Channel(), patch.OriginalBlobId, intermediate->RequestUid);
-        ui32 newRefCount = ++RefCounts[patch.PatchedBlobId];
+        ui32 newRefCount = ++GetOrCreateRefCount(patch.PatchedBlobId);
         Y_ABORT_UNLESS(newRefCount == 1);
         intermediate->RefCountsIncr.emplace_back(patch.PatchedBlobId, true);
 
@@ -3559,6 +3816,8 @@ void TKeyValueState::RegisterRequestActor(const TActorContext &ctx, THolder<TInt
             fixPatch(*patch);
         }
     }
+    // the new entries live until the storage request completes, publish them before the wait
+    PublishStateBytesCounters();
 
     ctx.RegisterWithSameMailbox(CreateKeyValueStorageRequest(std::move(intermediate), info, tabletGeneration, this, GetLifetimeToken()));
 }
@@ -3579,16 +3838,27 @@ void TKeyValueState::ProcessPostponedIntermediate(const TActorContext& ctx, THol
 
 void TKeyValueState::ProcessPostponedTrims(const TActorContext& ctx, const TTabletStorageInfo *info) {
     if (!IsCollectEventSent) {
-        for (auto& interm : CmdTrimLeakedBlobsPostponed) {
-            CmdTrimLeakedBlobsUids.insert(interm->RequestUid);
-            const TRequestType::EType requestType = interm->Stat.RequestType;
-            if (requestType == TRequestType::ReadOnlyInline) {
-                ++RoInlineIntermediatesInFlight;
-                CountRequestTakeOffOrEnqueue(requestType);
-            }
-            RegisterRequestActor(ctx, std::move(interm), info, ExecutorGeneration);
-        }
+        auto postponed = std::move(CmdTrimLeakedBlobsPostponed);
         CmdTrimLeakedBlobsPostponed.clear();
+        PostponedTrimByUid.clear();
+        for (auto& interm : postponed) {
+            PostponedTrimBytes -= GetBudgetCharge(*interm);
+            RemoveAdmissionDeadline(interm->RequestUid);
+            const auto requestType = interm->Stat.RequestType;
+            if (AppData(ctx)->FeatureFlags.GetEnableTabletMemoryHost() &&
+                interm->Deadline != TInstant::Max() && interm->Deadline <= TAppData::TimeProvider->Now()) {
+                interm->AdmissionTimedOut = true;
+                StartAdmittedIntermediate(std::move(interm), NMemory::EAdmitSource::FromQueue);
+            } else if (!interm->MemoryAdmissionStarted &&
+                (requestType == TRequestType::WriteOnly || requestType == TRequestType::ReadOnlyInline)) {
+                // One GC has finished. Reserve this trim's turn while it rejoins
+                // admission, so another GC cannot repeatedly postpone it.
+                CmdTrimLeakedBlobsUids.insert(interm->RequestUid);
+                AdmitIntermediate(std::move(interm));
+            } else {
+                RegisterRequestActor(ctx, std::move(interm), info, ExecutorGeneration);
+            }
+        }
     }
 }
 
@@ -3608,8 +3878,7 @@ void TKeyValueState::OnEvReadRequest(TEvKeyValue::TEvRead::TPtr &ev, const TActo
             YDB_LOG_DEBUG("Create storage inline read request,",
                 {"keyValue", TabletId},
                 {"marker", "KV49"});
-            RegisterReadRequestActor(ctx, std::move(intermediate), info, ExecutorGeneration);
-            ++RoInlineIntermediatesInFlight;
+            AdmitIntermediate(std::move(intermediate));
         } else {
             if (TryStartOrPostponeIntermediate(intermediate, ctx)) {
                 YDB_LOG_DEBUG("Create storage read request, /",
@@ -3648,8 +3917,7 @@ void TKeyValueState::OnEvReadRangeRequest(TEvKeyValue::TEvReadRange::TPtr &ev, c
             YDB_LOG_DEBUG("Create storage inline read range request,",
                 {"keyValue", TabletId},
                 {"marker", "KV58"});
-            RegisterReadRequestActor(ctx, std::move(intermediate), info, ExecutorGeneration);
-            ++RoInlineIntermediatesInFlight;
+            AdmitIntermediate(std::move(intermediate));
         } else {
             if (TryStartOrPostponeIntermediate(intermediate, ctx)) {
                 YDB_LOG_DEBUG("Create storage read range request, /",
@@ -3687,7 +3955,7 @@ void TKeyValueState::OnEvExecuteTransaction(TEvKeyValue::TEvExecuteTransaction::
         YDB_LOG_DEBUG("Create storage request for WO,",
             {"keyValue", TabletId},
             {"marker", "KV67"});
-        RegisterRequestActor(ctx, std::move(intermediate), info, ExecutorGeneration);
+        AdmitIntermediate(std::move(intermediate));
 
         CountRequestTakeOffOrEnqueue(requestType);
     } else {
@@ -3784,22 +4052,18 @@ void TKeyValueState::OnEvRequest(TEvKeyValue::TEvRequest::TPtr &ev, const TActor
     if (PrepareIntermediate(ev, intermediate, requestType, ctx, info)) {
         // Spawn KeyValueStorageRequest actor on the same thread
         if (hasTrim && IsCollectEventSent) {
-            CmdTrimLeakedBlobsPostponed.push_back(std::move(intermediate));
+            PostponeTrim(std::move(intermediate));
         } else {
-            if (hasTrim) {
-                CmdTrimLeakedBlobsUids.insert(intermediate->RequestUid);
-            }
             if (requestType == TRequestType::WriteOnly) {
                 YDB_LOG_DEBUG("Create storage request for WO,",
                     {"keyValue", TabletId},
                     {"marker", "KV42"});
-                RegisterRequestActor(ctx, std::move(intermediate), info, ExecutorGeneration);
+                AdmitIntermediate(std::move(intermediate));
             } else if (requestType == TRequestType::ReadOnlyInline) {
                 YDB_LOG_DEBUG("Create storage request for RO_INLINE,",
                     {"keyValue", TabletId},
                     {"marker", "KV45"});
-                RegisterRequestActor(ctx, std::move(intermediate), info, ExecutorGeneration);
-                ++RoInlineIntermediatesInFlight;
+                AdmitIntermediate(std::move(intermediate));
             } else {
                 if (TryStartOrPostponeIntermediate(intermediate, ctx)) {
                     YDB_LOG_DEBUG("Create storage request for RO/RW, /",

@@ -15,6 +15,7 @@
 #include <util/generic/set.h>
 #include <util/generic/hash_multi_map.h>
 #include <ydb/core/base/appdata.h>
+#include <ydb/core/base/tablet_memory_admission.h>
 #include <ydb/public/lib/base/msgbus.h>
 #include <ydb/core/tablet/tablet_counters.h>
 #include <ydb/core/tablet/tablet_metrics.h>
@@ -236,6 +237,29 @@ public:
         return VacuumResetGeneration;
     }
 
+    // estimate of the logical state (vector sizes, no hash buckets or allocator rounding), not an allocated-memory bound
+    struct TStateBytes {
+        ui64 IndexBytes = 0;
+        ui64 InlineDataBytes = 0;
+        ui64 RefCountsBytes = 0;
+        ui64 TrashBytes = 0;
+
+        ui64 Total() const {
+            return IndexBytes + InlineDataBytes + RefCountsBytes + TrashBytes;
+        }
+
+        bool operator==(const TStateBytes& other) const = default;
+
+        TString ToString() const {
+            return TStringBuilder() << "{Index# " << IndexBytes << " InlineData# " << InlineDataBytes
+                << " RefCounts# " << RefCountsBytes << " Trash# " << TrashBytes << "}";
+        }
+    };
+
+    const TStateBytes& GetStateBytes() const {
+        return StateBytes;
+    }
+
 protected:
     TIntrusivePtr<TTabletStorageInfo> TabletInfo;
 
@@ -254,6 +278,16 @@ protected:
     ui64 CompletedVacuumTrashGeneration = 0;
     TMap<ui64, THashSet<TActorId>> VacuumGenerationToSender;
     ui64 VacuumResetGeneration = 0; // needs to distinguish between vacuum clanups of different resets
+
+    // red-black tree node: color, parent and two child pointers
+    static constexpr ui64 TreeNodeOverheadBytes = 4 * sizeof(void*);
+    // TString keeps its bytes in a separate heap block: refcount, length, capacity and the allocator header
+    static constexpr ui64 KeyHeapOverheadBytes = 32;
+    static constexpr ui64 IndexNodeBytes = sizeof(TIndex::value_type) + TreeNodeOverheadBytes + KeyHeapOverheadBytes;
+    static constexpr ui64 ChainItemBytes = sizeof(TIndexRecord::TChainItem);
+    static constexpr ui64 RefCountNodeBytes = sizeof(std::pair<const TLogoBlobID, ui32>) + sizeof(void*);
+    static constexpr ui64 TrashNodeBytes = sizeof(TLogoBlobID) + TreeNodeOverheadBytes;
+    TStateBytes StateBytes;
 
     // move data operation state
     static constexpr ui64 MaxMoveDataRecordsInOneTx = 16 << 10;
@@ -279,7 +313,9 @@ protected:
     TMap<ui64, ui64> InFlightForStep;
     TMap<std::tuple<ui64, ui32>, ui32> RequestUidStepToCount;
     THashSet<ui64> CmdTrimLeakedBlobsUids;
-    std::vector<THolder<TIntermediate>> CmdTrimLeakedBlobsPostponed;
+    std::list<THolder<TIntermediate>> CmdTrimLeakedBlobsPostponed;
+    THashMap<ui64, decltype(CmdTrimLeakedBlobsPostponed)::iterator> PostponedTrimByUid;
+    ui64 PostponedTrimBytes = 0;
     THashMap<ui64, TInstant> RequestInputTime;
     ui64 NextRequestUid = 1;
     TIntrusivePtr<TCollectOperation> CollectOperation;
@@ -346,6 +382,12 @@ protected:
     TMemorizableControlWrapper UsePerChannelReadQueues;
     std::optional<TMemorizableControlWrapper> RequestsInFlightLimit;
 
+    // admission of write and inline-read requests by the node memory zone
+    NMemory::TMemoryAdmission<THolder<TIntermediate>, TKeyValueState> Admission{*this};
+    TMap<std::pair<TInstant, ui64>, bool> AdmissionDeadlines;
+    THashMap<ui64, TInstant> AdmissionDeadlineByUid;
+    bool AdmissionDeadlineScheduled = false;
+
     std::shared_ptr<TKeyValueStateLifetimeToken> LifetimeToken = std::make_shared<TKeyValueStateLifetimeToken>();
 
     bool RejectNonExistentStorageChannelEnabled(const TActorContext& ctx);
@@ -373,6 +415,7 @@ public:
     void CountTrashCollected(const TLogoBlobID& id);
     void CountTrashCommitted(const TLogoBlobID& id);
     void CountTrashDeleted(const TLogoBlobID& id);
+    void PublishStateBytesCounters();
     void CountOverrun();
     void CountLatencyBsOps(const TRequestStat &stat);
     void CountLatencyBsCollect();
@@ -538,6 +581,24 @@ public:
 
     void OnPeriodicRefresh();
     void OnUpdateWeights(TChannelBalancer::TEvUpdateWeights::TPtr ev);
+
+    void OnMemoryZone(NMemory::EMemoryZone zone);
+    void OnAdmissionDeadline();
+    void ScheduleAdmissionDeadline();
+    void RemoveAdmissionDeadline(ui64 requestUid);
+    void AddAdmissionDeadline(const TIntermediate& intermediate);
+    void PostponeTrim(THolder<TIntermediate>&& intermediate);
+    void PublishAdmissionCounters();
+    void AdmitIntermediate(THolder<TIntermediate>&& intermediate);
+    void StartAdmitted(THolder<TIntermediate>&& intermediate, NMemory::EAdmitSource source);
+
+    ui64 GetMemoryWaitingForGC() const {
+        return PostponedTrimBytes;
+    }
+
+    NMemory::TMemoryAdmissionStats GetMemoryAdmissionStats() const {
+        return Admission.GetStats();
+    }
 
     void OnRequestComplete(ui64 requestUid, ui64 generation, ui64 step, const TActorContext &ctx,
         const TTabletStorageInfo *info, NMsgBusProxy::EResponseStatus status, const TRequestStat &stat,
@@ -727,6 +788,11 @@ public:
     void ProcessPostponedIntermediate(const TActorContext& ctx, THolder<TIntermediate> &&intermediate,
              const TTabletStorageInfo *info);
 
+    // write payloads plus the response estimate of an inline read
+    static ui64 GetBudgetCharge(const TIntermediate& intermediate);
+    // the admission start callback: the actor of an admitted write or inline read
+    void StartAdmittedIntermediate(THolder<TIntermediate>&& intermediate, NMemory::EAdmitSource source);
+
     bool ConvertRange(const NKikimrClient::TKeyValueRequest::TKeyRange& from, TKeyRange *to,
                       const TActorContext& ctx, THolder<TIntermediate>& intermediate, const char *cmd, ui32 index);
 
@@ -842,7 +908,36 @@ public:
         });
     }
 
+private:
+    static TStateBytes GetIndexRecordBytes(const TString& key, const TIndexRecord& record);
+    void SubtractStateBytes(ui64& total, ui64 bytes);
+    void AccountIndexRecord(const TString& key, const TIndexRecord& record);
+    void UnaccountIndexRecord(const TString& key, const TIndexRecord& record);
+    // the only ways to change Index: the callback may mutate the record but must not erase it
+    template<typename TFunc>
+    TIndexRecord& ModifyIndexRecord(const TString& key, TFunc&& modify) {
+        const auto [it, inserted] = Index.try_emplace(key);
+        if (!inserted) {
+            UnaccountIndexRecord(it->first, it->second);
+        }
+        const size_t sizeBefore = Index.size();
+        modify(it->second);
+        Y_ABORT_UNLESS(Index.size() == sizeBefore);
+        AccountIndexRecord(it->first, it->second);
+        return it->second;
+    }
+    TVector<TIndexRecord::TChainItem> EraseIndexRecord(TIndex::iterator it);
+    ui32& GetOrCreateRefCount(const TLogoBlobID& id);
+    void EraseRefCount(THashMap<TLogoBlobID, ui32>::iterator it);
+    void InsertTrash(TSet<TLogoBlobID>& trashBin, const TLogoBlobID& id);
+    void EraseTrash(TSet<TLogoBlobID>& trashBin, const TLogoBlobID& id);
+
 public: // For testing
+    size_t GetRunningTrimsCount() const {
+        return CmdTrimLeakedBlobsUids.size();
+    }
+
+    TStateBytes RecountStateBytes() const;
     TString Dump() const;
     void VerifyEqualIndex(const TKeyValueState& state) const;
 };
