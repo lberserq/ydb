@@ -285,6 +285,30 @@ Y_UNIT_TEST_SUITE(TColumnShardMoveDataE2E) {
         RunMoveDataToCompletion(/*moveDataEnabled=*/false);
     }
 
+    Y_UNIT_TEST(CompletedSessionCanStartAnotherWithoutReboot) {
+        TMoveDataFixture f;
+        f.Controller->DisableBackground(EBackground::TTL);
+        f.Write(1, 0, 1000);
+        f.Controller->WaitCompactions(TDuration::Seconds(10));
+        f.ReassignPastWrittenData();
+
+        f.StartMove();
+        const auto first = f.DriveGateWithWrite(150, 2, 1000, 1001);
+        UNIT_ASSERT_C(first, "the first session must complete");
+        f.AssertDrainedSuccess(first);
+
+        f.StartMove({ NewGroup });
+        const auto refused = f.DriveGate(20);
+        UNIT_ASSERT(refused);
+        UNIT_ASSERT_VALUES_EQUAL((int)refused->Get()->Record.GetStatus(), (int)NKikimrTabletBase::TEvMoveDataResponse::ErrorGroupIdMismatch);
+
+        f.StartMove();
+        const auto next = f.DriveGateWithWrite(150, 3, 1001, 1002);
+        UNIT_ASSERT_C(next, "a completed or refused request must not prevent another session in the same incarnation");
+        f.AssertDrainedSuccess(next);
+        UNIT_ASSERT_VALUES_EQUAL(f.ReadRows(), 1001u);
+    }
+
     // A group still holding the latest history entry keeps taking writes and can never converge, so refuse it like keyvalue does.
     Y_UNIT_TEST(MoveDataRejectsAGroupStillTakingWrites) {
         TMoveDataFixture f;
@@ -618,6 +642,54 @@ Y_UNIT_TEST_SUITE(TColumnShardMoveDataE2E) {
         response = f.DriveGateWithWrite(200, 4, 3000, 3001);
         UNIT_ASSERT_C(response, "no Success after the first GC round of the incarnation committed");
         f.AssertDrainedSuccess(response);
+    }
+
+    Y_UNIT_TEST(MoveDataDrainAllowsHistoryCutAfterRestart) {
+        TMoveDataFixture f;
+        f.Controller->DisableBackground(EBackground::TTL);
+        f.Runtime.GetAppData().FeatureFlags.SetEnableCutHistory(true);
+        f.Runtime.GetAppData().FeatureFlags.SetEnableColumnshardCutHistory(true);
+        f.Runtime.SetScheduledEventFilter([](TTestActorRuntimeBase& r, TAutoPtr<IEventHandle>& event, TDuration delay, TInstant& deadline) {
+            if (event->GetTypeRewrite() == TEvPrivate::EvMoveDataWakeup ||
+                event->GetTypeRewrite() == TEvPrivate::EvContinueFindEmptyHistoryIntervals) {
+                return false;
+            }
+            return TTestActorRuntime::DefaultScheduledFilterFunc(r, event, delay, deadline);
+        });
+        THashSet<ui32> populatedChannels;
+        THashSet<ui32> cutChannels;
+        auto observer = f.Runtime.AddObserver<TEvTablet::TEvCutTabletHistory>([&](TEvTablet::TEvCutTabletHistory::TPtr& ev) {
+            const auto& record = ev->Get()->Record;
+            if (populatedChannels.contains(record.GetChannel()) && record.GetFromGeneration() == 0) {
+                UNIT_ASSERT_VALUES_EQUAL(record.GetGroupID(), OldGroup);
+                for (const auto& id : LivePortionBlobs(*f.OldGroupProxy, TabletId)) {
+                    UNIT_ASSERT_C(id.Channel() != record.GetChannel(), "cut history still contains live portion blobs");
+                }
+                cutChannels.emplace(record.GetChannel());
+                ev.Reset();
+            }
+        });
+        f.Write(1, 0, 1000);
+        f.Controller->WaitCompactions(TDuration::Seconds(10));
+        for (const auto& id : LivePortionBlobs(*f.OldGroupProxy, TabletId)) {
+            populatedChannels.emplace(id.Channel());
+        }
+        UNIT_ASSERT(!populatedChannels.empty());
+        f.ReassignPastWrittenData();
+
+        f.StartMove();
+        const auto response = f.DriveGateWithWrite(150, 2, 1000, 1001);
+        UNIT_ASSERT_C(response, "MoveData must drain the historical group");
+        f.AssertDrainedSuccess(response);
+        cutChannels.clear();
+
+        f.Restart();
+        for (ui32 i = 0; i < 60 && cutChannels.size() < populatedChannels.size(); ++i) {
+            Wakeup(f.Runtime, f.Sender, TabletId);
+            f.Runtime.DispatchEvents({}, TDuration::Seconds(1));
+        }
+        UNIT_ASSERT_VALUES_EQUAL_C(cutChannels.size(), populatedChannels.size(), "the next boot must cut the channels drained by MoveData");
+        UNIT_ASSERT_VALUES_EQUAL(f.ReadRows(), 1000u);
     }
 
     // MoveData must rewrite index blobs (InheritPortionStorage=false) left in BlobStorage by a tiered portion.
