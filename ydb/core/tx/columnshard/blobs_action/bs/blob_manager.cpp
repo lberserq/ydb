@@ -9,8 +9,6 @@
 
 #include <util/generic/algorithm.h>
 
-#include <algorithm>
-
 #define YDB_LOG_THIS_FILE_COMPONENT NKikimrServices::TX_COLUMNSHARD_BLOBS_BS
 
 namespace NKikimr::NOlap {
