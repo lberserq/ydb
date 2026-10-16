@@ -2019,8 +2019,7 @@ STFUNC(TColumnShard::StateWork) {
         HFunc(TEvPrivate::TEvUpdateChannelApproximateFreeSpace, Handle);
         HFunc(TEvPrivate::TEvStartCompaction, Handle);
         HFunc(TEvPrivate::TEvMetadataAccessorsInfo, Handle);
-        HFunc(TEvPrivate::TEvContinueFindEmptyHistoryIntervals, Handle);
-        HFunc(TEvPrivate::TEvFindEmptyHistoryIntervalsPortionsReady, Handle);
+        HFunc(TEvFindEmptyHistoryIntervals::TEvScanFinished, Handle);
         HFunc(NPrivateEvents::NWrite::TEvWritePortionResult, Handle);
 
         HFunc(TEvMediatorTimecast::TEvRegisterTabletResult, Handle);
