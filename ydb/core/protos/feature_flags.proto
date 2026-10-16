@@ -453,6 +453,7 @@ message TFeatureFlags {
     // Enables configuring column-table TTL on DyNumber, Date32, Datetime64 and Timestamp64.
     // Existing TTL settings continue to execute when the flag is disabled.
     optional bool EnableColumnShardExtendedTtlTypes = 366 [default = false];
-    // Tablets report their memory through Local to the memory controller and get a zone and a share back
+    // Enables executor owner-memory reports and feedback callbacks.
+    // Integration with the memory controller also requires a tablet memory host in Local.
     optional bool EnableTabletMemoryHost = 367 [default = false];
 }
