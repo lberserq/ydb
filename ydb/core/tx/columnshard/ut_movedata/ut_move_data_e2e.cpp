@@ -671,7 +671,7 @@ Y_UNIT_TEST_SUITE(TColumnShardMoveDataE2E) {
         f.Runtime.GetAppData().FeatureFlags.SetEnableColumnshardCutHistory(true);
         f.Runtime.SetScheduledEventFilter([](TTestActorRuntimeBase& r, TAutoPtr<IEventHandle>& event, TDuration delay, TInstant& deadline) {
             if (event->GetTypeRewrite() == TEvPrivate::EvMoveDataWakeup ||
-                event->GetTypeRewrite() == TEvPrivate::EvContinueFindEmptyHistoryIntervals) {
+                event->GetTypeRewrite() == TEvColumnShard::EvFindEmptyHistoryIntervalsContinue) {
                 return false;
             }
             return TTestActorRuntime::DefaultScheduledFilterFunc(r, event, delay, deadline);
