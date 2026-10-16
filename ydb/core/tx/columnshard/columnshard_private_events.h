@@ -33,8 +33,6 @@ class TGlobalColumnAddress;
 
 namespace NKikimr::NColumnShard {
 
-class TColumnShard;
-
 struct TEvPrivate {
     enum EEv {
         EvIndexing = EventSpaceBegin(TEvents::ES_PRIVATE),
@@ -106,14 +104,10 @@ struct TEvPrivate {
     static_assert(EvEnd < EventSpaceEnd(TEvents::ES_PRIVATE), "expect EvEnd < EventSpaceEnd(TEvents::ES_PRIVATE)");
 
     class TEvMetadataAccessorsInfo: public NActors::TEventLocal<TEvMetadataAccessorsInfo, EvMetadataAccessorsInfo> {
-    public:
-        using TOnApplied = void (*)(TColumnShard&, const NActors::TActorContext&);
-
     private:
         const std::shared_ptr<NOlap::IMetadataAccessorResultProcessor> Processor;
         const ui64 Generation;
         std::optional<NOlap::NResourceBroker::NSubscribe::TResourceContainer<NOlap::TDataAccessorsResult>> Result;
-        TOnApplied OnApplied;
 
     public:
         const std::shared_ptr<NOlap::IMetadataAccessorResultProcessor>& GetProcessor() const {
@@ -124,12 +118,6 @@ struct TEvPrivate {
             return Generation;
         }
 
-        void NotifyApplied(TColumnShard& tablet, const NActors::TActorContext& ctx) const {
-            if (OnApplied) {
-                OnApplied(tablet, ctx);
-            }
-        }
-
         NOlap::NResourceBroker::NSubscribe::TResourceContainer<NOlap::TDataAccessorsResult> ExtractResult() {
             AFL_VERIFY(Result);
             auto result = std::move(*Result);
@@ -138,11 +126,10 @@ struct TEvPrivate {
         }
 
         TEvMetadataAccessorsInfo(const std::shared_ptr<NOlap::IMetadataAccessorResultProcessor>& processor, const ui64 gen,
-            NOlap::NResourceBroker::NSubscribe::TResourceContainer<NOlap::TDataAccessorsResult>&& result, TOnApplied onApplied = nullptr)
+            NOlap::NResourceBroker::NSubscribe::TResourceContainer<NOlap::TDataAccessorsResult>&& result)
             : Processor(processor)
             , Generation(gen)
             , Result(std::move(result))
-            , OnApplied(onApplied)
         {
         }
     };
