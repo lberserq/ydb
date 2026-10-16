@@ -1696,14 +1696,21 @@ public:
         YDB_LOG_CREATE_CONTEXT(
             {"event", "TTxAskPortionChunks::Execute"});
         for (auto&& i : PortionsByPath) {
-            const auto& granule = Self->GetIndexAs<NOlap::TColumnEngineForLogs>().GetGranuleVerified(i.first);
+            const auto granule = Self->GetIndexAs<NOlap::TColumnEngineForLogs>().GetGranuleOptional(i.first);
+            if (!granule) {
+                // A captured path can disappear before this request or between transaction retries.
+                EraseNodesIf(Constructors, [&](const auto& item) {
+                    return item.second.GetPortionInfo()->GetPathId() == i.first;
+                });
+                continue;
+            }
             for (auto&& c : i.second.GetConsumers()) {
                 YDB_LOG_CREATE_CONTEXT(
                     {"consumer", c.first},
                     {"pathId", i.first});
                 YDB_LOG_TRACE_COMP(NKikimrServices::TX_COLUMNSHARD, "Dump size",
                     {"size", c.second.GetPortionsCount()});
-                for (auto&& portion : c.second.GetPortions(granule)) {
+                for (auto&& portion : c.second.GetPortions(*granule)) {
                     const ui64 p = portion->GetPortionId();
                     const NOlap::TPortionAddress pAddress = portion->GetAddress();
                     auto itPortionConstructor = Constructors.find(pAddress);
