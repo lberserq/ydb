@@ -31,9 +31,13 @@ namespace NKikimr {
             ui64 AllocatorCachesMemory;
 
             /**
-             * @brief Number of cached bytes the allocator can return to the OS on request
+             * @brief Estimated cached bytes eligible for release to the OS.
+             *
+             * For tcmalloc this is free backed page-heap memory, excluding object caches.
+             * Release is best-effort: this is not a promised RSS reduction.
+             * Allocators without a supported estimate report zero.
              */
-            ui64 ReclaimableMemory;
+            ui64 AllocatorReclaimableBytes;
         };
 
         virtual ~IAllocState() = default;

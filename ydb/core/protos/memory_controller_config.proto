@@ -33,10 +33,10 @@ message TMemoryControllerConfig {
     // so caches do not grow into memory the allocator still holds.
     optional bool RssAwareBudget = 140 [default = false];
     optional uint64 RssBudgetSlackBytes = 141 [default = 536870912];
-    // Release allocator caches to the OS in the same tick when AnonRss exceeds the soft limit.
+    // Request best-effort allocator release in the same tick when AnonRss exceeds the soft limit.
     optional bool ReleaseAllocatorCachesOnPressure = 142 [default = false];
-    // Smallest release request: a smaller one is served by the allocator's huge page cache alone.
+    // Minimum nonzero request before applying the reclaimable estimate and per-tick cap.
     optional uint64 MinAllocatorCachesReleaseBytes = 143 [default = 67108864];
-    // Largest release request of a single tick: the allocator releases synchronously.
+    // Maximum requested bytes per tick; actual release size and call duration may differ.
     optional uint64 MaxAllocatorCachesReleaseBytes = 144 [default = 268435456];
 }

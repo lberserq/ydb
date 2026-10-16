@@ -409,7 +409,7 @@ Y_UNIT_TEST(RssAwareBudget) {
     // rss above soft limit while allocated is low: caches are cut and allocator caches get released
     server->ProcessMemoryInfo->AnonRss = 180_MB;
     server->ProcessMemoryInfo->AllocatorCachesMemory = 50_MB;
-    server->ProcessMemoryInfo->AllocatorCachesReclaimable = 50_MB;
+    server->ProcessMemoryInfo->AllocatorReclaimableBytes = 50_MB;
     runtime.SimulateSleep(TDuration::Seconds(2));
     UNIT_ASSERT_VALUES_EQUAL(sharedCacheLimit->Val(), 0);
     UNIT_ASSERT_VALUES_EQUAL(rssExcess->Val(), 140_MB);
@@ -438,7 +438,7 @@ Y_UNIT_TEST(RssAwareBudget_Disabled) {
     server->ProcessMemoryInfo->AllocatedMemory = 30_MB;
     server->ProcessMemoryInfo->AnonRss = 180_MB;
     server->ProcessMemoryInfo->AllocatorCachesMemory = 50_MB;
-    server->ProcessMemoryInfo->AllocatorCachesReclaimable = 50_MB;
+    server->ProcessMemoryInfo->AllocatorReclaimableBytes = 50_MB;
     runtime.SimulateSleep(TDuration::Seconds(2));
     UNIT_ASSERT_DOUBLES_EQUAL(server->MemoryControllerCounters->GetCounter("Consumer/SharedCache/Limit")->Val(), static_cast<i64>(66_MB), static_cast<i64>(1_MB));
     UNIT_ASSERT_VALUES_EQUAL(server->MemoryControllerCounters->GetCounter("Stats/RssExcess")->Val(), 0);
@@ -462,7 +462,7 @@ Y_UNIT_TEST(RssAwareBudget_BudgetOnly) {
     server->ProcessMemoryInfo->AllocatedMemory = 30_MB;
     server->ProcessMemoryInfo->AnonRss = 180_MB;
     server->ProcessMemoryInfo->AllocatorCachesMemory = 50_MB;
-    server->ProcessMemoryInfo->AllocatorCachesReclaimable = 50_MB;
+    server->ProcessMemoryInfo->AllocatorReclaimableBytes = 50_MB;
     runtime.SimulateSleep(TDuration::Seconds(2));
     UNIT_ASSERT_VALUES_EQUAL(server->MemoryControllerCounters->GetCounter("Consumer/SharedCache/Limit")->Val(), 0);
     UNIT_ASSERT_VALUES_EQUAL(server->MemoryControllerCounters->GetCounter("Stats/RssExcess")->Val(), 140_MB);
@@ -486,7 +486,7 @@ Y_UNIT_TEST(RssAwareBudget_ReleaseOnly) {
     server->ProcessMemoryInfo->AllocatedMemory = 30_MB;
     server->ProcessMemoryInfo->AnonRss = 180_MB;
     server->ProcessMemoryInfo->AllocatorCachesMemory = 50_MB;
-    server->ProcessMemoryInfo->AllocatorCachesReclaimable = 50_MB;
+    server->ProcessMemoryInfo->AllocatorReclaimableBytes = 50_MB;
     runtime.SimulateSleep(TDuration::Seconds(2));
     UNIT_ASSERT_DOUBLES_EQUAL(server->MemoryControllerCounters->GetCounter("Consumer/SharedCache/Limit")->Val(), static_cast<i64>(66_MB), static_cast<i64>(1_MB));
     UNIT_ASSERT_VALUES_EQUAL(server->MemoryControllerCounters->GetCounter("Stats/RssExcess")->Val(), 0);
@@ -522,20 +522,20 @@ Y_UNIT_TEST(RssAwareBudget_Bounds) {
     // release is capped by what the allocator actually holds
     server->ProcessMemoryInfo->AnonRss = 250_MB;
     server->ProcessMemoryInfo->AllocatorCachesMemory = 20_MB;
-    server->ProcessMemoryInfo->AllocatorCachesReclaimable = 20_MB;
+    server->ProcessMemoryInfo->AllocatorReclaimableBytes = 20_MB;
     runtime.SimulateSleep(TDuration::Seconds(2));
     UNIT_ASSERT_VALUES_EQUAL(releaseRequested->Val(), 20_MB);
 
     // nothing cached by the allocator: nothing to release even under pressure
     server->ProcessMemoryInfo->AllocatorCachesMemory = 0;
-    server->ProcessMemoryInfo->AllocatorCachesReclaimable = 0;
+    server->ProcessMemoryInfo->AllocatorReclaimableBytes = 0;
     runtime.SimulateSleep(TDuration::Seconds(2));
     UNIT_ASSERT_VALUES_EQUAL(releaseRequested->Val(), 0);
 
     // exactly at the soft limit: no release (strict comparison)
     server->ProcessMemoryInfo->AnonRss = 150_MB;
     server->ProcessMemoryInfo->AllocatorCachesMemory = 50_MB;
-    server->ProcessMemoryInfo->AllocatorCachesReclaimable = 50_MB;
+    server->ProcessMemoryInfo->AllocatorReclaimableBytes = 50_MB;
     runtime.SimulateSleep(TDuration::Seconds(2));
     UNIT_ASSERT_VALUES_EQUAL(releaseRequested->Val(), 0);
     server->ProcessMemoryInfo->AnonRss = 150_MB + 1;
@@ -563,13 +563,13 @@ Y_UNIT_TEST(ReleaseIsCappedByReclaimablePart) {
     server->ProcessMemoryInfo->AllocatedMemory = 30_MB;
     server->ProcessMemoryInfo->AnonRss = 180_MB;
     server->ProcessMemoryInfo->AllocatorCachesMemory = 50_MB;
-    server->ProcessMemoryInfo->AllocatorCachesReclaimable = 10_MB;
+    server->ProcessMemoryInfo->AllocatorReclaimableBytes = 10_MB;
     runtime.SimulateSleep(TDuration::Seconds(2));
     UNIT_ASSERT_VALUES_EQUAL(reclaimable->Val(), 10_MB);
     UNIT_ASSERT_VALUES_EQUAL(releaseRequested->Val(), 10_MB);
 
     // nothing reclaimable: no request at all, however large the caches are
-    server->ProcessMemoryInfo->AllocatorCachesReclaimable = 0;
+    server->ProcessMemoryInfo->AllocatorReclaimableBytes = 0;
     runtime.SimulateSleep(TDuration::Seconds(2));
     UNIT_ASSERT_VALUES_EQUAL(reclaimable->Val(), 0);
     UNIT_ASSERT_VALUES_EQUAL(releaseRequested->Val(), 0);
@@ -594,7 +594,7 @@ Y_UNIT_TEST(ReleaseRequestReachesPastTheHugePageCache) {
     server->ProcessMemoryInfo->AllocatedMemory = 30_MB;
     server->ProcessMemoryInfo->AnonRss = 151_MB;
     server->ProcessMemoryInfo->AllocatorCachesMemory = 90_MB;
-    server->ProcessMemoryInfo->AllocatorCachesReclaimable = 90_MB;
+    server->ProcessMemoryInfo->AllocatorReclaimableBytes = 90_MB;
     runtime.SimulateSleep(TDuration::Seconds(2));
     UNIT_ASSERT_VALUES_EQUAL(releaseRequested->Val(), 64_MB);
 
@@ -623,7 +623,7 @@ Y_UNIT_TEST(ReleaseFloorNeverExceedsTheCachedBytes) {
     server->ProcessMemoryInfo->AllocatedMemory = 30_MB;
     server->ProcessMemoryInfo->AnonRss = 180_MB;
     server->ProcessMemoryInfo->AllocatorCachesMemory = 50_MB;
-    server->ProcessMemoryInfo->AllocatorCachesReclaimable = 10_MB;
+    server->ProcessMemoryInfo->AllocatorReclaimableBytes = 10_MB;
     runtime.SimulateSleep(TDuration::Seconds(2));
     UNIT_ASSERT_VALUES_EQUAL(releaseRequested->Val(), 10_MB);
 }
@@ -648,7 +648,7 @@ Y_UNIT_TEST(ReleaseIsBoundedPerTick) {
     server->ProcessMemoryInfo->AllocatedMemory = 30_MB;
     server->ProcessMemoryInfo->AnonRss = 230_MB;
     server->ProcessMemoryInfo->AllocatorCachesMemory = 90_MB;
-    server->ProcessMemoryInfo->AllocatorCachesReclaimable = 90_MB;
+    server->ProcessMemoryInfo->AllocatorReclaimableBytes = 90_MB;
     runtime.SimulateSleep(TDuration::Seconds(2));
     UNIT_ASSERT_VALUES_EQUAL(releaseRequested->Val(), 32_MB);
 }
@@ -700,7 +700,7 @@ Y_UNIT_TEST(RssAwareBudget_ConfigHotReload) {
     server->ProcessMemoryInfo->AllocatedMemory = 30_MB;
     server->ProcessMemoryInfo->AnonRss = 180_MB;
     server->ProcessMemoryInfo->AllocatorCachesMemory = 50_MB;
-    server->ProcessMemoryInfo->AllocatorCachesReclaimable = 50_MB;
+    server->ProcessMemoryInfo->AllocatorReclaimableBytes = 50_MB;
     runtime.SimulateSleep(TDuration::Seconds(2));
     UNIT_ASSERT_DOUBLES_EQUAL(sharedCacheLimit->Val(), static_cast<i64>(66_MB), static_cast<i64>(1_MB));
     UNIT_ASSERT_VALUES_EQUAL(releaseRequested->Val(), 0);
@@ -767,7 +767,7 @@ Y_UNIT_TEST(RssAwareBudget_ReleasesPageHeap) {
     server->ProcessMemoryInfo->AllocatedMemory = 30_MB;
     server->ProcessMemoryInfo->AnonRss = 150_MB + parked;
     server->ProcessMemoryInfo->AllocatorCachesMemory = parked;
-    server->ProcessMemoryInfo->AllocatorCachesReclaimable = parked;
+    server->ProcessMemoryInfo->AllocatorReclaimableBytes = parked;
     runtime.SimulateSleep(TDuration::Seconds(2));
     UNIT_ASSERT_VALUES_EQUAL(server->MemoryControllerCounters->GetCounter("Stats/AllocatorCachesReleaseRequested")->Val(), parked);
     const ui64 afterRelease = *pageHeapFree();

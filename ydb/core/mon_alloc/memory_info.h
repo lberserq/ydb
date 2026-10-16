@@ -7,7 +7,8 @@ namespace NKikimr::NMemory {
 struct TProcessMemoryInfo {
     ui64 AllocatedMemory;
     ui64 AllocatorCachesMemory;
-    ui64 AllocatorCachesReclaimable;
+    // Allocator estimate of cached bytes eligible for release; actual released bytes may differ.
+    ui64 AllocatorReclaimableBytes;
     std::optional<ui64> AnonRss;
     std::optional<ui64> CGroupLimit;
     std::optional<ui64> MemTotal;

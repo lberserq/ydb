@@ -427,10 +427,11 @@ private:
         ui64 releaseBytes = 0;
         if (Config.GetReleaseAllocatorCachesOnPressure() && processMemoryInfo.AnonRss.has_value()
                 && processMemoryInfo.AnonRss.value() > softLimitBytes) {
-            ui64 reclaimableBytes = processMemoryInfo.AllocatorCachesReclaimable;
+            ui64 reclaimableBytes = processMemoryInfo.AllocatorReclaimableBytes;
             releaseBytes = Min(reclaimableBytes, processMemoryInfo.AnonRss.value() - softLimitBytes);
             if (releaseBytes) {
-                // ask past the huge page cache, but never for more than is cached or fits in one tick
+                // The floor helps reach beyond the huge page cache; cap the requested bytes.
+                // Actual release size and synchronous call duration are allocator-dependent.
                 releaseBytes = Min(Max(releaseBytes, Config.GetMinAllocatorCachesReleaseBytes()),
                     Min(reclaimableBytes, Config.GetMaxAllocatorCachesReleaseBytes()));
                 tcmalloc::MallocExtension::ReleaseMemoryToSystem(releaseBytes);
@@ -465,7 +466,7 @@ private:
             {"memAvailable", HumanReadableBytes(processMemoryInfo.MemAvailable)},
             {"allocatedMemory", HumanReadableBytes(processMemoryInfo.AllocatedMemory)},
             {"allocatorCachesMemory", HumanReadableBytes(processMemoryInfo.AllocatorCachesMemory)},
-            {"allocatorCachesReclaimable", HumanReadableBytes(processMemoryInfo.AllocatorCachesReclaimable)},
+            {"allocatorCachesReclaimable", HumanReadableBytes(processMemoryInfo.AllocatorReclaimableBytes)},
             {"hardLimit", HumanReadableBytes(hardLimitBytes)},
             {"softLimit", HumanReadableBytes(softLimitBytes)},
             {"targetUtilization", HumanReadableBytes(targetUtilizationBytes)},
@@ -486,7 +487,7 @@ private:
         Counters->GetCounter("Stats/MemMapsCount")->Set(GetMemoryMapsCountOrZero());
         Counters->GetCounter("Stats/AllocatedMemory")->Set(processMemoryInfo.AllocatedMemory);
         Counters->GetCounter("Stats/AllocatorCachesMemory")->Set(processMemoryInfo.AllocatorCachesMemory);
-        Counters->GetCounter("Stats/AllocatorCachesReclaimable")->Set(processMemoryInfo.AllocatorCachesReclaimable);
+        Counters->GetCounter("Stats/AllocatorCachesReclaimable")->Set(processMemoryInfo.AllocatorReclaimableBytes);
         Counters->GetCounter("Stats/HardLimit")->Set(hardLimitBytes);
         Counters->GetCounter("Stats/SoftLimit")->Set(softLimitBytes);
         Counters->GetCounter("Stats/TargetUtilization")->Set(targetUtilizationBytes);

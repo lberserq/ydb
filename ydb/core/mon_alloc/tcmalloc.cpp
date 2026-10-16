@@ -508,6 +508,8 @@ public:
 
         ui64 used = GetProperty(properties, "generic.physical_memory_used");
         ui64 caches = GetCachesSize(properties);
+        // Free backed page-heap bytes; CPU/thread/transfer/central object caches are excluded.
+        // ReleaseMemoryToSystem is best-effort, so this is an estimate for request sizing.
         ui64 pageHeapFree = GetProperty(properties, "tcmalloc.page_heap_free");
 
         return {
