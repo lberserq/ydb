@@ -1716,14 +1716,18 @@ public:
         YDB_LOG_CREATE_CONTEXT(
             {"event", "TTxAskPortionChunks::Execute"});
         for (auto&& i : PortionsByPath) {
-            const auto& granule = Self->GetIndexAs<NOlap::TColumnEngineForLogs>().GetGranuleVerified(i.first);
+            const auto granule = Self->GetIndexAs<NOlap::TColumnEngineForLogs>().GetGranuleOptional(i.first);
+            // A table may be dropped after an asynchronous metadata request was queued.
+            if (!granule) {
+                continue;
+            }
             for (auto&& c : i.second.GetConsumers()) {
                 YDB_LOG_CREATE_CONTEXT(
                     {"consumer", c.first},
                     {"pathId", i.first});
                 YDB_LOG_TRACE_COMP(NKikimrServices::TX_COLUMNSHARD, "Dump size",
                     {"size", c.second.GetPortionsCount()});
-                for (auto&& portion : c.second.GetPortions(granule)) {
+                for (auto&& portion : c.second.GetPortions(*granule)) {
                     const ui64 p = portion->GetPortionId();
                     const NOlap::TPortionAddress pAddress = portion->GetAddress();
                     auto itPortionConstructor = Constructors.find(pAddress);
@@ -2035,8 +2039,7 @@ STFUNC(TColumnShard::StateWork) {
         HFunc(TEvPrivate::TEvUpdateChannelApproximateFreeSpace, Handle);
         HFunc(TEvPrivate::TEvStartCompaction, Handle);
         HFunc(TEvPrivate::TEvMetadataAccessorsInfo, Handle);
-        HFunc(TEvPrivate::TEvContinueFindEmptyHistoryIntervals, Handle);
-        HFunc(TEvPrivate::TEvFindEmptyHistoryIntervalsPortionsReady, Handle);
+        HFunc(TEvFindEmptyHistoryIntervals::TEvScanFinished, Handle);
         HFunc(NPrivateEvents::NWrite::TEvWritePortionResult, Handle);
 
         HFunc(TEvMediatorTimecast::TEvRegisterTabletResult, Handle);
