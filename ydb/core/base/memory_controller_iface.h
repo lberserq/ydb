@@ -17,6 +17,8 @@ enum class EMemoryConsumerKind {
     ColumnTablesColumnDataCache,
     ColumnTablesDeduplicationGroupedMemory,
     ColumnTablesPortionsMetaDataCache,
+
+    QueryExecution,
 };
 
 // Tablet admission policy: Green admits, Yellow limits running bytes with idle progress, Red admits one at a time
