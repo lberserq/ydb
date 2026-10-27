@@ -30,7 +30,7 @@ enum class EAdmitResult {
     Duplicate,
 };
 
-// Gates memory-charged items in FIFO order: Yellow reuses a byte ceiling with idle progress; Red runs one at a time
+// Gates memory-charged items in FIFO order: Yellow limits running bytes with idle progress; Red runs one at a time
 // One admission belongs to one tablet and runs only in that tablet's actor context, so it takes no locks by design
 template <class TItem, class TOwner>
 class TMemoryAdmission {
@@ -89,9 +89,9 @@ public:
             return;
         }
         Zone = zone;
-        // Snapshot running bytes on each zone transition. Yellow reuses this ceiling;
-        // a later idle start may raise it to that request's charge.
-        Watermark = RunningBytes;
+        // Yellow uses the running-byte snapshot taken on entry as its admission ceiling.
+        // Starting a request while idle may raise it to that request's charge.
+        YellowRunningBytesCeiling = RunningBytes;
         Drain();
     }
 
@@ -116,7 +116,7 @@ private:
             case EMemoryZone::Green:
                 return true;
             case EMemoryZone::Yellow:
-                return RunningCount == 0 || (charge <= Watermark && RunningBytes <= Watermark - charge);
+                return RunningCount == 0 || (charge <= YellowRunningBytesCeiling && RunningBytes <= YellowRunningBytesCeiling - charge);
             case EMemoryZone::Red:
                 return RunningCount == 0;
         }
@@ -126,7 +126,7 @@ private:
     void Run(ui64 uid, TItem&& item, ui64 charge, EAdmitSource source) {
         // An idle start in Yellow may raise its ceiling; it never lowers it.
         if (Zone == EMemoryZone::Yellow && RunningCount == 0) {
-            Watermark = Max(Watermark, charge);
+            YellowRunningBytesCeiling = Max(YellowRunningBytesCeiling, charge);
         }
         RunningBytes += charge;
         ++RunningCount;
@@ -153,7 +153,7 @@ private:
     TOwner& Owner; // starts what the gate lets through: StartAdmitted(TItem&&, EAdmitSource)
 
     EMemoryZone Zone = EMemoryZone::Green;
-    ui64 Watermark = 0;
+    ui64 YellowRunningBytesCeiling = 0; // applies to RunningBytes, excluding queued bytes
     ui64 RunningBytes = 0;
     ui64 RunningCount = 0;
     ui64 PostponedBytes = 0;

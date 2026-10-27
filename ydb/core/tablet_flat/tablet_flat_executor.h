@@ -520,10 +520,11 @@ namespace NFlatExecutorSetup {
         // memory usage excluding transactions and executor cache.
         virtual ui64 GetMemoryUsage() const { return 50 << 10; }
 
-        // the requests the tablet holds back or runs under its memory admission; zeros when it has none
+        // Override when the tablet uses memory admission; the default reports no running or queued charges.
         virtual NMemory::TMemoryAdmissionStats GetMemoryAdmissionStats() const { return {}; }
 
-        // the tablet's own bytes for the memory controller; memtable and pinned pages report under other kinds
+        // Owner memory only; memtables and pinned pages report under other consumer kinds.
+        // The default reports Demand == Used and Reclaimable == 0. Override for elastic memory.
         virtual NMemory::TConsumerReport GetMemoryReport() const {
             const ui64 used = GetMemoryUsage() + GetMemoryAdmissionStats().HeldBytes();
             return {.Used = used, .Demand = used, .Reclaimable = 0};
@@ -532,7 +533,7 @@ namespace NFlatExecutorSetup {
         // called in the tablet's context when the node zone changed
         virtual void OnMemoryZone(NMemory::EMemoryZone) { /* default */ }
 
-        // keep the reclaimable part at or below shareBytes: a tablet that reports Reclaimable > 0 promises to honor it
+        // Byte budget for the owner's elastic memory. Owners reporting Reclaimable > 0 must honor it.
         virtual void OnMemoryLimit(ui64 /* shareBytes */) { /* default */ }
         // A withdrawn elastic allocation is zeroed first, then its optional share is cleared.
         virtual void OnMemoryLimitCleared() { /* default */ }

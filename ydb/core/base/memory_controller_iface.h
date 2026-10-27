@@ -21,7 +21,7 @@ enum class EMemoryConsumerKind {
     QueryExecution,
 };
 
-// Node memory pressure as the tablets see it: Green admits, Yellow forbids growth, Red admits one at a time
+// Tablet admission policy: Green admits, Yellow limits running bytes with idle progress, Red admits one at a time
 enum class EMemoryZone : ui8 {
     Green,
     Yellow,
@@ -95,10 +95,10 @@ struct TEvConsumerLimit : public TEventLocal<TEvConsumerLimit, EvConsumerLimit> 
     }
 };
 
-// Sent to the executors of the tablets a Local runs
+// Feedback delivered to tablet executors by Local when a tablet memory host is installed
 struct TEvMemoryZone : public TEventLocal<TEvMemoryZone, EvMemoryZone> {
     const EMemoryZone Zone;
-    // Set when the tablet reported a reclaimable part: how much of it it may keep
+    // Optional byte budget for the owner's elastic memory; zero is a valid budget.
     const std::optional<ui64> Share;
     const bool ClearShare;
 

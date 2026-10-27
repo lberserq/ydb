@@ -460,6 +460,7 @@ message TFeatureFlags {
     optional bool EnableComputeSchedulerMemory = 370 [default = true, (RequireRestart) = true];
     optional bool EnableAddColumnGeneratedVirtual = 371 [default = false];
     optional bool EnableAddColumnGeneratedStored = 372 [default = false];
-    // Tablets report their memory through Local to the memory controller and get a zone and a share back
+    // Enables executor owner-memory reports and feedback callbacks.
+    // Integration with the memory controller also requires a tablet memory host in Local.
     optional bool EnableTabletMemoryHost = 373 [default = false];
 }
