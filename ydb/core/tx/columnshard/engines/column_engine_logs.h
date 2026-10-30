@@ -67,6 +67,7 @@ private:
     TVersionedPresetSchemas VersionedSchemas;
 
     void InitDerivedState();
+    void RegisterSchemaVersion(const TSnapshot& snapshot, TObjectCache<TSchemaVersionId, TIndexInfo>::TEntryGuard&& indexInfo);
 
 public:
     NMonitoring::TDynamicCounters::TCounterPtr GetBadPortionsCounter() const {
@@ -202,7 +203,6 @@ public:
     virtual bool ApplyChangesOnExecute(
         IDbWrapper& db, std::shared_ptr<TColumnEngineChanges> indexChanges, const TSnapshot& snapshot) noexcept override;
 
-    void RegisterSchemaVersion(const TSnapshot& snapshot, TIndexInfo&& info) override;
     void RegisterSchemaVersion(const TSnapshot& snapshot, const ui64 presetId, const TSchemaVersionView& schema) override;
     void RegisterOldSchemaVersion(const TSnapshot& snapshot, const ui64 presetId, const TSchemaVersionView& schema) override;
 
