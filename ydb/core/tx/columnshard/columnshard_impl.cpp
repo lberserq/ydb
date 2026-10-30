@@ -1719,6 +1719,7 @@ public:
             const auto granule = Self->GetIndexAs<NOlap::TColumnEngineForLogs>().GetGranuleOptional(i.first);
             // A table may be dropped after an asynchronous metadata request was queued.
             if (!granule) {
+                AFL_VERIFY(!Self->GetTablesManager().HasTable(i.first))("path_id", i.first);
                 continue;
             }
             for (auto&& c : i.second.GetConsumers()) {
@@ -1736,18 +1737,22 @@ public:
                         itPortionConstructor = Constructors.emplace(pAddress, std::move(constructor)).first;
                     } else if (itPortionConstructor->second.IsReady()) {
                         continue;
+                    } else {
+                        // Cleanup may remove metadata between retries of an incomplete constructor.
+                        itPortionConstructor->second = TPortionConstructorV2(portion);
                     }
                     if (!itPortionConstructor->second.HasRecords()) {
                         auto rowset = db.Table<NColumnShard::Schema::IndexColumnsV2>().Key(i.first.GetRawValue(), p).Select();
                         if (!rowset.IsReady()) {
                             reask = true;
-                        } else if (rowset.EndOfSet()) {
-                            // Metadata scans can see retired portions between cleanup Execute (DB erase) and Complete (PortionInfo erase).
-                            AFL_VERIFY(itPortionConstructor->second.GetPortionInfo()->HasRemoveSnapshot())("path_id", i.first)("portion_id", p)(
-                                "debug", itPortionConstructor->second.GetPortionInfo()->DebugString(true));
-                            Constructors.erase(itPortionConstructor);
-                            continue;
                         } else {
+                            if (rowset.EndOfSet()) {
+                                // Cleanup erases persisted metadata before removing PortionInfo in Complete.
+                                AFL_VERIFY(portion->HasRemoveSnapshot() || !Self->GetTablesManager().HasTable(i.first))
+                                ("path_id", i.first)("portion_id", p)("debug", portion->DebugString(true));
+                                Constructors.erase(pAddress);
+                                continue;
+                            }
                             NOlap::TColumnChunkLoadContextV2 info(rowset, selector);
                             itPortionConstructor->second.SetRecords(std::move(info));
                         }
@@ -1771,7 +1776,9 @@ public:
                                         localReask = true;
                                     }
                                 }
-                                itPortionConstructor->second.SetIndexes(std::move(indexes));
+                                if (!localReask) {
+                                    itPortionConstructor->second.SetIndexes(std::move(indexes));
+                                }
                             }
                         }
                     }
@@ -1782,12 +1789,12 @@ public:
             return false;
         }
 
-        for (auto&& i : Constructors) {
-            // On retry, GetPortions omits portions removed by cleanup, leaving their unfinished constructors.
-            if (!i.second.IsReady()) {
-                continue;
+        for (auto&& [address, constructor] : Constructors) {
+            const auto granule = Self->GetIndexAs<NOlap::TColumnEngineForLogs>().GetGranuleOptional(address.GetPathId());
+            if (granule && granule->GetPortionOptional(address.GetPortionId(), false)) {
+                AFL_VERIFY(constructor.IsReady())("portion_id", address.GetPortionId());
+                FetchedAccessors.emplace_back(std::move(constructor));
             }
-            FetchedAccessors.emplace_back(std::move(i.second));
         }
 
         YDB_LOG_TRACE_COMP(NKikimrServices::TX_COLUMNSHARD, "Dump stage",
