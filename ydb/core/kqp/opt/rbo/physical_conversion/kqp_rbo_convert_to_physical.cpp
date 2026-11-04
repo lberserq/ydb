@@ -15,12 +15,15 @@
 #include <ydb/core/kqp/opt/peephole/kqp_opt_peephole.h>
 #include <ydb/core/kqp/opt/rbo/kqp_rbo.h>
 #include <ydb/core/kqp/provider/yql_kikimr_settings.h>
+#include <ydb/core/kqp/tracing/kqp_compile_trace.h>
 #include <ydb/library/yql/dq/opt/dq_opt_peephole.h>
 
 #include <yql/essentials/core/yql_expr_optimize.h>
 #include <yql/essentials/core/yql_graph_transformer.h>
 #include <yql/essentials/core/yql_opt_utils.h>
 #include <yql/essentials/utils/log/log.h>
+
+#include <optional>
 
 using namespace NYql::NNodes;
 using namespace NKikimr;
@@ -63,6 +66,9 @@ TVector<ui32> GetUnionAllInputArgumentOrder(TOpUnionAll& unionAll) {
 TExprNode::TPtr ConvertToPhysical(const TVector<TIntrusivePtr<TOpRoot>>& roots, TRBOContext& rboCtx) {
     TExprContext& ctx = rboCtx.ExprCtx;
     ui32 stageInputCounter = 0;
+    TCompileTraceScope traceScope(rboCtx.GetCompileTrace(), TCompileTraceLevels::Phase, "Convert to physical plan");
+    std::optional<TCompileTraceScope> convertOperatorsTraceScope(std::in_place, rboCtx.GetCompileTrace(),
+        TCompileTraceLevels::Step, "Convert operators");
 
     if (rboCtx.NeedToLog()) {
         rboCtx.TraceLog.stage("Physical AST generation");
@@ -413,6 +419,33 @@ TExprNode::TPtr ConvertToPhysical(const TVector<TIntrusivePtr<TOpRoot>>& roots, 
                 stageBodies[opStageId] = currentStageBody;
                 stagePos[opStageId] = op->Pos;
                 YQL_CLOG(TRACE, CoreDq) << "Converted IndexLookupJoin " << opStageId;
+            } else if (op->Kind == EOperator::Sequencer) {
+                auto& sequencer = CastOperator<TOpSequencer>(*op);
+                const auto inputStageId = *sequencer.GetInput()->Props.StageId;
+                TVector<std::pair<TString, TString>> inputRenames;
+                TVector<std::pair<TString, TString>> outputRenames;
+                for (const auto& [id, name] : sequencer.GetInputColumns().Items()) {
+                    inputRenames.emplace_back(names.Get(id), name);
+                    outputRenames.emplace_back(name, names.Get(id));
+                }
+                for (const auto& [id, name] : sequencer.GetGeneratedColumns().Items()) {
+                    outputRenames.emplace_back(name, names.Get(id));
+                }
+                // The existing sequencer connection uses storage column names.
+                // Restore IU names immediately after it so ordinary Maps can
+                // compute expressions that depend on the generated values.
+                stageBodies[inputStageId] = NPhysicalConvertionUtils::TransformStageOutput(stageBodies.at(inputStageId),
+                    [&](const NPhysicalConvertionUtils::TStageBody& body) {
+                        return NPhysicalConvertionUtils::TStageBody::Narrow(
+                            NPhysicalConvertionUtils::BuildRenameMap(body.AsNarrow(ctx), inputRenames, ctx, /*ordered=*/true));
+                    }, GetReplicateOutputIndex(*sequencer.GetInput()), ctx);
+                auto [stageArg, stageInput] = graph.GenerateStageInput(stageInputCounter, op->Pos, ctx);
+                stageArgs[opStageId].push_back(stageArg);
+                auto stream = Build<TCoToStream>(ctx, op->Pos).Input(stageInput).Done().Ptr();
+                currentStageBody = NPhysicalConvertionUtils::TStageBody::Narrow(
+                    NPhysicalConvertionUtils::BuildRenameMap(stream, outputRenames, ctx, /*ordered=*/true));
+                stageBodies[opStageId] = currentStageBody;
+                stagePos[opStageId] = op->Pos;
             } else if (op->Kind == EOperator::TableEffect) {
                 auto& tableEffect = CastOperator<TOpTableEffect>(*op);
 
@@ -445,6 +478,7 @@ TExprNode::TPtr ConvertToPhysical(const TVector<TIntrusivePtr<TOpRoot>>& roots, 
         allStageArgs.push_back(std::move(stageArgs));
         allStagePos.push_back(std::move(stagePos));
     }
+    convertOperatorsTraceScope.reset();
 
     return TPhysicalQueryBuilder(roots, std::move(queryGraphs), std::move(allStages), std::move(allStageArgs), std::move(allStagePos), std::move(allNames), rboCtx).BuildPhysicalQuery();
 

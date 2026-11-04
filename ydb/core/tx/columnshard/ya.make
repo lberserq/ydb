@@ -62,7 +62,6 @@ PEERDIR(
     ydb/core/tx/columnshard/engines/reader/abstract
     ydb/core/tx/columnshard/engines/writer
     ydb/core/tx/columnshard/export
-    ydb/core/tx/columnshard/find_empty_history_intervals
     ydb/core/tx/columnshard/loading
     ydb/core/tx/columnshard/normalizer
     ydb/core/tx/columnshard/operations
@@ -72,6 +71,7 @@ PEERDIR(
     ydb/core/tx/columnshard/splitter
     ydb/core/tx/columnshard/subscriber
     ydb/core/tx/columnshard/tablet
+    ydb/core/tx/columnshard/tablet/cut_history/lib
     ydb/core/tx/columnshard/tracing
     ydb/core/tx/columnshard/transactions
     ydb/core/tx/columnshard/transactions/operators
@@ -110,10 +110,9 @@ RECURSE(
 )
 
 RECURSE_FOR_TESTS(
-    find_empty_history_intervals
     hooks/abstract
+    tablet/cut_history
     ut_accessor
-    ut_cut_history
     ut_rw
     ut_schema
     ut_movedata
