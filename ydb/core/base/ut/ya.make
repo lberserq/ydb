@@ -23,6 +23,7 @@ SRCS(
     database_kind_ut.cpp
     fulltext_ut.cpp
     kmeans_ut.cpp
+    int4_kmeans_ut.cpp
     localdb_ut.cpp
     logoblob_ut.cpp
     memory_stats_ut.cpp
@@ -30,8 +31,10 @@ SRCS(
     path_ut.cpp
     state_storage_follower_ids_ut.cpp
     statestorage_guardian_impl_ut.cpp
+    statestorage_guardian_ut.cpp
     statestorage_ut.cpp
     table_index_ut.cpp
+    tablet_memory_admission_ut.cpp
 )
 
 END()

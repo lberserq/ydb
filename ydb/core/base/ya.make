@@ -51,13 +51,16 @@ SRCS(
     logoblob.cpp
     logoblob.h
     memory_controller_iface.h
+    tablet_memory_admission.h
     mon_auth.cpp
     nameservice.h
     nodestate.h
     path.cpp
     pool_stats_collector.cpp
     pool_stats_collector.h
+    reassign_tablets.h
     request_types.h
+    resource_profile.cpp
     resource_profile.h
     row_version.cpp
     row_version.h
@@ -113,6 +116,7 @@ PEERDIR(
     library/cpp/lwtrace/mon
     library/cpp/random_provider
     library/cpp/svnversion
+    library/cpp/threading/atomic_shared_ptr
     library/cpp/threading/light_rw_lock
     library/cpp/time_provider
     ydb/core/audit/audit_config
@@ -164,13 +168,12 @@ RECURSE(
     generated
 )
 
-IF (NOT OPENSOURCE OR OPENSOURCE_PROJECT == "ydb")
 RECURSE_FOR_TESTS(
     ut
+    ut_hnsw_settings
     ut_auth
     ut_backtrace
     ut_board_subscriber
     ut_http_database_param
     ut_statestorage_proxy
 )
-ENDIF()
