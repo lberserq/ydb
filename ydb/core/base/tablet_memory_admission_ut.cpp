@@ -44,7 +44,7 @@ Y_UNIT_TEST(GreenAdmitsEverything) {
     UNIT_ASSERT(fixture.Sources.back() == EAdmitSource::Immediate);
 }
 
-Y_UNIT_TEST(YellowForbidsGrowthAboveTheWatermark) {
+Y_UNIT_TEST(YellowAdmissionUsesRunningBytesCeiling) {
     TFixture fixture;
     fixture.Admit(1, 100);
     fixture.Admit(2, 100);
@@ -105,7 +105,7 @@ Y_UNIT_TEST(UntoldZoneBehavesAsGreen) {
     UNIT_ASSERT_VALUES_EQUAL(fixture.Started.size(), 3u);
 }
 
-    Y_UNIT_TEST(EveryYellowIntervalHasItsOwnWatermark) {
+    Y_UNIT_TEST(EveryYellowIntervalHasItsOwnRunningBytesCeiling) {
         TFixture owner;
         auto& admission = owner.Admission;
         admission.Admit(1, 1, 100);
