@@ -19,7 +19,6 @@ enum class EMemoryConsumerKind {
     ColumnTablesPortionsMetaDataCache,
 
     QueryExecution,
-
     Tablets, // the tablets' state, what they cannot give back
     TabletsElastic, // the part of the tablets' memory they report as Reclaimable
 };
