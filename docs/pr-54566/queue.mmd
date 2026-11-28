@@ -1,0 +1,15 @@
+sequenceDiagram
+participant A as TMoveDataActualizer
+participant Q as TPortionQueue
+A->>Q: Add(portionId, state)
+Q->>Q: Добавить запись в конец списка и увеличить счётчик
+A->>Q: ScanForStateUpdate(limit)
+Note over Q: StateUpdateCursor продолжает сверку состояний
+A->>Q: ScanForRewrite(limit)
+Note over Q: RewriteCursor продолжает подбор задач, если есть<br/>Ready или RewriteStarted
+Q->>Q: Посетить до min(limit, размер списка) записей
+Note over Q: Каждый курсор проходит список по кругу
+opt Порция перешла в Finished
+Q->>Q: Сдвинуть курсоры, указывающие на запись, и удалить её
+end
+Q-->>A: GetSizes учитывает Ready, RewriteStarted и Uncommitted

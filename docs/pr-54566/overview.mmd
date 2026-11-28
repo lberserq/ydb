@@ -1,0 +1,19 @@
+sequenceDiagram
+participant H as Hive
+participant S as TColumnShard
+participant C as TMoveDataCoordinator
+participant W as TMoveDataScan
+H->>S: TEvMoveData(Groups)
+S->>C: AcceptRequest
+Note over S,C: Координатор работает в mailbox шарда
+S->>S: StartMoveDataVacuumFromOwner()<br/>при открытии сессии
+C->>W: Запустить сканирование в отдельном mailbox
+W-->>S: TEvBatch
+S->>C: OnBatch
+C->>C: Поставить целевые порции в очередь
+C->>S: StartTtl(MoveDataOnly) через индекс
+S-->>C: TTxWriteIndex::Complete → RequestStep
+Note over S,C: Перезапись фиксирует метаданные и remove snapshot
+S-->>C: OnVacuumCompleted (независимо от перезаписи)
+Note over C: Vacuum завершён, сканирование и очереди пусты,<br/>целевых shared/borrowed ссылок нет
+C-->>H: TEvMoveDataResponse(Success) всем подписчикам

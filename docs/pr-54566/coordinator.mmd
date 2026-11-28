@@ -1,0 +1,19 @@
+sequenceDiagram
+participant S as TColumnShard
+participant C as TMoveDataCoordinator
+participant W as TMoveDataScan
+participant G as TGranuleMeta
+S->>C: AcceptRequest(sender, groups)
+C->>C: Добавить подписчика и объединить группы
+opt Добавились целевые группы
+C->>C: Дождаться загрузки порций
+C->>W: Остановить предыдущий скан, если он активен
+C->>C: Сбросить очереди и собрать ID порций без remove snapshot
+C->>W: Запустить новый скан, если есть кандидаты
+end
+S->>C: OnBatch от текущего сканера
+Note over C: Игнорировать устаревший ответ при смене сканера или групп
+C->>G: AddMoveDataCandidate для живых совпадений
+C-->>W: TEvContinue со списком живых порций без accessor
+C->>C: Обновить Pending и проверить условия завершения
+Note over S,C: Завершение vacuum и записи индекса ставит TEvPoke.<br/>TEvWakeup повторяет проверку через 5 с.

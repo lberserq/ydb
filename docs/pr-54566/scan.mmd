@@ -1,0 +1,18 @@
+sequenceDiagram
+participant W as TMoveDataScan
+participant K as Кеш метаданных порций
+participant S as TColumnShard
+Note over W: Снимок ID committed и inserted порций с данными в BlobStorage
+W->>K: AskObjects(MOVE_DATA, addresses)
+Note over W: До 1024 порций в батче, мягкий лимит памяти
+K-->>W: TEvAccessorsReady через callback
+W->>W: Сверить GetDsGroup() у блобов с целевыми группами
+W-->>S: TEvBatch(Matches, Missing, Rejected)
+S-->>W: TEvContinue(Retry)
+alt Остались новые ID
+W->>W: Запросить следующий батч
+else Остались только живые порции без accessor
+W->>W: Повторить запрос через 5 с
+else Все ID обработаны
+W->>W: PassAway
+end

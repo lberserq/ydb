@@ -1,0 +1,17 @@
+sequenceDiagram
+participant I as TGranuleActualizationIndex
+participant A as TMoveDataActualizer
+participant T as TTieringProcessContext
+I->>A: AddCandidate для порции из целевой группы
+A->>A: Ready для committed, иначе Uncommitted
+I->>A: UpdatePortionStates
+Note over A: Запись прошлой генерации продолжает обычный commit/abort.<br/>После commit порция становится Ready.<br/>Remove snapshot или отсутствие ID в обеих картах → Finished.
+I->>A: ExtractTasks → DoExtractTasks
+A->>T: AddPortion с SetForcedMove()
+alt SUCCESS
+A->>A: RewriteStarted
+else PORTION_LOCKED
+A->>A: Оставить в очереди и перейти к следующей порции
+else TASK_LIMIT_EXCEEDED
+A->>A: Прервать текущий обход
+end
