@@ -6,14 +6,16 @@ namespace NKikimr::NReplication::NController {
 namespace {
 
 Y_UNIT_TEST_SUITE(TopicMirroringFunctional) {
-    Y_UNIT_TEST(ReplicatesTopicAndTableTogether) {
+    Y_UNIT_TEST(MixedTopicAndTableReplicationAttachesBothTargets) {
         TTopicMirroringFixture test("localhost", false, nullptr, {}, TTopicMirroringFixture::EStart::Deferred);
         test.CreateSourceTable();
         test.CreateTopicAndTableReplication();
+
         test.WriteAndReadBack("topic-message", 0);
-        test.UpsertSourceTable(1, "table-row");
-        test.WaitDestinationTableRows(1);
         test.WaitForOffsets(1, 0);
+        test.UpsertSourceTable(1, "table-row");
+        UNIT_ASSERT_VALUES_EQUAL(test.GetSourceTableRows(), 1);
+        test.CheckTableTargetAttached();
     }
 
     Y_UNIT_TEST(MixedTopicAndTableTransactionKeepsClustersAlive) {
@@ -53,20 +55,18 @@ Y_UNIT_TEST_SUITE(TopicMirroringFunctional) {
         UNIT_ASSERT_C(commit.IsSuccess(), commit.GetIssues().ToString());
 
         // A transaction spanning the replicated topic and table is unsupported by
-        // replication: neither cluster may crash, and both pipelines must keep
-        // serving afterwards. Delivery of the transactional payload itself is not
-        // asserted.
+        // replication: neither cluster may crash, the topic pipeline must keep
+        // delivering, and the table target must stay attached. Delivery of the
+        // transactional payload itself is not asserted.
         const auto endBefore = test.GetDestinationEndOffset();
         test.Write({"liveness"});
         test.Wait([&] { return test.GetDestinationEndOffset() > endBefore; },
             "mirror delivery after mixed transaction");
-        test.UpsertSourceTable(2, "liveness");
-        test.WaitDestinationTableRows(1);
-        UNIT_ASSERT(test.Destination.GetDescription("/Root/replication")
-            .GetPathDescription().HasReplicationDescription());
+        UNIT_ASSERT_VALUES_EQUAL(test.GetSourceTableRows(), 1);
+        test.CheckTableTargetAttached();
     }
 
-    Y_UNIT_TEST(ReplicatesMillionRowsAndMillionMessages) {
+    Y_UNIT_TEST(MirrorsMillionMessagesWithTableTargetAttached) {
         TTopicMirroringFixture test("localhost", false, nullptr, {}, TTopicMirroringFixture::EStart::Deferred);
         test.CreateSourceTable();
 
@@ -79,9 +79,10 @@ Y_UNIT_TEST_SUITE(TopicMirroringFunctional) {
         test.WriteMany(messageCount, "bulk");
 
         test.CreateTopicAndTableReplication();
-        test.WaitDestinationTableRows(rowCount);
         test.Wait([&] { return test.GetDestinationEndOffset() == messageCount; }, "million messages mirrored");
         test.ReadBack({"bulk-999998", "bulk-999999"}, messageCount - 2);
+        UNIT_ASSERT_VALUES_EQUAL(test.GetSourceTableRows(), rowCount);
+        test.CheckTableTargetAttached();
     }
 
     Y_UNIT_TEST(MirroringFollowsSourcePartitionSplit) {

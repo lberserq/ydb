@@ -1,6 +1,7 @@
 #pragma once
 
 #include "private_events.h"
+#include "public_events.h"
 #include "dst_alterer.h"
 #include "dst_remover.h"
 #include "stream_remover.h"
@@ -571,19 +572,27 @@ public:
         UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
     }
 
-    void WaitDestinationTableRows(size_t count) {
-        NYdb::NTable::TTableClient client(Destination.GetDriver());
-        auto session = Destination.RunCall([&] { return client.CreateSession().GetValueSync().GetSession(); });
-        Wait([&] {
-            const auto result = Destination.RunCall([&] {
-                return session.ExecuteDataQuery("SELECT COUNT(*) FROM `/Root/table`;",
-                    NYdb::NTable::TTxControl::BeginTx().CommitTx()).GetValueSync();
-            });
-            UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
-            auto parser = result.GetResultSetParser(0);
-            UNIT_ASSERT(parser.TryNextRow());
-            return parser.ColumnParser(0).GetUint64() >= count;
-        }, "destination table rows");
+    // TEnv runs no replication worker service, so table targets attach (read-only
+    // replica + controller Ready) but cannot deliver rows in this harness.
+    void CheckTableTargetAttached() {
+        const auto table = Destination.GetDescription("/Root/table").GetPathDescription().GetTable();
+        UNIT_ASSERT_VALUES_EQUAL(table.GetReplicationConfig().GetMode(),
+            NKikimrSchemeOp::TTableReplicationConfig::REPLICATION_MODE_READ_ONLY);
+        const auto state = ControllerState();
+        UNIT_ASSERT_C(state.HasStandBy(), state.DebugString());
+    }
+
+    ui64 GetSourceTableRows() {
+        NYdb::NTable::TTableClient client(Source.GetDriver());
+        auto session = Source.RunCall([&] { return client.CreateSession().GetValueSync().GetSession(); });
+        const auto result = Source.RunCall([&] {
+            return session.ExecuteDataQuery("SELECT COUNT(*) FROM `/Root/src/table`;",
+                NYdb::NTable::TTxControl::BeginTx().CommitTx()).GetValueSync();
+        });
+        UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+        auto parser = result.GetResultSetParser(0);
+        UNIT_ASSERT(parser.TryNextRow());
+        return parser.ColumnParser(0).GetUint64();
     }
 
     void BulkUpsertSourceTable(ui64 begin, ui64 count) {
@@ -681,10 +690,22 @@ public:
         });
     }
 
+    NKikimrReplication::TReplicationState ControllerState() {
+        const auto controllerId = Destination.GetDescription("/Root/replication")
+            .GetPathDescription().GetReplicationDescription().GetControllerId();
+        const auto pathId = Destination.GetPathId("/Root/replication");
+        auto request = MakeHolder<TEvController::TEvDescribeReplication>();
+        pathId.ToProto(request->Record.MutablePathId());
+        const auto result = Destination.Send<TEvController::TEvDescribeReplicationResult>(
+            controllerId, std::move(request));
+        return result->Get()->Record.GetState();
+    }
+
     void WaitReplicationError(const TString& issuePart = {}) {
+        // Schemeshard describe only reflects CREATE/ALTER states; controller-internal
+        // errors are visible only through the controller's own describe.
         Wait([&] {
-            const auto& state = Destination.GetDescription("/Root/replication")
-                .GetPathDescription().GetReplicationDescription().GetState();
+            const auto state = ControllerState();
             return state.HasError()
                 && (issuePart.empty() || state.GetError().DebugString().Contains(issuePart));
         }, TStringBuilder() << "replication error containing '" << issuePart << "'");

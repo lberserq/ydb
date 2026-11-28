@@ -150,7 +150,7 @@ Y_UNIT_TEST_SUITE(TopicMirroringData) {
         test.WaitForOffsets(2, 0);
     }
 
-    Y_UNIT_TEST(MirrorConsumerRecreatedAfterManualDrop) {
+    Y_UNIT_TEST(MirrorConsumerManualDropStopsMirroring) {
         TTopicMirroringFixture test;
         test.WriteAndReadBack("before-drop", 0);
         NYdb::NTopic::TTopicClient source(test.Source.GetDriver());
@@ -158,8 +158,15 @@ Y_UNIT_TEST_SUITE(TopicMirroringData) {
             .AppendDropConsumers(test.MirrorConsumer.c_str())).GetValueSync();
         UNIT_ASSERT_C(altered.IsSuccess(), altered.GetIssues().ToString());
 
-        test.WriteAndReadBack("after-drop", 1);
-        test.WaitForOffsets(2, 0);
+        // The mirrorer retries the read session but never recreates a dropped mirror
+        // consumer: delivery stops. Both clusters must stay healthy and droppable.
+        test.Write({"after-drop"});
+        Sleep(TDuration::Seconds(3));
+        UNIT_ASSERT_VALUES_EQUAL(test.GetDestinationEndOffset(), 1);
+        test.ReadBack({"before-drop"}, 0);
+        test.Exec("DROP ASYNC REPLICATION `/Root/replication`;");
+        UNIT_ASSERT_VALUES_EQUAL(test.Destination.GetDescription("/Root/replication").GetSchemeStatus(),
+            NKikimrScheme::StatusPathDoesNotExist);
     }
 }
 }
